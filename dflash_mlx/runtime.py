@@ -858,6 +858,35 @@ def _cleanup_generation_caches(
     target_cache.clear()
 
 
+def _launch_prefetched_draft(
+    *,
+    target_model: Any,
+    draft_model: DFlashDraftModel,
+    draft_cache: list[Any],
+    staged_first: mx.array,
+    target_hidden: mx.array,
+    block_len: int,
+    mask_token_tail: mx.array,
+    suppress_token_mask: Optional[mx.array],
+) -> mx.array:
+    if int(block_len) <= 1:
+        raise ValueError("prefetched draft requires block_len > 1")
+    block_token_ids = mx.concatenate(
+        [staged_first[:1], mask_token_tail[: int(block_len) - 1]],
+        axis=0,
+    )
+    noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
+    draft_hidden = draft_model(
+        noise_embedding=noise_embedding,
+        target_hidden=target_hidden,
+        cache=draft_cache,
+    )
+    draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
+    drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+    mx.async_eval(drafted)
+    return drafted
+
+
 def _restore_target_cache_after_acceptance(
     cache_entries: list[Any],
     *,
@@ -1184,7 +1213,9 @@ def generate_dflash_once(
         )
         for _ in range(len(draft_model.layers))
     ]
+    target_layer_id_list = list(draft_model.target_layer_ids)
     capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
+    mask_token_id = int(draft_model.mask_token_id)
 
     try:
         start_ns = time.perf_counter_ns()
@@ -1205,7 +1236,7 @@ def generate_dflash_once(
             target_hidden_chunks.append(
                 extract_context_feature_from_dict(
                     prefill_hidden_states,
-                    list(draft_model.target_layer_ids),
+                    target_layer_id_list,
                 )
             )
         prefill_ns = time.perf_counter_ns() - prefill_start_ns
@@ -1221,8 +1252,13 @@ def generate_dflash_once(
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
         effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
-        generated_token_buffer = mx.full((max_new_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
-        block_token_buffer = mx.full((effective_block_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
+        generated_token_buffer = mx.full((max_new_tokens,), mask_token_id, dtype=mx.uint32)
+        block_token_buffer = mx.full((effective_block_tokens,), mask_token_id, dtype=mx.uint32)
+        mask_token_tail = mx.full(
+            (max(0, effective_block_tokens - 1),),
+            mask_token_id,
+            dtype=mx.uint32,
+        )
         generated_token_count = 0
         accepted_from_draft = 0
         cycles_completed = 0
@@ -1248,6 +1284,7 @@ def generate_dflash_once(
             "other": 0,
             "cycle_total": 0,
         }
+        prefetched_draft: Optional[dict[str, Any]] = None
 
         while generated_token_count < max_new_tokens:
             cycle_start_ns = time.perf_counter_ns()
@@ -1259,24 +1296,47 @@ def generate_dflash_once(
             hidden_extract_cycle_ns = 0
             remaining = max_new_tokens - generated_token_count
             block_len = max(1, min(effective_block_tokens, remaining))
-            block_token_buffer[:block_len] = draft_model.mask_token_id
+            block_token_buffer[:block_len] = mask_token_id
             block_token_buffer[:1] = staged_first
             block_token_ids = block_token_buffer[:block_len]
+            current_staged_first = staged_first
+            drafted = None
 
             if block_len > 1:
-                draft_start_ns = time.perf_counter_ns()
-                noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
-                draft_hidden = draft_model(
-                    noise_embedding=noise_embedding,
-                    target_hidden=target_hidden,
-                    cache=draft_cache,
-                )
-                draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-                mx.async_eval(draft_logits)
-                mx.eval(draft_logits)
-                drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
-                block_token_ids[1:block_len] = drafted
-                draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                if profile_cycles:
+                    draft_start_ns = time.perf_counter_ns()
+                    noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
+                    draft_hidden = draft_model(
+                        noise_embedding=noise_embedding,
+                        target_hidden=target_hidden,
+                        cache=draft_cache,
+                    )
+                    draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
+                    drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+                    mx.eval(draft_logits)
+                    block_token_ids[1:block_len] = drafted
+                    draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                else:
+                    if (
+                        prefetched_draft is not None
+                        and int(prefetched_draft["block_len"]) == block_len
+                    ):
+                        drafted = prefetched_draft["drafted"]
+                        current_staged_first = prefetched_draft["staged_first"]
+                    else:
+                        draft_start_ns = time.perf_counter_ns()
+                        drafted = _launch_prefetched_draft(
+                            target_model=target_model,
+                            draft_model=draft_model,
+                            draft_cache=draft_cache,
+                            staged_first=current_staged_first,
+                            target_hidden=target_hidden,
+                            block_len=block_len,
+                            mask_token_tail=mask_token_tail,
+                            suppress_token_mask=suppress_token_mask,
+                        )
+                        draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                    prefetched_draft = None
                 draft_ns_total += draft_cycle_ns
                 if not seen_draft_cycle:
                     draft_prefill_ns += draft_cycle_ns
@@ -1284,7 +1344,16 @@ def generate_dflash_once(
                 else:
                     draft_incremental_ns += draft_cycle_ns
 
-            verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
+            verify_token_count = min(block_len, verify_len_cap)
+            if profile_cycles or block_len <= 1:
+                verify_token_ids = block_token_ids[:verify_token_count]
+            elif verify_token_count <= 1:
+                verify_token_ids = current_staged_first[:1]
+            else:
+                verify_token_ids = mx.concatenate(
+                    [current_staged_first[:1], drafted[: verify_token_count - 1]],
+                    axis=0,
+                )
             verify_ids = verify_token_ids[None]
             if use_speculative_linear_cache:
                 _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
@@ -1303,6 +1372,8 @@ def generate_dflash_once(
 
             acceptance_start_ns = time.perf_counter_ns()
             posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            if not profile_cycles:
+                mx.async_eval(posterior, *verify_hidden_states.values())
             acceptance_len = int(
                 _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
             )
@@ -1312,9 +1383,12 @@ def generate_dflash_once(
             hidden_extract_start_ns = time.perf_counter_ns()
             committed_hidden = extract_context_feature_from_dict(
                 verify_hidden_states,
-                list(draft_model.target_layer_ids),
+                target_layer_id_list,
             )[:, : (1 + acceptance_len), :]
-            mx.eval(committed_hidden, posterior)
+            if profile_cycles:
+                mx.eval(committed_hidden, posterior)
+            else:
+                mx.async_eval(committed_hidden)
             hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
 
             commit_count = 1 + acceptance_len
@@ -1322,6 +1396,33 @@ def generate_dflash_once(
             generated_token_buffer[generated_token_count : generated_token_count + commit_count] = committed_segment
             generated_token_count += commit_count
             accepted_from_draft += acceptance_len
+            staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+
+            if not profile_cycles:
+                next_remaining = max_new_tokens - generated_token_count
+                next_block_len = max(1, min(effective_block_tokens, next_remaining))
+                if next_remaining > 0 and next_block_len > 1:
+                    draft_start_ns = time.perf_counter_ns()
+                    next_drafted = _launch_prefetched_draft(
+                        target_model=target_model,
+                        draft_model=draft_model,
+                        draft_cache=draft_cache,
+                        staged_first=staged_first_next,
+                        target_hidden=committed_hidden,
+                        block_len=next_block_len,
+                        mask_token_tail=mask_token_tail,
+                        suppress_token_mask=suppress_token_mask,
+                    )
+                    launch_ns = time.perf_counter_ns() - draft_start_ns
+                    draft_ns_total += launch_ns
+                    draft_incremental_ns += launch_ns
+                    prefetched_draft = {
+                        "block_len": next_block_len,
+                        "staged_first": staged_first_next,
+                        "drafted": next_drafted,
+                    }
+                else:
+                    prefetched_draft = None
 
             commit_start_ns = time.perf_counter_ns()
             start += commit_count
@@ -1351,7 +1452,7 @@ def generate_dflash_once(
             if stop_hit:
                 break
 
-            staged_first = posterior[acceptance_len : acceptance_len + 1]
+            staged_first = staged_first_next
 
             if profile_cycles:
                 cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
@@ -1494,7 +1595,9 @@ def stream_dflash_generate(
         )
         for _ in range(len(draft_model.layers))
     ]
+    target_layer_id_list = list(draft_model.target_layer_ids)
     capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
+    profile_cycles = _profile_dflash_cycles_enabled()
 
     try:
         start_ns = time.perf_counter_ns()
@@ -1515,7 +1618,7 @@ def stream_dflash_generate(
             target_hidden_chunks.append(
                 extract_context_feature_from_dict(
                     prefill_hidden_states,
-                    list(draft_model.target_layer_ids),
+                    target_layer_id_list,
                 )
             )
             yield {
@@ -1542,7 +1645,16 @@ def stream_dflash_generate(
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
         effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
-        block_token_buffer = mx.full((effective_block_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
+        block_token_buffer = mx.full(
+            (effective_block_tokens,),
+            int(draft_model.mask_token_id),
+            dtype=mx.uint32,
+        )
+        mask_token_tail = mx.full(
+            (max(0, effective_block_tokens - 1),),
+            int(draft_model.mask_token_id),
+            dtype=mx.uint32,
+        )
         generated_token_ids: list[int] = []
         accepted_from_draft = 0
         cycles_completed = 0
@@ -1556,7 +1668,6 @@ def stream_dflash_generate(
         replay_ns_total = 0
         commit_ns_total = 0
         seen_draft_cycle = False
-        profile_cycles = _profile_dflash_cycles_enabled()
         cycle_profiles: list[dict[str, Any]] = []
         profile_totals_ns = {
             "draft": 0,
@@ -1567,6 +1678,7 @@ def stream_dflash_generate(
             "other": 0,
             "cycle_total": 0,
         }
+        prefetched_draft: Optional[dict[str, Any]] = None
 
         while len(generated_token_ids) < max_new_tokens:
             cycle_start_ns = time.perf_counter_ns()
@@ -1578,24 +1690,46 @@ def stream_dflash_generate(
             hidden_extract_cycle_ns = 0
             remaining = max_new_tokens - len(generated_token_ids)
             block_len = max(1, min(effective_block_tokens, remaining))
-            block_token_buffer[:block_len] = draft_model.mask_token_id
+            block_token_buffer[:block_len] = int(draft_model.mask_token_id)
             block_token_buffer[:1] = staged_first
             block_token_ids = block_token_buffer[:block_len]
+            current_staged_first = staged_first
+            drafted = None
 
             if block_len > 1:
-                draft_start_ns = time.perf_counter_ns()
-                noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
-                draft_hidden = draft_model(
-                    noise_embedding=noise_embedding,
-                    target_hidden=target_hidden,
-                    cache=draft_cache,
-                )
-                draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-                mx.async_eval(draft_logits)
-                mx.eval(draft_logits)
-                drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
-                block_token_ids[1:block_len] = drafted
-                draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                if profile_cycles:
+                    draft_start_ns = time.perf_counter_ns()
+                    noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
+                    draft_hidden = draft_model(
+                        noise_embedding=noise_embedding,
+                        target_hidden=target_hidden,
+                        cache=draft_cache,
+                    )
+                    draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
+                    drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+                    mx.eval(draft_logits)
+                    block_token_ids[1:block_len] = drafted
+                else:
+                    if (
+                        prefetched_draft is not None
+                        and int(prefetched_draft["block_len"]) == block_len
+                    ):
+                        drafted = prefetched_draft["drafted"]
+                        current_staged_first = prefetched_draft["staged_first"]
+                    else:
+                        draft_start_ns = time.perf_counter_ns()
+                        drafted = _launch_prefetched_draft(
+                            target_model=target_model,
+                            draft_model=draft_model,
+                            draft_cache=draft_cache,
+                            staged_first=current_staged_first,
+                            target_hidden=target_hidden,
+                            block_len=block_len,
+                            mask_token_tail=mask_token_tail,
+                            suppress_token_mask=suppress_token_mask,
+                        )
+                        draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                    prefetched_draft = None
                 draft_ns_total += draft_cycle_ns
                 if not seen_draft_cycle:
                     draft_prefill_ns += draft_cycle_ns
@@ -1603,7 +1737,16 @@ def stream_dflash_generate(
                 else:
                     draft_incremental_ns += draft_cycle_ns
 
-            verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
+            verify_token_count = min(block_len, verify_len_cap)
+            if profile_cycles or block_len <= 1:
+                verify_token_ids = block_token_ids[:verify_token_count]
+            elif verify_token_count <= 1:
+                verify_token_ids = current_staged_first[:1]
+            else:
+                verify_token_ids = mx.concatenate(
+                    [current_staged_first[:1], drafted[: verify_token_count - 1]],
+                    axis=0,
+                )
             verify_ids = verify_token_ids[None]
             _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
             verify_start_ns = time.perf_counter_ns()
@@ -1621,6 +1764,8 @@ def stream_dflash_generate(
 
             acceptance_start_ns = time.perf_counter_ns()
             posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            if not profile_cycles:
+                mx.async_eval(posterior, *verify_hidden_states.values())
             acceptance_len = int(
                 _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
             )
@@ -1628,9 +1773,12 @@ def stream_dflash_generate(
             hidden_extract_start_ns = time.perf_counter_ns()
             committed_hidden = extract_context_feature_from_dict(
                 verify_hidden_states,
-                list(draft_model.target_layer_ids),
+                target_layer_id_list,
             )[:, : (1 + acceptance_len), :]
-            mx.eval(committed_hidden, posterior)
+            if profile_cycles:
+                mx.eval(committed_hidden, posterior)
+            else:
+                mx.async_eval(committed_hidden)
             hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
 
             commit_count = 1 + acceptance_len
@@ -1651,6 +1799,32 @@ def stream_dflash_generate(
             commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
 
             accepted_from_draft += acceptance_len
+            staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+            if not profile_cycles:
+                next_remaining = max_new_tokens - len(generated_token_ids) - commit_count
+                next_block_len = max(1, min(effective_block_tokens, next_remaining))
+                if next_remaining > 0 and next_block_len > 1:
+                    draft_start_ns = time.perf_counter_ns()
+                    next_drafted = _launch_prefetched_draft(
+                        target_model=target_model,
+                        draft_model=draft_model,
+                        draft_cache=draft_cache,
+                        staged_first=staged_first_next,
+                        target_hidden=committed_hidden,
+                        block_len=next_block_len,
+                        mask_token_tail=mask_token_tail,
+                        suppress_token_mask=suppress_token_mask,
+                    )
+                    launch_ns = time.perf_counter_ns() - draft_start_ns
+                    draft_ns_total += launch_ns
+                    draft_incremental_ns += launch_ns
+                    prefetched_draft = {
+                        "block_len": next_block_len,
+                        "staged_first": staged_first_next,
+                        "drafted": next_drafted,
+                    }
+                else:
+                    prefetched_draft = None
             committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
             for token_id in committed_ids:
                 if len(generated_token_ids) >= max_new_tokens:
@@ -1679,7 +1853,7 @@ def stream_dflash_generate(
             if stop_hit:
                 break
 
-            staged_first = posterior[acceptance_len : acceptance_len + 1]
+            staged_first = staged_first_next
 
             if profile_cycles:
                 cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
