@@ -9,6 +9,7 @@ import json
 import sys
 import os
 import logging
+import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Any, Optional
@@ -153,14 +154,22 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
         request_tuple = request
         rqueue, request, args = request_tuple
 
-        def progress(tokens_processed, tokens_total):
-            rqueue.put((tokens_processed, tokens_total))
+        if args.max_tokens <= 256:
+            sys.stderr.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] fast-path AR | max_tokens={args.max_tokens}\n"
+            )
+            sys.stderr.flush()
+            saved_draft_model = self.model_provider.draft_model
+            try:
+                self.model_provider.draft_model = None
+                return super()._serve_single((rqueue, request, args))
+            finally:
+                self.model_provider.draft_model = saved_draft_model
 
         try:
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
-
             tokenized = self._tokenize(tokenizer, request, args)
             if isinstance(tokenized, tuple):
                 prompt, _, _, initial_state = tokenized
@@ -202,6 +211,14 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
             pending_match: Optional[tuple[int, ...]] = None
             pending_finish_reason: Optional[str] = None
             finish_reason: Optional[str] = None
+            summary_event: Optional[dict[str, Any]] = None
+            request_start_ns = time.perf_counter_ns()
+            prefill_elapsed_s = 0.0
+            live_tok_s = 0.0
+            live_token_count = 0
+            live_acceptance_pct = 0.0
+            live_prompt_len = len(prompt)
+            printed_prefill_progress = False
 
             event_iter = stream_dflash_generate(
                 target_model=model,
@@ -214,59 +231,98 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 prompt_tokens_override=prompt,
             )
 
-            for event in event_iter:
-                if event.get("event") == "prefill":
-                    n = int(event.get("prompt_token_count", len(prompt)))
-                    progress(n, n)
-                    continue
-                if event.get("event") != "token":
-                    if event.get("event") == "summary":
-                        generated_token_ids = list(event.get("generated_token_ids", []) or [])
-                        if generated_token_ids:
-                            last_token = int(generated_token_ids[-1])
-                            if last_token in eos_token_ids:
-                                finish_reason = "stop"
-                            elif int(event.get("generation_tokens", 0)) >= int(args.max_tokens):
-                                finish_reason = "length"
+            try:
+                for event in event_iter:
+                    if event.get("event") in ("prefill", "prefill_progress"):
+                        processed = int(
+                            event.get(
+                                "tokens_processed",
+                                event.get("prompt_token_count", len(prompt)),
+                            )
+                        )
+                        total = int(
+                            event.get(
+                                "tokens_total",
+                                event.get("prompt_token_count", len(prompt)),
+                            )
+                        )
+                        elapsed_s = (time.perf_counter_ns() - request_start_ns) / 1e9
+                        if event.get("event") == "prefill_progress":
+                            sys.stderr.write(
+                                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefill: {processed}/{total} tokens | {elapsed_s:.1f}s\n"
+                            )
+                            sys.stderr.flush()
+                            printed_prefill_progress = True
+                        else:
+                            prefill_elapsed_s = elapsed_s
+                            if not printed_prefill_progress:
+                                sys.stderr.write(
+                                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefill: {processed}/{total} tokens | {elapsed_s:.1f}s\n"
+                                )
+                                sys.stderr.flush()
+                        continue
+                    if event.get("event") != "token":
+                        if event.get("event") == "summary":
+                            summary_event = event
+                            generated_token_ids = list(event.get("generated_token_ids", []) or [])
+                            if generated_token_ids:
+                                last_token = int(generated_token_ids[-1])
+                                if last_token in eos_token_ids:
+                                    finish_reason = "stop"
+                                elif int(event.get("generation_tokens", 0)) >= int(args.max_tokens):
+                                    finish_reason = "length"
+                                else:
+                                    finish_reason = "stop"
                             else:
                                 finish_reason = "stop"
-                        else:
-                            finish_reason = "stop"
-                    continue
+                        continue
 
-                token = int(event["token_id"])
-                current_state = "normal"
-                match_sequence: Optional[tuple[int, ...]] = None
-                token_finish_reason: Optional[str] = None
-                if sm is not None:
-                    sm_state, match_sequence, current_state = sm.match(sm_state, token)
-                    if match_sequence is not None and current_state is None:
-                        token_finish_reason = "stop"
-
-                text = ""
-                if token not in eos_token_ids:
-                    detokenizer.add_token(token)
-                    text = detokenizer.last_segment
-
-                if pending_token is not None:
-                    rqueue.put(
-                        self._make_response(
-                            text=pending_text,
-                            token=pending_token,
-                            state=pending_state,
-                            match=pending_match,
-                            finish_reason=pending_finish_reason,
+                    token = int(event["token_id"])
+                    live_token_count += 1
+                    live_acceptance_pct = float(event.get("acceptance_ratio", 0.0) or 0.0) * 100.0
+                    elapsed_s = (time.perf_counter_ns() - request_start_ns) / 1e9
+                    live_tok_s = live_token_count / max(0.001, elapsed_s - prefill_elapsed_s)
+                    if live_token_count % 2048 == 0:
+                        sys.stderr.write(
+                            f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] {live_tok_s:.1f} tok/s | {live_acceptance_pct:.1f}% accepted | "
+                            f"{live_token_count} tokens | {elapsed_s:.1f}s | "
+                            f"prompt: {live_prompt_len} tokens\n"
                         )
-                    )
+                        sys.stderr.flush()
+                    current_state = "normal"
+                    match_sequence: Optional[tuple[int, ...]] = None
+                    token_finish_reason: Optional[str] = None
+                    if sm is not None:
+                        sm_state, match_sequence, current_state = sm.match(sm_state, token)
+                        if match_sequence is not None and current_state is None:
+                            token_finish_reason = "stop"
 
-                pending_token = token
-                pending_text = text
-                pending_state = current_state or "normal"
-                pending_match = match_sequence
-                pending_finish_reason = token_finish_reason
+                    text = ""
+                    if token not in eos_token_ids:
+                        detokenizer.add_token(token)
+                        text = detokenizer.last_segment
 
-                if ctx._should_stop:
-                    break
+                    if pending_token is not None:
+                        rqueue.put(
+                            self._make_response(
+                                text=pending_text,
+                                token=pending_token,
+                                state=pending_state,
+                                match=pending_match,
+                                finish_reason=pending_finish_reason,
+                            )
+                        )
+
+                    pending_token = token
+                    pending_text = text
+                    pending_state = current_state or "normal"
+                    pending_match = match_sequence
+                    pending_finish_reason = token_finish_reason
+
+                    if ctx._should_stop:
+                        break
+            finally:
+                event_iter.close()
 
             detokenizer.finalize()
             tail = detokenizer.last_segment
@@ -281,6 +337,22 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                     )
                 )
 
+            if summary_event is not None:
+                generation_tokens = int(summary_event.get("generation_tokens", 0) or 0)
+                elapsed_us = float(summary_event.get("elapsed_us", 0.0) or 0.0)
+                phase_timings_us = dict(summary_event.get("phase_timings_us") or {})
+                prefill_us = float(phase_timings_us.get("prefill", 0.0) or 0.0)
+                decode_s = max(0.0, (elapsed_us - prefill_us) / 1_000_000.0)
+                tok_s = (generation_tokens / decode_s) if decode_s > 0.0 else 0.0
+                acceptance_pct = float(summary_event.get("acceptance_ratio", 0.0) or 0.0) * 100.0
+                total_s = elapsed_us / 1_000_000.0
+                sys.stderr.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] {tok_s:.1f} tok/s | {acceptance_pct:.1f}% accepted | "
+                    f"{generation_tokens} tokens | {total_s:.1f}s | "
+                    f"prompt: {len(prompt)} tokens\n"
+                )
+                sys.stderr.flush()
+
             rqueue.put(None)
         except Exception as e:
             rqueue.put(e)
@@ -291,6 +363,10 @@ class DFlashAPIHandler(mlx_server.APIHandler):
         try:
             return super().handle_completion(request, stop_words)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+            return
+        except ValueError as e:
+            logging.warning("Tool parser error (likely malformed tool call): %s", e)
             self.close_connection = True
             return
 
@@ -533,6 +609,7 @@ def main() -> None:
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
+        mx.set_cache_limit(wired_limit // 4)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),

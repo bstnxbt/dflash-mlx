@@ -69,6 +69,7 @@ class RecurrentRollbackCache(_BaseCache):
     def finalize(self):
         self.lengths = None
         self.left_padding = None
+        self.clear_transients()
 
     def advance(self, n: int):
         if self.lengths is not None:
@@ -94,6 +95,14 @@ class RecurrentRollbackCache(_BaseCache):
 
     def checkpoint(self) -> None:
         self._snapshot = list(self.cache)
+
+    def clear_transients(self) -> None:
+        self._armed = False
+        self._tape = None
+        self._tape_k = None
+        self._tape_g = None
+        self._tape_qkv = None
+        self._snapshot = None
 
     def arm_rollback(self, prefix_len: int = 0) -> None:
         del prefix_len
@@ -138,6 +147,7 @@ class RecurrentRollbackCache(_BaseCache):
 
     def rollback(self, n_accepted: int) -> None:
         if self._snapshot is None:
+            self.clear_transients()
             return
 
         self.cache = list(self._snapshot)
@@ -158,8 +168,4 @@ class RecurrentRollbackCache(_BaseCache):
             self.cache[1] = state
             self.cache[0] = self._rebuild_conv_state(accepted_steps)
 
-        self._armed = False
-        self._tape = None
-        self._tape_k = None
-        self._tape_g = None
-        self._tape_qkv = None
+        self.clear_transients()

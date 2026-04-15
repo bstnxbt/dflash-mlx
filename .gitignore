@@ -16,3 +16,4 @@ AGENTS.md
 CLAUDE.md
 benchmark/datasets/
 .aider*
+.idea/

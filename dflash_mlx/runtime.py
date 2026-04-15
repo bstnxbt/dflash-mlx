@@ -3,6 +3,7 @@
 # Based on DFlash (arXiv:2602.06036)
 
 import os
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -213,12 +214,14 @@ def _resolve_verify_len_cap(target_model: Any, block_tokens: int) -> int:
 
 
 def _resolve_dflash_max_ctx() -> int:
-    raw = os.environ.get("DFLASH_MAX_CTX", "4096").strip()
+    raw = os.environ.get("DFLASH_MAX_CTX", "0").strip()
     try:
         max_ctx = int(raw)
     except ValueError:
-        max_ctx = 4096
-    return max(1, max_ctx)
+        max_ctx = 0
+    if max_ctx <= 0:
+        return sys.maxsize
+    return max_ctx
 
 
 def _resolve_draft_window() -> tuple[int, int]:
@@ -827,6 +830,9 @@ def _arm_target_rollback_with_prefix(
 
 
 def _clear_rollback_state(cache_entry: Any) -> None:
+    if hasattr(cache_entry, "clear_transients"):
+        cache_entry.clear_transients()
+        return
     if hasattr(cache_entry, "_armed"):
         cache_entry._armed = False
     if hasattr(cache_entry, "_tape"):
@@ -839,6 +845,17 @@ def _clear_rollback_state(cache_entry: Any) -> None:
         cache_entry._tape_qkv = None
     if hasattr(cache_entry, "_snapshot"):
         cache_entry._snapshot = None
+
+
+def _cleanup_generation_caches(
+    target_cache: list[Any],
+    draft_cache: list[Any],
+) -> None:
+    for cache_entry in target_cache:
+        if hasattr(cache_entry, "clear_transients"):
+            cache_entry.clear_transients()
+    draft_cache.clear()
+    target_cache.clear()
 
 
 def _restore_target_cache_after_acceptance(
@@ -1169,233 +1186,251 @@ def generate_dflash_once(
     ]
     capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
 
-    start_ns = time.perf_counter_ns()
-    prefill_start_ns = time.perf_counter_ns()
-    prefill_logits, prefill_hidden_states = target_forward_with_hidden_states(
-        target_model,
-        input_ids=prompt_array,
-        cache=target_cache,
-        capture_layer_ids=capture_layer_ids,
-    )
-    _eval_logits_and_captured(prefill_logits, prefill_hidden_states)
-    prefill_ns = time.perf_counter_ns() - prefill_start_ns
-
-    suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
-    staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
-    target_hidden = extract_context_feature_from_dict(
-        prefill_hidden_states,
-        list(draft_model.target_layer_ids),
-    )
-
-    draft_block_size = int(draft_model.block_size)
-    requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
-    effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
-    generated_token_buffer = mx.full((max_new_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
-    block_token_buffer = mx.full((effective_block_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
-    generated_token_count = 0
-    accepted_from_draft = 0
-    cycles_completed = 0
-    verify_len_cap = _resolve_verify_len_cap(target_model, effective_block_tokens)
-    start = prompt_len
-
-    draft_ns_total = 0
-    draft_prefill_ns = 0
-    draft_incremental_ns = 0
-    verify_ns_total = 0
-    replay_ns_total = 0
-    commit_ns_total = 0
-    seen_draft_cycle = False
-    acceptance_history: list[int] = []
-    profile_cycles = _profile_dflash_cycles_enabled()
-    cycle_profiles: list[dict[str, Any]] = []
-    profile_totals_ns = {
-        "draft": 0,
-        "verify": 0,
-        "acceptance": 0,
-        "hidden_extraction": 0,
-        "rollback": 0,
-        "other": 0,
-        "cycle_total": 0,
-    }
-
-    while generated_token_count < max_new_tokens:
-        cycle_start_ns = time.perf_counter_ns()
-        draft_cycle_ns = 0
-        verify_cycle_ns = 0
-        replay_cycle_ns = 0
-        commit_cycle_ns = 0
-        acceptance_cycle_ns = 0
-        hidden_extract_cycle_ns = 0
-        remaining = max_new_tokens - generated_token_count
-        block_len = max(1, min(effective_block_tokens, remaining))
-        block_token_buffer[:block_len] = draft_model.mask_token_id
-        block_token_buffer[:1] = staged_first
-        block_token_ids = block_token_buffer[:block_len]
-
-        if block_len > 1:
-            draft_start_ns = time.perf_counter_ns()
-            noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
-            draft_hidden = draft_model(
-                noise_embedding=noise_embedding,
-                target_hidden=target_hidden,
-                cache=draft_cache,
+    try:
+        start_ns = time.perf_counter_ns()
+        prefill_start_ns = time.perf_counter_ns()
+        prefill_step_size = 2048
+        prefill_logits = None
+        target_hidden_chunks: list[mx.array] = []
+        for chunk_start in range(0, prompt_len, prefill_step_size):
+            chunk_end = min(chunk_start + prefill_step_size, prompt_len)
+            chunk_ids = prompt_array[:, chunk_start:chunk_end]
+            prefill_logits, prefill_hidden_states = target_forward_with_hidden_states(
+                target_model,
+                input_ids=chunk_ids,
+                cache=target_cache,
+                capture_layer_ids=capture_layer_ids,
             )
-            draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-            mx.async_eval(draft_logits)
-            mx.eval(draft_logits)
-            drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
-            block_token_ids[1:block_len] = drafted
-            draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
-            draft_ns_total += draft_cycle_ns
-            if not seen_draft_cycle:
-                draft_prefill_ns += draft_cycle_ns
-                seen_draft_cycle = True
-            else:
-                draft_incremental_ns += draft_cycle_ns
+            _eval_logits_and_captured(prefill_logits, prefill_hidden_states)
+            target_hidden_chunks.append(
+                extract_context_feature_from_dict(
+                    prefill_hidden_states,
+                    list(draft_model.target_layer_ids),
+                )
+            )
+        prefill_ns = time.perf_counter_ns() - prefill_start_ns
 
-        verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
-        verify_ids = verify_token_ids[None]
-        if use_speculative_linear_cache:
-            _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
-        verify_start_ns = time.perf_counter_ns()
-        verify_logits, verify_hidden_states = _verify_target_block(
-            target_model=target_model,
-            verify_ids=verify_ids,
-            target_cache=target_cache,
-            verify_chunk_tokens=verify_chunk_tokens,
-            capture_layer_ids=capture_layer_ids,
+        suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
+        staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
+        target_hidden = (
+            target_hidden_chunks[0]
+            if len(target_hidden_chunks) == 1
+            else mx.concatenate(target_hidden_chunks, axis=1)
         )
+
+        draft_block_size = int(draft_model.block_size)
+        requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
+        effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+        generated_token_buffer = mx.full((max_new_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
+        block_token_buffer = mx.full((effective_block_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
+        generated_token_count = 0
+        accepted_from_draft = 0
+        cycles_completed = 0
+        verify_len_cap = _resolve_verify_len_cap(target_model, effective_block_tokens)
+        start = prompt_len
+
+        draft_ns_total = 0
+        draft_prefill_ns = 0
+        draft_incremental_ns = 0
+        verify_ns_total = 0
+        replay_ns_total = 0
+        commit_ns_total = 0
+        seen_draft_cycle = False
+        acceptance_history: list[int] = []
+        profile_cycles = _profile_dflash_cycles_enabled()
+        cycle_profiles: list[dict[str, Any]] = []
+        profile_totals_ns = {
+            "draft": 0,
+            "verify": 0,
+            "acceptance": 0,
+            "hidden_extraction": 0,
+            "rollback": 0,
+            "other": 0,
+            "cycle_total": 0,
+        }
+
+        while generated_token_count < max_new_tokens:
+            cycle_start_ns = time.perf_counter_ns()
+            draft_cycle_ns = 0
+            verify_cycle_ns = 0
+            replay_cycle_ns = 0
+            commit_cycle_ns = 0
+            acceptance_cycle_ns = 0
+            hidden_extract_cycle_ns = 0
+            remaining = max_new_tokens - generated_token_count
+            block_len = max(1, min(effective_block_tokens, remaining))
+            block_token_buffer[:block_len] = draft_model.mask_token_id
+            block_token_buffer[:1] = staged_first
+            block_token_ids = block_token_buffer[:block_len]
+
+            if block_len > 1:
+                draft_start_ns = time.perf_counter_ns()
+                noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
+                draft_hidden = draft_model(
+                    noise_embedding=noise_embedding,
+                    target_hidden=target_hidden,
+                    cache=draft_cache,
+                )
+                draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
+                mx.async_eval(draft_logits)
+                mx.eval(draft_logits)
+                drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+                block_token_ids[1:block_len] = drafted
+                draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                draft_ns_total += draft_cycle_ns
+                if not seen_draft_cycle:
+                    draft_prefill_ns += draft_cycle_ns
+                    seen_draft_cycle = True
+                else:
+                    draft_incremental_ns += draft_cycle_ns
+
+            verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
+            verify_ids = verify_token_ids[None]
+            if use_speculative_linear_cache:
+                _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
+            verify_start_ns = time.perf_counter_ns()
+            verify_logits, verify_hidden_states = _verify_target_block(
+                target_model=target_model,
+                verify_ids=verify_ids,
+                target_cache=target_cache,
+                verify_chunk_tokens=verify_chunk_tokens,
+                capture_layer_ids=capture_layer_ids,
+            )
+            if profile_cycles:
+                _eval_logits_and_captured(verify_logits, verify_hidden_states)
+            verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
+            verify_ns_total += verify_cycle_ns
+
+            acceptance_start_ns = time.perf_counter_ns()
+            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            acceptance_len = int(
+                _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+            )
+            acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+            acceptance_history.append(acceptance_len)
+
+            hidden_extract_start_ns = time.perf_counter_ns()
+            committed_hidden = extract_context_feature_from_dict(
+                verify_hidden_states,
+                list(draft_model.target_layer_ids),
+            )[:, : (1 + acceptance_len), :]
+            mx.eval(committed_hidden, posterior)
+            hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
+
+            commit_count = 1 + acceptance_len
+            committed_segment = verify_token_ids[:commit_count]
+            generated_token_buffer[generated_token_count : generated_token_count + commit_count] = committed_segment
+            generated_token_count += commit_count
+            accepted_from_draft += acceptance_len
+
+            commit_start_ns = time.perf_counter_ns()
+            start += commit_count
+            target_hidden = committed_hidden
+            replay_cycle_ns = _restore_target_cache_after_acceptance(
+                target_cache,
+                target_len=start,
+                acceptance_length=acceptance_len,
+                drafted_tokens=block_len - 1,
+            )
+            replay_ns_total += replay_cycle_ns
+            cycles_completed += 1
+            commit_wall_ns = time.perf_counter_ns() - commit_start_ns
+            commit_ns_total += commit_wall_ns
+            commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
+
+            stop_hit = False
+            if stop_token_array is not None:
+                stop_hit = bool(
+                    mx.any(
+                        mx.equal(
+                            committed_segment[:, None],
+                            stop_token_array[None, :],
+                        )
+                    ).item()
+                )
+            if stop_hit:
+                break
+
+            staged_first = posterior[acceptance_len : acceptance_len + 1]
+
+            if profile_cycles:
+                cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
+                named_ns = (
+                    draft_cycle_ns
+                    + verify_cycle_ns
+                    + acceptance_cycle_ns
+                    + hidden_extract_cycle_ns
+                    + replay_cycle_ns
+                )
+                other_cycle_ns = max(0, cycle_total_ns - named_ns)
+                cycle_profiles.append(
+                    {
+                        "cycle": cycles_completed,
+                        "block_len": int(block_len),
+                        "commit_count": int(commit_count),
+                        "acceptance_len": int(acceptance_len),
+                        "draft_us": _ns_to_us(draft_cycle_ns),
+                        "verify_us": _ns_to_us(verify_cycle_ns),
+                        "acceptance_us": _ns_to_us(acceptance_cycle_ns),
+                        "hidden_extraction_us": _ns_to_us(hidden_extract_cycle_ns),
+                        "rollback_us": _ns_to_us(replay_cycle_ns),
+                        "other_us": _ns_to_us(other_cycle_ns),
+                        "cycle_total_us": _ns_to_us(cycle_total_ns),
+                    }
+                )
+                profile_totals_ns["draft"] += draft_cycle_ns
+                profile_totals_ns["verify"] += verify_cycle_ns
+                profile_totals_ns["acceptance"] += acceptance_cycle_ns
+                profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
+                profile_totals_ns["rollback"] += replay_cycle_ns
+                profile_totals_ns["other"] += other_cycle_ns
+                profile_totals_ns["cycle_total"] += cycle_total_ns
+
+        elapsed_us = (time.perf_counter_ns() - start_ns) / 1_000.0
+        generated_token_ids = (
+            generated_token_buffer[:generated_token_count].tolist()
+            if generated_token_count > 0
+            else []
+        )
+        first_20 = acceptance_history[:20]
+        last_20 = acceptance_history[-20:]
+        result = {
+            "elapsed_us": elapsed_us,
+            "prompt_token_count": prompt_len,
+            "generated_token_ids": generated_token_ids,
+            "generation_tokens": len(generated_token_ids),
+            "accepted_from_draft": accepted_from_draft,
+            "acceptance_ratio": (
+                accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
+            ),
+            "block_tokens": effective_block_tokens,
+            "cycles_completed": cycles_completed,
+            "phase_timings_us": {
+                "prefill": prefill_ns / 1_000.0,
+                "draft": draft_ns_total / 1_000.0,
+                "draft_prefill": draft_prefill_ns / 1_000.0,
+                "draft_incremental": draft_incremental_ns / 1_000.0,
+                "verify": verify_ns_total / 1_000.0,
+                "replay": replay_ns_total / 1_000.0,
+                "commit": commit_ns_total / 1_000.0,
+            },
+            "speculative_linear_cache": use_speculative_linear_cache,
+            "verify_chunk_tokens": int(verify_chunk_tokens) if verify_chunk_tokens else None,
+            "verify_len_cap": int(verify_len_cap),
+            "quantize_kv_cache": bool(quantize_kv_cache),
+            "tokens_per_cycle": (len(generated_token_ids) / cycles_completed) if cycles_completed > 0 else 0.0,
+            "acceptance_first_20_avg": (sum(first_20) / len(first_20)) if first_20 else 0.0,
+            "acceptance_last_20_avg": (sum(last_20) / len(last_20)) if last_20 else 0.0,
+            "peak_memory_gb": float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else None,
+        }
         if profile_cycles:
-            _eval_logits_and_captured(verify_logits, verify_hidden_states)
-        verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
-        verify_ns_total += verify_cycle_ns
-
-        acceptance_start_ns = time.perf_counter_ns()
-        posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
-        acceptance_len = int(
-            _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
-        )
-        acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
-        acceptance_history.append(acceptance_len)
-
-        hidden_extract_start_ns = time.perf_counter_ns()
-        committed_hidden = extract_context_feature_from_dict(
-            verify_hidden_states,
-            list(draft_model.target_layer_ids),
-        )[:, : (1 + acceptance_len), :]
-        mx.eval(committed_hidden, posterior)
-        hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
-
-        commit_count = 1 + acceptance_len
-        committed_segment = verify_token_ids[:commit_count]
-        generated_token_buffer[generated_token_count : generated_token_count + commit_count] = committed_segment
-        generated_token_count += commit_count
-        accepted_from_draft += acceptance_len
-
-        commit_start_ns = time.perf_counter_ns()
-        start += commit_count
-        target_hidden = committed_hidden
-        replay_cycle_ns = _restore_target_cache_after_acceptance(
-            target_cache,
-            target_len=start,
-            acceptance_length=acceptance_len,
-            drafted_tokens=block_len - 1,
-        )
-        replay_ns_total += replay_cycle_ns
-        cycles_completed += 1
-        commit_wall_ns = time.perf_counter_ns() - commit_start_ns
-        commit_ns_total += commit_wall_ns
-        commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
-
-        stop_hit = False
-        if stop_token_array is not None:
-            stop_hit = bool(
-                mx.any(
-                    mx.equal(
-                        committed_segment[:, None],
-                        stop_token_array[None, :],
-                    )
-                ).item()
-            )
-        if stop_hit:
-            break
-
-        staged_first = posterior[acceptance_len : acceptance_len + 1]
-
-        if profile_cycles:
-            cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
-            named_ns = (
-                draft_cycle_ns
-                + verify_cycle_ns
-                + acceptance_cycle_ns
-                + hidden_extract_cycle_ns
-                + replay_cycle_ns
-            )
-            other_cycle_ns = max(0, cycle_total_ns - named_ns)
-            cycle_profiles.append(
-                {
-                    "cycle": cycles_completed,
-                    "block_len": int(block_len),
-                    "commit_count": int(commit_count),
-                    "acceptance_len": int(acceptance_len),
-                    "draft_us": _ns_to_us(draft_cycle_ns),
-                    "verify_us": _ns_to_us(verify_cycle_ns),
-                    "acceptance_us": _ns_to_us(acceptance_cycle_ns),
-                    "hidden_extraction_us": _ns_to_us(hidden_extract_cycle_ns),
-                    "rollback_us": _ns_to_us(replay_cycle_ns),
-                    "other_us": _ns_to_us(other_cycle_ns),
-                    "cycle_total_us": _ns_to_us(cycle_total_ns),
-                }
-            )
-            profile_totals_ns["draft"] += draft_cycle_ns
-            profile_totals_ns["verify"] += verify_cycle_ns
-            profile_totals_ns["acceptance"] += acceptance_cycle_ns
-            profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
-            profile_totals_ns["rollback"] += replay_cycle_ns
-            profile_totals_ns["other"] += other_cycle_ns
-            profile_totals_ns["cycle_total"] += cycle_total_ns
-
-    elapsed_us = (time.perf_counter_ns() - start_ns) / 1_000.0
-    generated_token_ids = (
-        generated_token_buffer[:generated_token_count].tolist()
-        if generated_token_count > 0
-        else []
-    )
-    first_20 = acceptance_history[:20]
-    last_20 = acceptance_history[-20:]
-    result = {
-        "elapsed_us": elapsed_us,
-        "prompt_token_count": prompt_len,
-        "generated_token_ids": generated_token_ids,
-        "generation_tokens": len(generated_token_ids),
-        "accepted_from_draft": accepted_from_draft,
-        "acceptance_ratio": (
-            accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
-        ),
-        "block_tokens": effective_block_tokens,
-        "cycles_completed": cycles_completed,
-        "phase_timings_us": {
-            "prefill": prefill_ns / 1_000.0,
-            "draft": draft_ns_total / 1_000.0,
-            "draft_prefill": draft_prefill_ns / 1_000.0,
-            "draft_incremental": draft_incremental_ns / 1_000.0,
-            "verify": verify_ns_total / 1_000.0,
-            "replay": replay_ns_total / 1_000.0,
-            "commit": commit_ns_total / 1_000.0,
-        },
-        "speculative_linear_cache": use_speculative_linear_cache,
-        "verify_chunk_tokens": int(verify_chunk_tokens) if verify_chunk_tokens else None,
-        "verify_len_cap": int(verify_len_cap),
-        "quantize_kv_cache": bool(quantize_kv_cache),
-        "tokens_per_cycle": (len(generated_token_ids) / cycles_completed) if cycles_completed > 0 else 0.0,
-        "acceptance_first_20_avg": (sum(first_20) / len(first_20)) if first_20 else 0.0,
-        "acceptance_last_20_avg": (sum(last_20) / len(last_20)) if last_20 else 0.0,
-        "peak_memory_gb": float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else None,
-    }
-    if profile_cycles:
-        result["cycle_profile_us"] = cycle_profiles
-        result["cycle_profile_totals_us"] = {key: _ns_to_us(value) for key, value in profile_totals_ns.items()}
-    return result
+            result["cycle_profile_us"] = cycle_profiles
+            result["cycle_profile_totals_us"] = {key: _ns_to_us(value) for key, value in profile_totals_ns.items()}
+        return result
+    finally:
+        _cleanup_generation_caches(target_cache, draft_cache)
+        del draft_cache
+        del target_cache
 
 
 def stream_dflash_generate(
@@ -1461,232 +1496,255 @@ def stream_dflash_generate(
     ]
     capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
 
-    start_ns = time.perf_counter_ns()
-    prefill_start_ns = time.perf_counter_ns()
-    prefill_logits, prefill_hidden_states = target_forward_with_hidden_states(
-        target_model,
-        input_ids=prompt_array,
-        cache=target_cache,
-        capture_layer_ids=capture_layer_ids,
-    )
-    _eval_logits_and_captured(prefill_logits, prefill_hidden_states)
-    prefill_ns = time.perf_counter_ns() - prefill_start_ns
-
-    suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
-    staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
-    target_hidden = extract_context_feature_from_dict(
-        prefill_hidden_states,
-        list(draft_model.target_layer_ids),
-    )
-
-    yield {
-        "event": "prefill",
-        "prefill_us": prefill_ns / 1_000.0,
-        "prompt_token_count": prompt_len,
-    }
-
-    draft_block_size = int(draft_model.block_size)
-    requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
-    effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
-    block_token_buffer = mx.full((effective_block_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
-    generated_token_ids: list[int] = []
-    accepted_from_draft = 0
-    cycles_completed = 0
-    verify_len_cap = _resolve_verify_len_cap(target_model, effective_block_tokens)
-    start = prompt_len
-
-    draft_ns_total = 0
-    draft_prefill_ns = 0
-    draft_incremental_ns = 0
-    verify_ns_total = 0
-    replay_ns_total = 0
-    commit_ns_total = 0
-    seen_draft_cycle = False
-    profile_cycles = _profile_dflash_cycles_enabled()
-    cycle_profiles: list[dict[str, Any]] = []
-    profile_totals_ns = {
-        "draft": 0,
-        "verify": 0,
-        "acceptance": 0,
-        "hidden_extraction": 0,
-        "rollback": 0,
-        "other": 0,
-        "cycle_total": 0,
-    }
-
-    while len(generated_token_ids) < max_new_tokens:
-        cycle_start_ns = time.perf_counter_ns()
-        draft_cycle_ns = 0
-        verify_cycle_ns = 0
-        replay_cycle_ns = 0
-        commit_cycle_ns = 0
-        acceptance_cycle_ns = 0
-        hidden_extract_cycle_ns = 0
-        remaining = max_new_tokens - len(generated_token_ids)
-        block_len = max(1, min(effective_block_tokens, remaining))
-        block_token_buffer[:block_len] = draft_model.mask_token_id
-        block_token_buffer[:1] = staged_first
-        block_token_ids = block_token_buffer[:block_len]
-
-        if block_len > 1:
-            draft_start_ns = time.perf_counter_ns()
-            noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
-            draft_hidden = draft_model(
-                noise_embedding=noise_embedding,
-                target_hidden=target_hidden,
-                cache=draft_cache,
+    try:
+        start_ns = time.perf_counter_ns()
+        prefill_start_ns = time.perf_counter_ns()
+        prefill_step_size = 2048
+        prefill_logits = None
+        target_hidden_chunks: list[mx.array] = []
+        for chunk_start in range(0, prompt_len, prefill_step_size):
+            chunk_end = min(chunk_start + prefill_step_size, prompt_len)
+            chunk_ids = prompt_array[:, chunk_start:chunk_end]
+            prefill_logits, prefill_hidden_states = target_forward_with_hidden_states(
+                target_model,
+                input_ids=chunk_ids,
+                cache=target_cache,
+                capture_layer_ids=capture_layer_ids,
             )
-            draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-            mx.async_eval(draft_logits)
-            mx.eval(draft_logits)
-            drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
-            block_token_ids[1:block_len] = drafted
-            draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
-            draft_ns_total += draft_cycle_ns
-            if not seen_draft_cycle:
-                draft_prefill_ns += draft_cycle_ns
-                seen_draft_cycle = True
-            else:
-                draft_incremental_ns += draft_cycle_ns
-
-        verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
-        verify_ids = verify_token_ids[None]
-        _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
-        verify_start_ns = time.perf_counter_ns()
-        verify_logits, verify_hidden_states = _verify_target_block(
-            target_model=target_model,
-            verify_ids=verify_ids,
-            target_cache=target_cache,
-            verify_chunk_tokens=None,
-            capture_layer_ids=capture_layer_ids,
-        )
-        if profile_cycles:
-            _eval_logits_and_captured(verify_logits, verify_hidden_states)
-        verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
-        verify_ns_total += verify_cycle_ns
-
-        acceptance_start_ns = time.perf_counter_ns()
-        posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
-        acceptance_len = int(
-            _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
-        )
-        acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
-        hidden_extract_start_ns = time.perf_counter_ns()
-        committed_hidden = extract_context_feature_from_dict(
-            verify_hidden_states,
-            list(draft_model.target_layer_ids),
-        )[:, : (1 + acceptance_len), :]
-        mx.eval(committed_hidden, posterior)
-        hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
-
-        commit_count = 1 + acceptance_len
-        committed_segment = verify_token_ids[:commit_count]
-        commit_start_ns = time.perf_counter_ns()
-        start += commit_count
-        target_hidden = committed_hidden
-        replay_cycle_ns = _restore_target_cache_after_acceptance(
-            target_cache,
-            target_len=start,
-            acceptance_length=acceptance_len,
-            drafted_tokens=block_len - 1,
-        )
-        replay_ns_total += replay_cycle_ns
-        cycles_completed += 1
-        commit_wall_ns = time.perf_counter_ns() - commit_start_ns
-        commit_ns_total += commit_wall_ns
-        commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
-
-        accepted_from_draft += acceptance_len
-        committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
-        for token_id in committed_ids:
-            if len(generated_token_ids) >= max_new_tokens:
-                break
-            generated_token_ids.append(token_id)
+            _eval_logits_and_captured(prefill_logits, prefill_hidden_states)
+            target_hidden_chunks.append(
+                extract_context_feature_from_dict(
+                    prefill_hidden_states,
+                    list(draft_model.target_layer_ids),
+                )
+            )
             yield {
-                "event": "token",
-                "token_id": token_id,
-                "generated_tokens": len(generated_token_ids),
-                "acceptance_ratio": (
-                    accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
-                ),
-                "cycles_completed": cycles_completed,
+                "event": "prefill_progress",
+                "tokens_processed": chunk_end,
+                "tokens_total": prompt_len,
             }
+        prefill_ns = time.perf_counter_ns() - prefill_start_ns
 
-        stop_hit = False
-        if stop_token_array is not None:
-            stop_hit = bool(
-                mx.any(
-                    mx.equal(
-                        committed_segment[:, None],
-                        stop_token_array[None, :],
-                    )
-                ).item()
-            )
-        if stop_hit:
-            break
+        suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
+        staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
+        target_hidden = (
+            target_hidden_chunks[0]
+            if len(target_hidden_chunks) == 1
+            else mx.concatenate(target_hidden_chunks, axis=1)
+        )
 
-        staged_first = posterior[acceptance_len : acceptance_len + 1]
-
-        if profile_cycles:
-            cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
-            named_ns = (
-                draft_cycle_ns
-                + verify_cycle_ns
-                + acceptance_cycle_ns
-                + hidden_extract_cycle_ns
-                + replay_cycle_ns
-            )
-            other_cycle_ns = max(0, cycle_total_ns - named_ns)
-            cycle_profiles.append(
-                {
-                    "cycle": cycles_completed,
-                    "block_len": int(block_len),
-                    "commit_count": int(commit_count),
-                    "acceptance_len": int(acceptance_len),
-                    "draft_us": _ns_to_us(draft_cycle_ns),
-                    "verify_us": _ns_to_us(verify_cycle_ns),
-                    "acceptance_us": _ns_to_us(acceptance_cycle_ns),
-                    "hidden_extraction_us": _ns_to_us(hidden_extract_cycle_ns),
-                    "rollback_us": _ns_to_us(replay_cycle_ns),
-                    "other_us": _ns_to_us(other_cycle_ns),
-                    "cycle_total_us": _ns_to_us(cycle_total_ns),
-                }
-            )
-            profile_totals_ns["draft"] += draft_cycle_ns
-            profile_totals_ns["verify"] += verify_cycle_ns
-            profile_totals_ns["acceptance"] += acceptance_cycle_ns
-            profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
-            profile_totals_ns["rollback"] += replay_cycle_ns
-            profile_totals_ns["other"] += other_cycle_ns
-            profile_totals_ns["cycle_total"] += cycle_total_ns
-
-    elapsed_us = (time.perf_counter_ns() - start_ns) / 1_000.0
-    summary = {
-        "event": "summary",
-        "elapsed_us": elapsed_us,
-        "prompt_token_count": prompt_len,
-        "generated_token_ids": generated_token_ids,
-        "generation_tokens": len(generated_token_ids),
-        "accepted_from_draft": accepted_from_draft,
-        "acceptance_ratio": (
-            accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
-        ),
-        "block_tokens": effective_block_tokens,
-        "cycles_completed": cycles_completed,
-        "phase_timings_us": {
-            "prefill": prefill_ns / 1_000.0,
-            "draft": draft_ns_total / 1_000.0,
-            "draft_prefill": draft_prefill_ns / 1_000.0,
-            "draft_incremental": draft_incremental_ns / 1_000.0,
-            "verify": verify_ns_total / 1_000.0,
-            "replay": replay_ns_total / 1_000.0,
-            "commit": commit_ns_total / 1_000.0,
-        },
-        "verify_len_cap": int(verify_len_cap),
-    }
-    if profile_cycles:
-        summary["cycle_profile_us"] = cycle_profiles
-        summary["cycle_profile_totals_us"] = {
-            key: _ns_to_us(value) for key, value in profile_totals_ns.items()
+        yield {
+            "event": "prefill",
+            "prefill_us": prefill_ns / 1_000.0,
+            "prompt_token_count": prompt_len,
         }
-    yield summary
+
+        draft_block_size = int(draft_model.block_size)
+        requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
+        effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+        block_token_buffer = mx.full((effective_block_tokens,), draft_model.mask_token_id, dtype=mx.uint32)
+        generated_token_ids: list[int] = []
+        accepted_from_draft = 0
+        cycles_completed = 0
+        verify_len_cap = _resolve_verify_len_cap(target_model, effective_block_tokens)
+        start = prompt_len
+
+        draft_ns_total = 0
+        draft_prefill_ns = 0
+        draft_incremental_ns = 0
+        verify_ns_total = 0
+        replay_ns_total = 0
+        commit_ns_total = 0
+        seen_draft_cycle = False
+        profile_cycles = _profile_dflash_cycles_enabled()
+        cycle_profiles: list[dict[str, Any]] = []
+        profile_totals_ns = {
+            "draft": 0,
+            "verify": 0,
+            "acceptance": 0,
+            "hidden_extraction": 0,
+            "rollback": 0,
+            "other": 0,
+            "cycle_total": 0,
+        }
+
+        while len(generated_token_ids) < max_new_tokens:
+            cycle_start_ns = time.perf_counter_ns()
+            draft_cycle_ns = 0
+            verify_cycle_ns = 0
+            replay_cycle_ns = 0
+            commit_cycle_ns = 0
+            acceptance_cycle_ns = 0
+            hidden_extract_cycle_ns = 0
+            remaining = max_new_tokens - len(generated_token_ids)
+            block_len = max(1, min(effective_block_tokens, remaining))
+            block_token_buffer[:block_len] = draft_model.mask_token_id
+            block_token_buffer[:1] = staged_first
+            block_token_ids = block_token_buffer[:block_len]
+
+            if block_len > 1:
+                draft_start_ns = time.perf_counter_ns()
+                noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
+                draft_hidden = draft_model(
+                    noise_embedding=noise_embedding,
+                    target_hidden=target_hidden,
+                    cache=draft_cache,
+                )
+                draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
+                mx.async_eval(draft_logits)
+                mx.eval(draft_logits)
+                drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+                block_token_ids[1:block_len] = drafted
+                draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                draft_ns_total += draft_cycle_ns
+                if not seen_draft_cycle:
+                    draft_prefill_ns += draft_cycle_ns
+                    seen_draft_cycle = True
+                else:
+                    draft_incremental_ns += draft_cycle_ns
+
+            verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
+            verify_ids = verify_token_ids[None]
+            _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
+            verify_start_ns = time.perf_counter_ns()
+            verify_logits, verify_hidden_states = _verify_target_block(
+                target_model=target_model,
+                verify_ids=verify_ids,
+                target_cache=target_cache,
+                verify_chunk_tokens=None,
+                capture_layer_ids=capture_layer_ids,
+            )
+            if profile_cycles:
+                _eval_logits_and_captured(verify_logits, verify_hidden_states)
+            verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
+            verify_ns_total += verify_cycle_ns
+
+            acceptance_start_ns = time.perf_counter_ns()
+            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            acceptance_len = int(
+                _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+            )
+            acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+            hidden_extract_start_ns = time.perf_counter_ns()
+            committed_hidden = extract_context_feature_from_dict(
+                verify_hidden_states,
+                list(draft_model.target_layer_ids),
+            )[:, : (1 + acceptance_len), :]
+            mx.eval(committed_hidden, posterior)
+            hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
+
+            commit_count = 1 + acceptance_len
+            committed_segment = verify_token_ids[:commit_count]
+            commit_start_ns = time.perf_counter_ns()
+            start += commit_count
+            target_hidden = committed_hidden
+            replay_cycle_ns = _restore_target_cache_after_acceptance(
+                target_cache,
+                target_len=start,
+                acceptance_length=acceptance_len,
+                drafted_tokens=block_len - 1,
+            )
+            replay_ns_total += replay_cycle_ns
+            cycles_completed += 1
+            commit_wall_ns = time.perf_counter_ns() - commit_start_ns
+            commit_ns_total += commit_wall_ns
+            commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
+
+            accepted_from_draft += acceptance_len
+            committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
+            for token_id in committed_ids:
+                if len(generated_token_ids) >= max_new_tokens:
+                    break
+                generated_token_ids.append(token_id)
+                yield {
+                    "event": "token",
+                    "token_id": token_id,
+                    "generated_tokens": len(generated_token_ids),
+                    "acceptance_ratio": (
+                        accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
+                    ),
+                    "cycles_completed": cycles_completed,
+                }
+
+            stop_hit = False
+            if stop_token_array is not None:
+                stop_hit = bool(
+                    mx.any(
+                        mx.equal(
+                            committed_segment[:, None],
+                            stop_token_array[None, :],
+                        )
+                    ).item()
+                )
+            if stop_hit:
+                break
+
+            staged_first = posterior[acceptance_len : acceptance_len + 1]
+
+            if profile_cycles:
+                cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
+                named_ns = (
+                    draft_cycle_ns
+                    + verify_cycle_ns
+                    + acceptance_cycle_ns
+                    + hidden_extract_cycle_ns
+                    + replay_cycle_ns
+                )
+                other_cycle_ns = max(0, cycle_total_ns - named_ns)
+                cycle_profiles.append(
+                    {
+                        "cycle": cycles_completed,
+                        "block_len": int(block_len),
+                        "commit_count": int(commit_count),
+                        "acceptance_len": int(acceptance_len),
+                        "draft_us": _ns_to_us(draft_cycle_ns),
+                        "verify_us": _ns_to_us(verify_cycle_ns),
+                        "acceptance_us": _ns_to_us(acceptance_cycle_ns),
+                        "hidden_extraction_us": _ns_to_us(hidden_extract_cycle_ns),
+                        "rollback_us": _ns_to_us(replay_cycle_ns),
+                        "other_us": _ns_to_us(other_cycle_ns),
+                        "cycle_total_us": _ns_to_us(cycle_total_ns),
+                    }
+                )
+                profile_totals_ns["draft"] += draft_cycle_ns
+                profile_totals_ns["verify"] += verify_cycle_ns
+                profile_totals_ns["acceptance"] += acceptance_cycle_ns
+                profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
+                profile_totals_ns["rollback"] += replay_cycle_ns
+                profile_totals_ns["other"] += other_cycle_ns
+                profile_totals_ns["cycle_total"] += cycle_total_ns
+
+        elapsed_us = (time.perf_counter_ns() - start_ns) / 1_000.0
+        summary = {
+            "event": "summary",
+            "elapsed_us": elapsed_us,
+            "prompt_token_count": prompt_len,
+            "generated_token_ids": generated_token_ids,
+            "generation_tokens": len(generated_token_ids),
+            "accepted_from_draft": accepted_from_draft,
+            "acceptance_ratio": (
+                accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
+            ),
+            "block_tokens": effective_block_tokens,
+            "cycles_completed": cycles_completed,
+            "phase_timings_us": {
+                "prefill": prefill_ns / 1_000.0,
+                "draft": draft_ns_total / 1_000.0,
+                "draft_prefill": draft_prefill_ns / 1_000.0,
+                "draft_incremental": draft_incremental_ns / 1_000.0,
+                "verify": verify_ns_total / 1_000.0,
+                "replay": replay_ns_total / 1_000.0,
+                "commit": commit_ns_total / 1_000.0,
+            },
+            "verify_len_cap": int(verify_len_cap),
+        }
+        if profile_cycles:
+            summary["cycle_profile_us"] = cycle_profiles
+            summary["cycle_profile_totals_us"] = {
+                key: _ns_to_us(value) for key, value in profile_totals_ns.items()
+            }
+        yield summary
+    finally:
+        _cleanup_generation_caches(target_cache, draft_cache)
+        del draft_cache
+        del target_cache
