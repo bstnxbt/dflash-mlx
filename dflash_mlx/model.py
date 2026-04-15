@@ -12,7 +12,6 @@ from mlx_lm.models.base import scaled_dot_product_attention
 from mlx_lm.models.qwen3 import MLP
 from mlx_lm.models.rope_utils import initialize_rope
 
-
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
     if num_draft_layers <= 1:
         return [num_target_layers // 2]

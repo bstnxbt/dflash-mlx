@@ -20,8 +20,9 @@ from mlx_lm.models.base import (
 )
 from mlx_lm.utils import load, load_model
 
+from dflash_mlx.adapter import detect_engine
+from dflash_mlx.draft_backend import make_draft_backend
 from dflash_mlx.model import (
-    ContextOnlyDraftKVCache,
     DFlashDraftModel,
     DFlashDraftModelArgs,
     extract_context_feature,
@@ -858,35 +859,6 @@ def _cleanup_generation_caches(
     target_cache.clear()
 
 
-def _launch_prefetched_draft(
-    *,
-    target_model: Any,
-    draft_model: DFlashDraftModel,
-    draft_cache: list[Any],
-    staged_first: mx.array,
-    target_hidden: mx.array,
-    block_len: int,
-    mask_token_tail: mx.array,
-    suppress_token_mask: Optional[mx.array],
-) -> mx.array:
-    if int(block_len) <= 1:
-        raise ValueError("prefetched draft requires block_len > 1")
-    block_token_ids = mx.concatenate(
-        [staged_first[:1], mask_token_tail[: int(block_len) - 1]],
-        axis=0,
-    )
-    noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
-    draft_hidden = draft_model(
-        noise_embedding=noise_embedding,
-        target_hidden=target_hidden,
-        cache=draft_cache,
-    )
-    draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-    drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
-    mx.async_eval(drafted)
-    return drafted
-
-
 def _restore_target_cache_after_acceptance(
     cache_entries: list[Any],
     *,
@@ -1200,19 +1172,19 @@ def generate_dflash_once(
     )
 
     use_speculative_linear_cache = verify_chunk_tokens is None
+    engine = detect_engine(target_model)
+    draft_backend = make_draft_backend()
     target_cache = make_target_cache(
         target_model,
         enable_speculative_linear_cache=use_speculative_linear_cache,
         quantize_kv_cache=quantize_kv_cache,
     )
 
-    draft_cache = [
-        ContextOnlyDraftKVCache(
-            sink_size=draft_sink_size,
-            window_size=draft_window_size,
-        )
-        for _ in range(len(draft_model.layers))
-    ]
+    draft_cache = draft_backend.make_cache(
+        draft_model=draft_model,
+        sink_size=draft_sink_size,
+        window_size=draft_window_size,
+    )
     target_layer_id_list = list(draft_model.target_layer_ids)
     capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
     mask_token_id = int(draft_model.mask_token_id)
@@ -1305,15 +1277,17 @@ def generate_dflash_once(
             if block_len > 1:
                 if profile_cycles:
                     draft_start_ns = time.perf_counter_ns()
-                    noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
-                    draft_hidden = draft_model(
-                        noise_embedding=noise_embedding,
+                    drafted = draft_backend.draft_greedy(
+                        target_model=target_model,
+                        draft_model=draft_model,
+                        draft_cache=draft_cache,
+                        staged_first=current_staged_first,
                         target_hidden=target_hidden,
-                        cache=draft_cache,
+                        block_len=block_len,
+                        mask_token_tail=mask_token_tail,
+                        suppress_token_mask=suppress_token_mask,
+                        async_launch=False,
                     )
-                    draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-                    drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
-                    mx.eval(draft_logits)
                     block_token_ids[1:block_len] = drafted
                     draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                 else:
@@ -1325,7 +1299,7 @@ def generate_dflash_once(
                         current_staged_first = prefetched_draft["staged_first"]
                     else:
                         draft_start_ns = time.perf_counter_ns()
-                        drafted = _launch_prefetched_draft(
+                        drafted = draft_backend.draft_greedy(
                             target_model=target_model,
                             draft_model=draft_model,
                             draft_cache=draft_cache,
@@ -1334,6 +1308,7 @@ def generate_dflash_once(
                             block_len=block_len,
                             mask_token_tail=mask_token_tail,
                             suppress_token_mask=suppress_token_mask,
+                            async_launch=True,
                         )
                         draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                     prefetched_draft = None
@@ -1356,9 +1331,9 @@ def generate_dflash_once(
                 )
             verify_ids = verify_token_ids[None]
             if use_speculative_linear_cache:
-                _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
+                engine.arm_rollback(target_cache, prefix_len=start)
             verify_start_ns = time.perf_counter_ns()
-            verify_logits, verify_hidden_states = _verify_target_block(
+            verify_logits, verify_hidden_states = engine.verify(
                 target_model=target_model,
                 verify_ids=verify_ids,
                 target_cache=target_cache,
@@ -1403,7 +1378,7 @@ def generate_dflash_once(
                 next_block_len = max(1, min(effective_block_tokens, next_remaining))
                 if next_remaining > 0 and next_block_len > 1:
                     draft_start_ns = time.perf_counter_ns()
-                    next_drafted = _launch_prefetched_draft(
+                    next_drafted = draft_backend.draft_greedy(
                         target_model=target_model,
                         draft_model=draft_model,
                         draft_cache=draft_cache,
@@ -1412,6 +1387,7 @@ def generate_dflash_once(
                         block_len=next_block_len,
                         mask_token_tail=mask_token_tail,
                         suppress_token_mask=suppress_token_mask,
+                        async_launch=True,
                     )
                     launch_ns = time.perf_counter_ns() - draft_start_ns
                     draft_ns_total += launch_ns
@@ -1427,10 +1403,10 @@ def generate_dflash_once(
             commit_start_ns = time.perf_counter_ns()
             start += commit_count
             target_hidden = committed_hidden
-            replay_cycle_ns = _restore_target_cache_after_acceptance(
+            replay_cycle_ns = engine.rollback(
                 target_cache,
                 target_len=start,
-                acceptance_length=acceptance_len,
+                acceptance_len=acceptance_len,
                 drafted_tokens=block_len - 1,
             )
             replay_ns_total += replay_cycle_ns
@@ -1585,18 +1561,18 @@ def stream_dflash_generate(
     )
 
     use_speculative_linear_cache = verify_chunk_tokens is None
+    engine = detect_engine(target_model)
+    draft_backend = make_draft_backend()
     target_cache = make_target_cache(
         target_model,
         enable_speculative_linear_cache=use_speculative_linear_cache,
         quantize_kv_cache=quantize_kv_cache,
     )
-    draft_cache = [
-        ContextOnlyDraftKVCache(
-            sink_size=draft_sink_size,
-            window_size=draft_window_size,
-        )
-        for _ in range(len(draft_model.layers))
-    ]
+    draft_cache = draft_backend.make_cache(
+        draft_model=draft_model,
+        sink_size=draft_sink_size,
+        window_size=draft_window_size,
+    )
     target_layer_id_list = list(draft_model.target_layer_ids)
     capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
     profile_cycles = _profile_dflash_cycles_enabled()
@@ -1712,15 +1688,17 @@ def stream_dflash_generate(
             if block_len > 1:
                 if profile_cycles:
                     draft_start_ns = time.perf_counter_ns()
-                    noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
-                    draft_hidden = draft_model(
-                        noise_embedding=noise_embedding,
+                    drafted = draft_backend.draft_greedy(
+                        target_model=target_model,
+                        draft_model=draft_model,
+                        draft_cache=draft_cache,
+                        staged_first=current_staged_first,
                         target_hidden=target_hidden,
-                        cache=draft_cache,
+                        block_len=block_len,
+                        mask_token_tail=mask_token_tail,
+                        suppress_token_mask=suppress_token_mask,
+                        async_launch=False,
                     )
-                    draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-                    drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
-                    mx.eval(draft_logits)
                     block_token_ids[1:block_len] = drafted
                 else:
                     if (
@@ -1731,7 +1709,7 @@ def stream_dflash_generate(
                         current_staged_first = prefetched_draft["staged_first"]
                     else:
                         draft_start_ns = time.perf_counter_ns()
-                        drafted = _launch_prefetched_draft(
+                        drafted = draft_backend.draft_greedy(
                             target_model=target_model,
                             draft_model=draft_model,
                             draft_cache=draft_cache,
@@ -1740,6 +1718,7 @@ def stream_dflash_generate(
                             block_len=block_len,
                             mask_token_tail=mask_token_tail,
                             suppress_token_mask=suppress_token_mask,
+                            async_launch=True,
                         )
                         draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                     prefetched_draft = None
@@ -1761,9 +1740,9 @@ def stream_dflash_generate(
                     axis=0,
                 )
             verify_ids = verify_token_ids[None]
-            _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
+            engine.arm_rollback(target_cache, prefix_len=start)
             verify_start_ns = time.perf_counter_ns()
-            verify_logits, verify_hidden_states = _verify_target_block(
+            verify_logits, verify_hidden_states = engine.verify(
                 target_model=target_model,
                 verify_ids=verify_ids,
                 target_cache=target_cache,
@@ -1799,10 +1778,10 @@ def stream_dflash_generate(
             commit_start_ns = time.perf_counter_ns()
             start += commit_count
             target_hidden = committed_hidden
-            replay_cycle_ns = _restore_target_cache_after_acceptance(
+            replay_cycle_ns = engine.rollback(
                 target_cache,
                 target_len=start,
-                acceptance_length=acceptance_len,
+                acceptance_len=acceptance_len,
                 drafted_tokens=block_len - 1,
             )
             replay_ns_total += replay_cycle_ns
@@ -1818,7 +1797,7 @@ def stream_dflash_generate(
                 next_block_len = max(1, min(effective_block_tokens, next_remaining))
                 if next_remaining > 0 and next_block_len > 1:
                     draft_start_ns = time.perf_counter_ns()
-                    next_drafted = _launch_prefetched_draft(
+                    next_drafted = draft_backend.draft_greedy(
                         target_model=target_model,
                         draft_model=draft_model,
                         draft_cache=draft_cache,
@@ -1827,6 +1806,7 @@ def stream_dflash_generate(
                         block_len=next_block_len,
                         mask_token_tail=mask_token_tail,
                         suppress_token_mask=suppress_token_mask,
+                        async_launch=True,
                     )
                     launch_ns = time.perf_counter_ns() - draft_start_ns
                     draft_ns_total += launch_ns
