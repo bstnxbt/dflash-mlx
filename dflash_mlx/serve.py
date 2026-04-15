@@ -210,6 +210,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
             pending_state: Optional[str] = "normal"
             pending_match: Optional[tuple[int, ...]] = None
             pending_finish_reason: Optional[str] = None
+            first_token_flushed = False
             finish_reason: Optional[str] = None
             summary_event: Optional[dict[str, Any]] = None
             request_start_ns = time.perf_counter_ns()
@@ -301,6 +302,27 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                     if token not in eos_token_ids:
                         detokenizer.add_token(token)
                         text = detokenizer.last_segment
+
+                    if not first_token_flushed:
+                        immediate_finish_reason = token_finish_reason
+                        if immediate_finish_reason is None:
+                            if token in eos_token_ids:
+                                immediate_finish_reason = "stop"
+                            elif live_token_count >= int(args.max_tokens):
+                                immediate_finish_reason = "length"
+                        rqueue.put(
+                            self._make_response(
+                                text=text,
+                                token=token,
+                                state=current_state or "normal",
+                                match=match_sequence,
+                                finish_reason=immediate_finish_reason,
+                            )
+                        )
+                        first_token_flushed = True
+                        if ctx._should_stop:
+                            break
+                        continue
 
                     if pending_token is not None:
                         rqueue.put(

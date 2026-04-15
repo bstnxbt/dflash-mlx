@@ -1543,6 +1543,7 @@ def stream_dflash_generate(
     max_new_tokens: int,
     use_chat_template: bool = False,
     block_tokens: Optional[int] = None,
+    verify_chunk_tokens: Optional[int] = None,
     stop_token_ids: Optional[list[int]] = None,
     suppress_token_ids: Optional[list[int]] = None,
     prompt_tokens_override: Optional[list[int]] = None,
@@ -1583,9 +1584,10 @@ def stream_dflash_generate(
         mx.array(stop_token_ids, dtype=mx.uint32) if stop_token_ids else None
     )
 
+    use_speculative_linear_cache = verify_chunk_tokens is None
     target_cache = make_target_cache(
         target_model,
-        enable_speculative_linear_cache=True,
+        enable_speculative_linear_cache=use_speculative_linear_cache,
         quantize_kv_cache=quantize_kv_cache,
     )
     draft_cache = [
@@ -1641,6 +1643,17 @@ def stream_dflash_generate(
             "prefill_us": prefill_ns / 1_000.0,
             "prompt_token_count": prompt_len,
         }
+
+        first_token_yielded = False
+        if max_new_tokens > 0:
+            first_token_yielded = True
+            yield {
+                "event": "token",
+                "token_id": int(staged_first.item()),
+                "generated_tokens": 1,
+                "acceptance_ratio": 0.0,
+                "cycles_completed": 0,
+            }
 
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
@@ -1754,7 +1767,7 @@ def stream_dflash_generate(
                 target_model=target_model,
                 verify_ids=verify_ids,
                 target_cache=target_cache,
-                verify_chunk_tokens=None,
+                verify_chunk_tokens=verify_chunk_tokens,
                 capture_layer_ids=capture_layer_ids,
             )
             if profile_cycles:
@@ -1830,6 +1843,9 @@ def stream_dflash_generate(
                 if len(generated_token_ids) >= max_new_tokens:
                     break
                 generated_token_ids.append(token_id)
+                if first_token_yielded:
+                    first_token_yielded = False
+                    continue
                 yield {
                     "event": "token",
                     "token_id": token_id,
@@ -1911,6 +1927,9 @@ def stream_dflash_generate(
                 "commit": commit_ns_total / 1_000.0,
             },
             "verify_len_cap": int(verify_len_cap),
+            "speculative_linear_cache": bool(use_speculative_linear_cache),
+            "verify_chunk_tokens": int(verify_chunk_tokens) if verify_chunk_tokens else None,
+            "quantize_kv_cache": bool(quantize_kv_cache),
         }
         if profile_cycles:
             summary["cycle_profile_us"] = cycle_profiles
