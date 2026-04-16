@@ -20,6 +20,7 @@ from mlx_lm import stream_generate as mlx_stream_generate
 from mlx_lm.utils import load as load_pristine_target
 
 from dflash_mlx.runtime import (
+    configure_quartet_gqa,
     load_draft_bundle,
     load_target_bundle,
     resolve_model_ref,
@@ -412,6 +413,7 @@ def _run_once_sequential(
     quantize_draft: bool,
     no_eos: bool,
     split_sdpa: bool,
+    quartet_gqa: bool,
 ) -> dict[str, Any]:
     pristine_target_model, pristine_tokenizer, pristine_meta = _load_pristine_target_bundle(
         target_model_ref
@@ -434,6 +436,7 @@ def _run_once_sequential(
         lazy=True,
         split_full_attention_sdpa=split_sdpa,
     )
+    configure_quartet_gqa(target_model, enabled=quartet_gqa)
     draft_model, draft_meta = load_draft_bundle(
         draft_model_ref,
         lazy=True,
@@ -496,6 +499,7 @@ def benchmark_once(
     quantize_draft: bool = False,
     no_eos: bool = False,
     split_sdpa: bool = True,
+    quartet_gqa: bool = False,
     cooldown: int = 10,
 ) -> dict[str, Any]:
     thermal_pressure = _get_thermal_pressure()
@@ -511,6 +515,7 @@ def benchmark_once(
         quantize_draft=quantize_draft,
         no_eos=no_eos,
         split_sdpa=split_sdpa,
+        quartet_gqa=quartet_gqa,
     )
     target_meta = result.pop("target_meta")
     draft_meta = result.pop("draft_meta")
@@ -541,6 +546,7 @@ def benchmark_matrix(
     quantize_draft: bool = False,
     no_eos: bool = False,
     split_sdpa: bool = True,
+    quartet_gqa: bool = False,
     cooldown: int = 10,
 ) -> dict[str, Any]:
     target_meta: dict[str, Any] | None = None
@@ -565,6 +571,7 @@ def benchmark_matrix(
             quantize_draft=quantize_draft,
             no_eos=no_eos,
             split_sdpa=split_sdpa,
+            quartet_gqa=quartet_gqa,
         )
         if target_meta is None:
             target_meta = run.pop("target_meta")
@@ -625,6 +632,12 @@ def main() -> None:
         default=True,
         help="Enable split_full_attention_sdpa when loading the target model (default: enabled).",
     )
+    parser.add_argument(
+        "--quartet-gqa",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable quartet-GQA SDPA on applicable full-attention verify layers (default: disabled).",
+    )
     args = parser.parse_args()
     repeat = args.repeat if args.repeat is not None else (DEFAULT_REPEAT if args.matrix else 1)
     if repeat < 1:
@@ -639,6 +652,7 @@ def main() -> None:
         "quantize_draft": args.quantize_draft,
         "no_eos": args.no_eos,
         "split_sdpa": args.split_sdpa,
+        "quartet_gqa": args.quartet_gqa,
         "cooldown": args.cooldown,
     }
     if args.matrix or repeat > 1:

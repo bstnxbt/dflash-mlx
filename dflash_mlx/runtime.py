@@ -595,7 +595,44 @@ def _install_split_full_attention_hook(attn: Any) -> None:
             and int(queries.shape[-1]) in (128, 256)
             and int(values.shape[-1]) in (128, 256)
         )
-        if should_use_batched_2pass:
+        quartet_mask = mask if isinstance(mask, mx.array) else None
+        should_use_quartet = bool(getattr(self, "_dflash_quartet_enabled", False))
+        if should_use_quartet and should_use_batched_2pass:
+            from dflash_mlx.kernels import (
+                batched_sdpa_2pass_exact,
+                quartet_gqa_applicable,
+                quartet_gqa_sdpa_exact,
+            )
+
+            output = None
+            if quartet_gqa_applicable(queries, keys, values, quartet_mask):
+                output = quartet_gqa_sdpa_exact(
+                    queries=queries,
+                    keys=keys,
+                    values=values,
+                    scale=self.scale,
+                    mask=quartet_mask,
+                )
+            if output is None:
+                output = batched_sdpa_2pass_exact(
+                    queries=queries,
+                    keys=keys,
+                    values=values,
+                    scale=self.scale,
+                    mask=quartet_mask,
+                )
+            if output is None:
+                output = _split_sdpa_output(
+                    queries=queries,
+                    keys=keys,
+                    values=values,
+                    scale=self.scale,
+                    mask=mask,
+                    cache=cache,
+                    chunk_size=1,
+                    cached_prefix_len=cached_prefix_len,
+                )
+        elif should_use_batched_2pass:
             from dflash_mlx.kernels import batched_sdpa_2pass_exact
 
             output = batched_sdpa_2pass_exact(
@@ -603,7 +640,7 @@ def _install_split_full_attention_hook(attn: Any) -> None:
                 keys=keys,
                 values=values,
                 scale=self.scale,
-                mask=mask if isinstance(mask, mx.array) else None,
+                mask=quartet_mask,
             )
             if output is None:
                 output = _split_sdpa_output(
@@ -637,6 +674,8 @@ def _install_split_full_attention_hook(attn: Any) -> None:
 
     cls.__call__ = split_call
     cls._dflash_split_full_attention_installed = True
+    if not hasattr(attn, "_dflash_quartet_enabled"):
+        attn._dflash_quartet_enabled = False
 
 
 def _install_target_speculative_hooks(target_model: Any) -> None:
@@ -672,6 +711,23 @@ def configure_full_attention_split(
             layer.self_attn._dflash_split_sdpa_exact_kv_threshold = (
                 _HYBRID_SDPA_EXACT_KV_THRESHOLD
             )
+
+
+def configure_quartet_gqa(
+    target_model: Any,
+    *,
+    enabled: bool,
+) -> list[int]:
+    text_model = _target_text_model(target_model)
+    if detect_target_family(target_model) == "pure_attention":
+        return []
+    _install_target_speculative_hooks(target_model)
+    fa_layers: list[int] = []
+    for layer_index, layer in enumerate(text_model.layers):
+        if not getattr(layer, "is_linear", False) and hasattr(layer, "self_attn"):
+            layer.self_attn._dflash_quartet_enabled = bool(enabled)
+            fa_layers.append(layer_index)
+    return fa_layers
 
 
 def make_target_cache(

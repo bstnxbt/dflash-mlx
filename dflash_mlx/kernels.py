@@ -655,6 +655,279 @@ _batched_sdpa_2pass_reduce_kernel = _make_batched_sdpa_2pass_reduce_kernel()
 
 
 
+def _make_quartet_gqa_kernel(*, has_mask: bool = False):
+    if not mx.metal.is_available():
+        return None
+
+    inputs = [
+        "queries",
+        "keys",
+        "values",
+        "N",
+        "k_head_stride",
+        "k_seq_stride",
+        "v_head_stride",
+        "v_seq_stride",
+        "scale",
+        "blocks",
+    ]
+
+    mask_setup = ""
+    mask_use = ""
+    if has_mask:
+        inputs.append("mask")
+        mask_setup = """
+        auto mask_ = mask + q_offset * N;
+        """
+        mask_use = """
+                float mask_value = static_cast<float>(mask_[n]);
+                use_key = use_key && (mask_value >= Limits<InT>::finite_min);
+                if (use_key) {
+                    score += mask_value;
+                }
+        """
+
+    source = f"""
+        constexpr int BM = 4;
+        constexpr int BN = 32;
+        constexpr int QUARTET = 4;
+        constexpr int SIMDGROUP = 32;
+        constexpr int QK_PER_THREAD = D / SIMDGROUP;
+        constexpr int V_PER_THREAD = V / SIMDGROUP;
+        constexpr int THREADS_PER_TG = BM * QUARTET * SIMDGROUP;
+
+        auto group_idx = threadgroup_position_in_grid.x;
+        auto q_tile_idx = threadgroup_position_in_grid.y;
+        auto block_idx = threadgroup_position_in_grid.z;
+
+        auto lane = thread_index_in_simdgroup;
+        auto simd_gid = simdgroup_index_in_threadgroup;
+        auto head_local = simd_gid % QUARTET;
+        auto q_local = simd_gid / QUARTET;
+        auto flat_tid = simd_gid * SIMDGROUP + lane;
+
+        auto b_idx = group_idx / Hk;
+        auto hk_idx = group_idx % Hk;
+        auto q_head_idx = hk_idx * QUARTET + head_local;
+        auto q_seq_idx = q_tile_idx * BM + q_local;
+        auto q_offset = ((b_idx * Hq + q_head_idx) * M_FIXED + q_seq_idx);
+
+        auto q_ = queries + q_offset * D + lane * QK_PER_THREAD;
+        auto k_base = keys + ((b_idx * Hk + hk_idx) * k_head_stride);
+        auto v_base = values + ((b_idx * Hk + hk_idx) * v_head_stride);
+        partials += (q_offset * blocks + block_idx) * V + lane * V_PER_THREAD;
+        sums += q_offset * blocks + block_idx;
+        maxs += q_offset * blocks + block_idx;
+        {mask_setup}
+
+        thread float q[QK_PER_THREAD];
+        thread float o[V_PER_THREAD];
+        threadgroup InT tg_k[BN * D];
+        threadgroup InT tg_v[BN * V];
+
+        for (int i = 0; i < QK_PER_THREAD; ++i) {{
+            q[i] = static_cast<float>(scale) * static_cast<float>(q_[i]);
+        }}
+        for (int i = 0; i < V_PER_THREAD; ++i) {{
+            o[i] = 0.0f;
+        }}
+
+        float max_score = Limits<float>::finite_min;
+        float sum_exp_score = 0.0f;
+        auto causal_limit = N - M_FIXED + q_seq_idx;
+
+        for (int tile_base = block_idx * BN; tile_base < N; tile_base += blocks * BN) {{
+            for (int idx = flat_tid; idx < BN * D; idx += THREADS_PER_TG) {{
+                auto n_local = idx / D;
+                auto d_idx = idx - n_local * D;
+                auto n = tile_base + n_local;
+                tg_k[idx] = n < N
+                    ? k_base[n * int(k_seq_stride) + d_idx]
+                    : static_cast<InT>(0);
+            }}
+            for (int idx = flat_tid; idx < BN * V; idx += THREADS_PER_TG) {{
+                auto n_local = idx / V;
+                auto v_idx = idx - n_local * V;
+                auto n = tile_base + n_local;
+                tg_v[idx] = n < N
+                    ? v_base[n * int(v_seq_stride) + v_idx]
+                    : static_cast<InT>(0);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int n_local = 0; n_local < BN; ++n_local) {{
+                auto n = tile_base + n_local;
+                if (n >= N) {{
+                    break;
+                }}
+
+                bool use_key = (n <= causal_limit);
+                float score = 0.0f;
+                if (use_key) {{
+                    for (int i = 0; i < QK_PER_THREAD; ++i) {{
+                        score += q[i] * static_cast<float>(tg_k[n_local * D + lane * QK_PER_THREAD + i]);
+                    }}
+                    score = simd_sum(score);
+        {mask_use}
+                }}
+
+                if (use_key) {{
+                    float new_max = metal::max(max_score, score);
+                    float factor = fast::exp(max_score - new_max);
+                    float exp_score = fast::exp(score - new_max);
+
+                    max_score = new_max;
+                    sum_exp_score = sum_exp_score * factor + exp_score;
+                    for (int i = 0; i < V_PER_THREAD; ++i) {{
+                        o[i] = o[i] * factor
+                             + exp_score * static_cast<float>(tg_v[n_local * V + lane * V_PER_THREAD + i]);
+                    }}
+                }}
+            }}
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        if (lane == 0) {{
+            sums[0] = sum_exp_score;
+            maxs[0] = max_score;
+        }}
+        for (int i = 0; i < V_PER_THREAD; ++i) {{
+            partials[i] = static_cast<InT>(o[i]);
+        }}
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"quartet_gqa_sdpa_partials{'_mask' if has_mask else ''}",
+        input_names=inputs,
+        output_names=["partials", "sums", "maxs"],
+        source=source,
+    )
+
+
+_quartet_gqa_kernel = _make_quartet_gqa_kernel(has_mask=False)
+_quartet_gqa_kernel_masked = _make_quartet_gqa_kernel(has_mask=True)
+
+
+def quartet_gqa_applicable(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    mask: Optional[mx.array] = None,
+) -> bool:
+    if not mx.metal.is_available():
+        return False
+    if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4:
+        return False
+    bsz, hq, q_len, d = queries.shape
+    _, hk, n_kv, _ = keys.shape
+    if values.shape[:3] != (bsz, hk, n_kv):
+        return False
+    if q_len != 16:
+        return False
+    if queries.dtype != mx.bfloat16 or keys.dtype != mx.bfloat16 or values.dtype != mx.bfloat16:
+        return False
+    if hq != 32 or hk != 8 or d != 128 or int(values.shape[-1]) != 128:
+        return False
+    if hq != 4 * hk:
+        return False
+    if mask is not None and not isinstance(mask, mx.array):
+        return False
+    return True
+
+
+def quartet_gqa_sdpa_exact(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    scale: float,
+    mask: Optional[mx.array] = None,
+) -> Optional[mx.array]:
+    if not quartet_gqa_applicable(queries, keys, values, mask):
+        return None
+
+    bsz, hq, q_len, d = queries.shape
+    _, hk, n_kv, _ = keys.shape
+    vdim = values.shape[-1]
+    input_type = queries.dtype
+
+    queries = mx.contiguous(queries)
+    keys = mx.contiguous(keys)
+    values = mx.contiguous(values)
+
+    blocks = _compute_sdpa_2pass_blocks(4, n_kv)
+    if blocks <= 0 or blocks % 32 != 0:
+        return None
+
+    k_head_stride = keys.shape[2] * keys.shape[3]
+    k_seq_stride = keys.shape[3]
+    v_head_stride = values.shape[2] * values.shape[3]
+    v_seq_stride = values.shape[3]
+
+    kernel = _quartet_gqa_kernel
+    inputs = [
+        queries,
+        keys,
+        values,
+        n_kv,
+        k_head_stride,
+        k_seq_stride,
+        v_head_stride,
+        v_seq_stride,
+        float(scale),
+        blocks,
+    ]
+
+    if mask is not None:
+        if mask.dtype == mx.bool_:
+            mask_tensor = mx.where(
+                mask,
+                mx.zeros(mask.shape, dtype=input_type),
+                mx.full(mask.shape, mx.finfo(input_type).min, dtype=input_type),
+            )
+        else:
+            mask_tensor = mask.astype(input_type) if mask.dtype != input_type else mask
+        mask_tensor = mx.broadcast_to(mask_tensor, (bsz, hq, q_len, n_kv))
+        mask_tensor = mx.contiguous(mask_tensor)
+        kernel = _quartet_gqa_kernel_masked
+        inputs.append(mask_tensor)
+
+    if kernel is None or _batched_sdpa_2pass_reduce_kernel is None:
+        return None
+
+    partial_shape = (bsz * hq, q_len, blocks, vdim)
+    stats_shape = (bsz * hq, q_len, blocks)
+    partials, sums, maxs = kernel(
+        inputs=inputs,
+        template=[
+            ("InT", input_type),
+            ("D", d),
+            ("V", vdim),
+            ("Hq", hq),
+            ("Hk", hk),
+            ("M_FIXED", q_len),
+        ],
+        grid=(bsz * hk * 32, (q_len // 4) * 4, blocks * 4),
+        threadgroup=(32, 4, 4),
+        output_shapes=[partial_shape, stats_shape, stats_shape],
+        output_dtypes=[input_type, mx.float32, mx.float32],
+    )
+
+    (out,) = _batched_sdpa_2pass_reduce_kernel(
+        inputs=[partials, sums, maxs, blocks],
+        template=[
+            ("InT", mx.float32),
+            ("V", vdim),
+            ("M_FIXED", q_len),
+        ],
+        grid=((bsz * hq) * 1024, q_len, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[queries.shape],
+        output_dtypes=[mx.float32],
+    )
+    return out.astype(input_type)
+
+
 def batched_sdpa_2pass_exact(
     queries: mx.array,
     keys: mx.array,
