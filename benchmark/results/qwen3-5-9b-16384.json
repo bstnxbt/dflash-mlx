@@ -1,0 +1,90 @@
+{
+  "hardware": {
+    "chip": "Apple M5 Max",
+    "memory_gb": "64",
+    "mlx_version": "0.31.1",
+    "python": "3.14.3"
+  },
+  "config": {
+    "target_model": "Qwen/Qwen3.5-9B",
+    "draft_model": "z-lab/Qwen3.5-9B-DFlash",
+    "max_new_tokens": 16384,
+    "block_tokens": 16,
+    "cooldown": 330,
+    "prompt": "The function $f$ satisfies the functional equation \\[ f(x) + f(y) = f(x + y) - xy - 1 \\] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \\boxed{}.",
+    "prompt_tokens": 92,
+    "prompt_id": "the_function_f_satisfies_the_functional_equation",
+    "repeat": 3,
+    "git_hash": "a52ed4f"
+  },
+  "runs": [
+    {
+      "run": 1,
+      "thermal_pressure": "unknown",
+      "baseline": {
+        "ttft_ms": 1171.1898329958785,
+        "generation_tps": 31.018138565802175,
+        "peak_memory_gb": 18.045503401
+      },
+      "dflash": {
+        "ttft_ms": 509.875875,
+        "generation_tps": 82.76342388870285,
+        "tokens_per_cycle": 7.383046237533998,
+        "cycles": 2206,
+        "acceptance_ratio": 0.8645545527107509,
+        "acceptance_first_20_avg": 7.4,
+        "acceptance_last_20_avg": 6.05,
+        "peak_memory_gb": 20.877246019
+      },
+      "speedup": 2.668226647873396
+    },
+    {
+      "run": 2,
+      "thermal_pressure": "unknown",
+      "baseline": {
+        "ttft_ms": 1160.1649160002125,
+        "generation_tps": 30.969238829390076,
+        "peak_memory_gb": 18.045487019
+      },
+      "dflash": {
+        "ttft_ms": 503.832625,
+        "generation_tps": 82.20196773515356,
+        "tokens_per_cycle": 7.383046237533998,
+        "cycles": 2206,
+        "acceptance_ratio": 0.8645545527107509,
+        "acceptance_first_20_avg": 7.4,
+        "acceptance_last_20_avg": 6.05,
+        "peak_memory_gb": 20.877246019
+      },
+      "speedup": 2.6543102395252665
+    },
+    {
+      "run": 3,
+      "thermal_pressure": "unknown",
+      "baseline": {
+        "ttft_ms": 1182.953916999395,
+        "generation_tps": 30.847015908004888,
+        "peak_memory_gb": 18.045487019
+      },
+      "dflash": {
+        "ttft_ms": 500.21745899999996,
+        "generation_tps": 82.26128385112976,
+        "tokens_per_cycle": 7.383046237533998,
+        "cycles": 2206,
+        "acceptance_ratio": 0.8645545527107509,
+        "acceptance_first_20_avg": 7.4,
+        "acceptance_last_20_avg": 6.05,
+        "peak_memory_gb": 20.877246021
+      },
+      "speedup": 2.666750135457437
+    }
+  ],
+  "summary": {
+    "baseline_tps_median": 30.969238829390076,
+    "dflash_tps_median": 82.26128385112976,
+    "dflash_tps_min": 82.20196773515356,
+    "dflash_tps_max": 82.76342388870285,
+    "speedup_median": 2.666750135457437,
+    "acceptance_ratio_median": 0.8645545527107509
+  }
+}

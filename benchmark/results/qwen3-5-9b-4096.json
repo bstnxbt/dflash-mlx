@@ -14,77 +14,37 @@
     "prompt": "The function $f$ satisfies the functional equation \\[ f(x) + f(y) = f(x + y) - xy - 1 \\] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \\boxed{}.",
     "prompt_tokens": 92,
     "prompt_id": "the_function_f_satisfies_the_functional_equation",
-    "repeat": 3,
-    "git_hash": "da458e2"
+    "repeat": 1,
+    "git_hash": "a52ed4f"
   },
   "runs": [
     {
       "run": 1,
       "thermal_pressure": "unknown",
       "baseline": {
-        "ttft_ms": 600.3910420004104,
-        "generation_tps": 31.11371735485262,
-        "peak_memory_gb": 18.100893915
+        "ttft_ms": 1496.7336249828804,
+        "generation_tps": 30.160974251043804,
+        "peak_memory_gb": 18.045511593
       },
       "dflash": {
-        "ttft_ms": 467.08304200000003,
-        "generation_tps": 115.95093366799479,
+        "ttft_ms": 851.912,
+        "generation_tps": 98.77121600227751,
         "tokens_per_cycle": 8.752136752136753,
         "cycles": 468,
         "acceptance_ratio": 0.8857421875,
         "acceptance_first_20_avg": 7.4,
         "acceptance_last_20_avg": 4.7,
-        "peak_memory_gb": 20.383171984
+        "peak_memory_gb": 20.387058896
       },
-      "speedup": 3.726682104409829
-    },
-    {
-      "run": 2,
-      "thermal_pressure": "unknown",
-      "baseline": {
-        "ttft_ms": 663.7116660003812,
-        "generation_tps": 31.578323158574467,
-        "peak_memory_gb": 18.100893917
-      },
-      "dflash": {
-        "ttft_ms": 472.373625,
-        "generation_tps": 103.89783952553638,
-        "tokens_per_cycle": 8.752136752136753,
-        "cycles": 468,
-        "acceptance_ratio": 0.8857421875,
-        "acceptance_first_20_avg": 7.4,
-        "acceptance_last_20_avg": 4.7,
-        "peak_memory_gb": 20.383171984
-      },
-      "speedup": 3.290163287132141
-    },
-    {
-      "run": 3,
-      "thermal_pressure": "unknown",
-      "baseline": {
-        "ttft_ms": 641.0905419998016,
-        "generation_tps": 32.67738439329625,
-        "peak_memory_gb": 18.100910301
-      },
-      "dflash": {
-        "ttft_ms": 484.657417,
-        "generation_tps": 102.10301667959163,
-        "tokens_per_cycle": 8.752136752136753,
-        "cycles": 468,
-        "acceptance_ratio": 0.8857421875,
-        "acceptance_first_20_avg": 7.4,
-        "acceptance_last_20_avg": 4.7,
-        "peak_memory_gb": 20.383171984
-      },
-      "speedup": 3.1245773973432835
+      "speedup": 3.2748019072646257
     }
   ],
   "summary": {
-    "baseline_tps_median": 31.578323158574467,
-    "dflash_tps_median": 103.89783952553638,
-    "dflash_tps_min": 102.10301667959163,
-    "dflash_tps_max": 115.95093366799479,
-    "speedup_median": 3.290163287132141,
+    "baseline_tps_median": 30.160974251043804,
+    "dflash_tps_median": 98.77121600227751,
+    "dflash_tps_min": 98.77121600227751,
+    "dflash_tps_max": 98.77121600227751,
+    "speedup_median": 3.2748019072646257,
     "acceptance_ratio_median": 0.8857421875
   }
 }

@@ -1657,6 +1657,7 @@ def stream_dflash_generate(
         replay_ns_total = 0
         commit_ns_total = 0
         seen_draft_cycle = False
+        acceptance_history: list[int] = []
         cycle_profiles: list[dict[str, Any]] = []
         profile_totals_ns = {
             "draft": 0,
@@ -1761,6 +1762,7 @@ def stream_dflash_generate(
             acceptance_len = int(
                 _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
             )
+            acceptance_history.append(acceptance_len)
             acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
             hidden_extract_start_ns = time.perf_counter_ns()
             committed_hidden = extract_context_feature_from_dict(
@@ -1885,6 +1887,8 @@ def stream_dflash_generate(
                 profile_totals_ns["cycle_total"] += cycle_total_ns
 
         elapsed_us = (time.perf_counter_ns() - start_ns) / 1_000.0
+        first_20 = acceptance_history[:20]
+        last_20 = acceptance_history[-20:]
         summary = {
             "event": "summary",
             "elapsed_us": elapsed_us,
@@ -1910,6 +1914,10 @@ def stream_dflash_generate(
             "speculative_linear_cache": bool(use_speculative_linear_cache),
             "verify_chunk_tokens": int(verify_chunk_tokens) if verify_chunk_tokens else None,
             "quantize_kv_cache": bool(quantize_kv_cache),
+            "tokens_per_cycle": (len(generated_token_ids) / cycles_completed) if cycles_completed > 0 else 0.0,
+            "acceptance_first_20_avg": (sum(first_20) / len(first_20)) if first_20 else 0.0,
+            "acceptance_last_20_avg": (sum(last_20) / len(last_20)) if last_20 else 0.0,
+            "peak_memory_gb": float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else None,
         }
         if profile_cycles:
             summary["cycle_profile_us"] = cycle_profiles
