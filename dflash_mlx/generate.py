@@ -92,6 +92,7 @@ def load_runtime_components(
     *,
     model_ref: str,
     draft_ref: Optional[str],
+    draft_quant: Optional[str] = None,
 ):
     resolved_draft_ref = resolve_optional_draft_ref(model_ref, draft_ref)
     if not resolved_draft_ref:
@@ -102,7 +103,7 @@ def load_runtime_components(
         )
     target_model, tokenizer, _ = load_target_bundle(model_ref, lazy=True)
     try:
-        draft_model, _ = load_draft_bundle(resolved_draft_ref, lazy=True)
+        draft_model, _ = load_draft_bundle(resolved_draft_ref, lazy=True, draft_quant=draft_quant)
     except Exception as exc:
         raise ValueError(
             f"Failed to load DFlash draft model '{resolved_draft_ref}' for '{model_ref}'."

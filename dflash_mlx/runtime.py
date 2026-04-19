@@ -3,9 +3,11 @@
 # Based on DFlash (arXiv:2602.06036)
 
 import os
+import re
 import sys
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -226,11 +228,65 @@ def _ns_to_us(ns: int | float) -> float:
     return float(ns) / 1_000.0
 
 
-def _should_quantize_draft(quantize_draft: bool = False) -> bool:
-    if quantize_draft:
-        return True
-    raw = os.environ.get("DFLASH_QUANTIZE_DRAFT", "").strip().lower()
-    return raw not in {"", "0", "false", "no"}
+@dataclass(frozen=True)
+class DraftQuantSpec:
+    """Parsed weight/activation quantization spec for the draft model.
+
+    Supported format: ``w{W}[a{A}][:gs{G}]``
+    - ``W`` – weight bits: 2, 4, or 8
+    - ``A`` – activation bits: 16 (bfloat16, default) or 32 (float32)
+    - ``G`` – group size: 32, 64 (default), or 128
+
+    Examples: ``w4``, ``w8a16``, ``w4a32:gs128``
+    """
+
+    weight_bits: int
+    group_size: int
+    act_bits: int
+
+
+_DRAFT_QUANT_RE = re.compile(
+    r"^w(?P<wb>2|4|8)"
+    r"(?:a(?P<ab>16|32))?"
+    r"(?::gs(?P<gs>32|64|128))?$",
+    re.IGNORECASE,
+)
+
+
+def parse_draft_quant_spec(spec: str) -> DraftQuantSpec:
+    """Parse a quantization spec string into a :class:`DraftQuantSpec`.
+
+    Raises :exc:`ValueError` for unrecognised formats.
+    """
+    m = _DRAFT_QUANT_RE.match(spec.strip())
+    if not m:
+        raise ValueError(
+            f"Invalid draft quant spec {spec!r}. "
+            "Expected format: w4, w8a16, w4a32:gs128, etc. "
+            "Weight bits: 2, 4, 8. Activation bits: 16 (bfloat16) or 32 (float32). "
+            "Group size: 32, 64, 128."
+        )
+    wb = int(m.group("wb"))
+    ab = int(m.group("ab") or 16)
+    gs = int(m.group("gs") or 64)
+    return DraftQuantSpec(weight_bits=wb, group_size=gs, act_bits=ab)
+
+
+def _resolve_draft_quant(draft_quant: str | None) -> DraftQuantSpec | None:
+    """Resolve the effective :class:`DraftQuantSpec` from arg + env vars.
+
+    Priority: explicit *draft_quant* arg > ``DFLASH_DRAFT_QUANT`` env var >
+    legacy ``DFLASH_QUANTIZE_DRAFT`` env var (maps to ``w4a16``).
+    """
+    spec = draft_quant or os.environ.get("DFLASH_DRAFT_QUANT", "").strip()
+    if not spec:
+        # Backward-compat: old boolean env var → default w4a16
+        raw_legacy = os.environ.get("DFLASH_QUANTIZE_DRAFT", "").strip().lower()
+        if raw_legacy not in {"", "0", "false", "no"}:
+            spec = "w4a16"
+    if not spec:
+        return None
+    return parse_draft_quant_spec(spec)
 
 
 
@@ -757,6 +813,8 @@ def load_draft_bundle(
     model_ref: str | Path | None = None,
     *,
     lazy: bool = True,
+    draft_quant: str | None = None,
+    # Deprecated: use draft_quant="w4a16" instead.
     quantize_draft: bool = False,
 ):
     resolved_ref = resolve_model_ref(model_ref, kind="draft")
@@ -766,13 +824,44 @@ def load_draft_bundle(
         lazy=lazy,
         get_model_classes=_get_dflash_model_classes,
     )
-    quantized = _should_quantize_draft(quantize_draft)
-    if quantized:
-        nn.quantize(model, bits=4, group_size=64)
+    # Backward compat: bool flag maps to w4a16
+    if quantize_draft and not draft_quant:
+        draft_quant = "w4a16"
+    quant_spec = _resolve_draft_quant(draft_quant)
+    if quant_spec is not None:
+        nn.quantize(model, bits=quant_spec.weight_bits, group_size=quant_spec.group_size)
+        if quant_spec.weight_bits in (4, 8):
+            # The draft always runs at M=16 (block_tokens) — the exact shape
+            # the verify MMA kernel is tuned for. Set the env flag before
+            # installing so VerifyQuantizedLinear actually routes to the Metal
+            # kernel and doesn't silently fall back to mx.quantized_matmul.
+            os.environ.setdefault("DFLASH_VERIFY_QMM", "1")
+            from dflash_mlx.verify_linear import install_verify_linears, prewarm_verify_kernels
+            install_verify_linears(model)
+            prewarm_verify_kernels(model)
+        if quant_spec.act_bits == 32:
+            # Cast non-packed parameters (norms, biases, quantization scales)
+            # to float32 AFTER install_verify_linears so the VerifyQuantizedLinear
+            # copies bfloat16 scales (half the memory) before we upcast the rest.
+            def _cast_to_f32(_, x: mx.array) -> mx.array:
+                if x.dtype not in (mx.uint32, mx.int32):
+                    return x.astype(mx.float32)
+                return x
+            model.apply(_cast_to_f32)
     return model, {
         "resolved_model_ref": str(model_ref) if model_ref is not None else str(resolved_ref),
         "config": config,
-        "quantize_draft": bool(quantized),
+        "draft_quant": (
+            {
+                "weight_bits": quant_spec.weight_bits,
+                "group_size": quant_spec.group_size,
+                "act_bits": quant_spec.act_bits,
+            }
+            if quant_spec is not None
+            else None
+        ),
+        # Kept for backward compat
+        "quantize_draft": quant_spec is not None,
     }
 
 
