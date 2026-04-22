@@ -16,9 +16,9 @@ def _make_gated_delta_kernel_with_tape(
         return None
 
     mask_load = (
-        "float mask_gate = static_cast<float>(mask[b_idx * T + t]);"
+        "bool do_step = static_cast<float>(mask[b_idx * T + t]) > 0.5f;"
         if has_mask
-        else "constexpr float mask_gate = 1.0f;"
+        else "constexpr bool do_step = true;"
     )
 
     if vectorized:
@@ -67,36 +67,48 @@ def _make_gated_delta_kernel_with_tape(
 
         for (int t = 0; t < T; ++t) {{
           {mask_load}
-          // Decay pass — always executes; gate zeroes out delta when masked.
-          float kv_mem = 0.0f;
-          for (int i = 0; i < n_per_t; ++i) {{
-            auto s_idx = n_per_t * dk_idx + i;
-            state[i] = state[i] * {g_access};
-            kv_mem  += state[i] * k_[s_idx];
-          }}
-          kv_mem = simd_sum(kv_mem);
 
-          // Branchless delta: gate multiplies out contribution when masked.
-          float delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
-                        * static_cast<float>(beta_[hv_idx])
-                        * mask_gate;
+          // Save pre-step state so we can restore it when masked.
+          float old_state[n_per_t];
+          for (int i = 0; i < n_per_t; ++i) {{
+            old_state[i] = state[i];
+          }}
 
           float out = 0.0f;
-          for (int i = 0; i < n_per_t; ++i) {{
-            auto s_idx = n_per_t * dk_idx + i;
-            state[i] += k_[s_idx] * delta;
-            out      += state[i] * static_cast<float>(q_[s_idx]);
-          }}
-          out = simd_sum(out);
+          float delta = 0.0f;
 
-          // Write output/tape gated by mask_gate (zero when masked).
+          // do_step is a uniform predicate — all threads in the simdgroup
+          // take the same branch, so simd_sum calls are safe inside.
+          if (do_step) {{
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = state[i] * {g_access};
+              kv_mem  += state[i] * k_[s_idx];
+            }}
+            kv_mem = simd_sum(kv_mem);
+
+            delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
+                    * static_cast<float>(beta_[hv_idx]);
+
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] += k_[s_idx] * delta;
+              out      += state[i] * static_cast<float>(q_[s_idx]);
+            }}
+            out = simd_sum(out);
+          }}
+
           if (thread_index_in_simdgroup == 0) {{
-            y[dv_idx]     = static_cast<InT>(out * mask_gate);
+            y[dv_idx]     = static_cast<InT>(out);
             tape_[dv_idx] = delta;
           }}
 
+          // Quantize new state, then conditional move: restore old state
+          // when masked so decay and quantization are fully skipped.
           for (int i = 0; i < n_per_t; ++i) {{
-            state[i] = static_cast<float>(static_cast<InT>(state[i]));
+            float quant_new = static_cast<float>(static_cast<InT>(state[i]));
+            state[i] = metal::select(old_state[i], quant_new, do_step);
           }}
           q_    += Hk * Dk;
           k_    += Hk * Dk;
@@ -246,9 +258,9 @@ def _make_tape_replay_kernel(*, has_mask: bool = False, vectorized: bool = False
         return None
 
     mask_load = (
-        "float mask_gate = static_cast<float>(mask[b_idx * T + t]);"
+        "bool do_step = static_cast<float>(mask[b_idx * T + t]) > 0.5f;"
         if has_mask
-        else "constexpr float mask_gate = 1.0f;"
+        else "constexpr bool do_step = true;"
     )
 
     if vectorized:
@@ -293,13 +305,14 @@ def _make_tape_replay_kernel(*, has_mask: bool = False, vectorized: bool = False
 
         for (int t = 0; t < T; ++t) {{
           {mask_load}
-          // Branchless: delta scaled by gate; when gate==0 delta==0 → state unchanged.
-          float delta = static_cast<float>(tape_[dv_idx]) * mask_gate;
+          float delta = static_cast<float>(tape_[dv_idx]);
           for (int i = 0; i < n_per_t; ++i) {{
             auto s_idx = n_per_t * dk_idx + i;
-            // Fused: decay + accumulate in one expression, no temps.
-            state[i] = state[i] * {g_access} + k_[s_idx] * delta;
-            state[i] = static_cast<float>(static_cast<InT>(state[i]));
+            float next = state[i] * {g_access} + k_[s_idx] * delta;
+            next = static_cast<float>(static_cast<InT>(next));
+            // Conditional move: old state when masked, next when accepted.
+            // do_step is uniform across the simdgroup — no divergence.
+            state[i] = metal::select(state[i], next, do_step);
           }}
           tape_ += Hv * Dv;
           k_    += Hk * Dk;
