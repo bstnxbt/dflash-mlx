@@ -112,6 +112,9 @@ def _default_results_path(
     if draft_quant:
         slug = re.sub(r"[^a-z0-9]+", "-", draft_quant.lower()).strip("-")
         name = f"{name}-dq-{slug}"
+    # Timestamp every run so repeated benches never overwrite history.
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name = f"{name}-{ts}"
     folder = _slugify_chip(chip) if chip else "unknown-chip"
     return Path("benchmark/results") / folder / f"{name}.json"
 
