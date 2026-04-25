@@ -17,37 +17,38 @@ from dflash_mlx.runtime import (
 
 
 # DFlash Draft Model Registry
-# Only includes official models from z-lab and RedHatAI
+# Only includes official models from z-lab and RedHatAI that are verified working
 # Format: "Target Model Name": "HF Repo ID"
 
 DRAFT_REGISTRY = {
-    # =================== Qwen3 Dense Models (z-lab) ===================
-    # Series with vocab_size=248320
+    # =================== Qwen3.5 Dense Models (z-lab) ===================
     "Qwen3.5-4B": "z-lab/Qwen3.5-4B-DFlash",
     "Qwen3.5-9B": "z-lab/Qwen3.5-9B-DFlash",
     "Qwen3.5-27B": "z-lab/Qwen3.5-27B-DFlash",
-    # Series with vocab_size=151936 (base Qwen3)
+
+    # =================== Qwen3 Base Models (z-lab) ===================
     "Qwen3-4B": "z-lab/Qwen3-4B-DFlash-b16",
     "Qwen3-8B": "z-lab/Qwen3-8B-DFlash-b16",
-    # Qwen3.6 series
-    "Qwen3.6-27B": "z-lab/Qwen3.6-27B-DFlash",
 
-    # =================== Qwen3 MoE Models (z-lab) ===================
+    # =================== Qwen3.5 MoE Models (z-lab) ===================
     "Qwen3.5-35B-A3B": "z-lab/Qwen3.5-35B-A3B-DFlash",
     "Qwen3.5-122B-A10B": "z-lab/Qwen3.5-122B-A10B-DFlash",
     "Qwen3.6-35B-A3B": "z-lab/Qwen3.6-35B-A3B-DFlash",
     "Qwen3-Coder-Next": "z-lab/Qwen3-Coder-Next-DFlash",
     "Qwen3-Coder-30B-A3B": "z-lab/Qwen3-Coder-30B-A3B-DFlash",
 
-    # =================== Other z-lab Models ===================
-    "Kimi-K2.5": "z-lab/Kimi-K2.5-DFlash",
+    # =================== Llama Model (z-lab) ===================
     "Llama-3.1-8B-Instruct": "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat",
-    "GPT-OSS-20B": "z-lab/gpt-oss-20b-DFlash",
-    "GPT-OSS-120B": "z-lab/gpt-oss-120b-DFlash",
 
     # =================== RedHatAI Models ===================
     "Gemma-4-31B-it": "RedHatAI/gemma-4-31B-it-speculator.dflash",
 }
+
+# Models that are known to have issues and are temporarily disabled:
+# - Qwen3.6-27B: Gated repo (requires HF authentication/terms acceptance)
+# - Kimi-K2.5: MLA (Multi-head Latent Attention) not yet supported
+# - GPT-OSS models: Target model architecture not available in mlx-lm
+# - Gemma-4-31B-it: Speculator format with different weight structure
 
 
 _NORMALIZED_DRAFT_REGISTRY = {
