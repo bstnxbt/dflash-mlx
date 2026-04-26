@@ -18,6 +18,7 @@ from mlx_lm.models.base import scaled_dot_product_attention
 from mlx_lm.models.qwen3 import MLP as Qwen3MLP
 from mlx_lm.models.rope_utils import initialize_rope
 
+from dflash_mlx.kernels import make_qwen3_no_cache_attn
 from dflash_mlx.archs.base import (
     DFlashArgs,
     DFlashAttention,
@@ -108,6 +109,20 @@ class Qwen3DFlashAttention(nn.Module, DFlashAttention):
             scaling_config=args.rope_scaling,
         )
 
+        self._compiled_no_cache_attn = make_qwen3_no_cache_attn(
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+            self.q_norm,
+            self.k_norm,
+            self.rope,
+            n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            scale=self.scale,
+        )
+
     def __call__(
         self,
         hidden_states: mx.array,
@@ -117,6 +132,11 @@ class Qwen3DFlashAttention(nn.Module, DFlashAttention):
     ) -> mx.array:
         batch, block_len, _ = hidden_states.shape
         ctx_len = int(target_hidden.shape[1])
+
+        # Phew-optimized path: fully compiled, ~1.2-1.35x vs unfused baseline.
+        # Fuses projections, RMSNorm, RoPE, GQA expand, and SDPA in one trace.
+        if cache is None and not hasattr(mx.fast, "dflash_cross_attention"):
+            return self._compiled_no_cache_attn(hidden_states, target_hidden, ctx_len)
 
         # Project and reshape queries
         queries = self.q_proj(hidden_states)
