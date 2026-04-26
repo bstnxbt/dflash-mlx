@@ -24,11 +24,8 @@ from mlx_lm.utils import load, load_model
 
 from dflash_mlx.adapter import detect_engine
 from dflash_mlx.draft_backend import make_draft_backend
-from dflash_mlx.model import (
-    DFlashDraftModel,
-    DFlashDraftModelArgs,
-    extract_context_feature,
-)
+from dflash_mlx.model import extract_context_feature
+from dflash_mlx.archs import create_dflash_model, DFlashArgs
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
 
@@ -40,7 +37,17 @@ def resolve_model_ref(model_ref: str | Path | None, *, kind: str) -> str:
 
 
 def _get_dflash_model_classes(config: dict[str, Any]):
-    return DFlashDraftModel, DFlashDraftModelArgs
+    """Get the appropriate DFlash model and args classes based on config.
+    
+    The architecture system automatically selects the right implementation
+    (Qwen3, Llama, etc.) based on the model_type in the config.
+    """
+    from dflash_mlx.archs.base import get_architecture_for_model_type
+    
+    model_type = config.get("model_type", "qwen3")
+    arch_spec = get_architecture_for_model_type(model_type)
+    
+    return arch_spec.model_class, DFlashArgs
 
 
 def _resolve_local_model_path(model_ref: str | Path) -> Path:
