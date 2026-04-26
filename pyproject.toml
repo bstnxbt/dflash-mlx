@@ -11,8 +11,8 @@ license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [{name = "bstnxbt"}]
 dependencies = [
-    "mlx>=0.25.0",
-    "mlx-lm>=0.31.0",
+    "mlx>=0.31.2",
+    "mlx-lm>=0.31.3",
 ]
 
 [project.urls]

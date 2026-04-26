@@ -77,9 +77,13 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         self.model_key = None
         self.draft_model = None
 
+        draft_quant = getattr(self.cli_args, "draft_quant", None)
+        if not draft_quant and getattr(self.cli_args, "quantize_draft", False):
+            draft_quant = "w4a16"
         model, tokenizer, draft_model, resolved_draft_ref = load_runtime_components(
             model_ref=model_ref,
             draft_ref=draft_ref,
+            draft_quant=draft_quant or None,
         )
 
         if self.cli_args.chat_template:
@@ -518,6 +522,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         help=argparse.SUPPRESS,
         default=3,
+    )
+    parser.add_argument(
+        "--draft-quant",
+        default=None,
+        metavar="SPEC",
+        help=(
+            "Quantize the draft model. Format: w{W}[a{A}][:gs{G}] where "
+            "W=weight bits (2/4/8), A=activation bits (16=bfloat16, 32=float32), "
+            "G=group size (32/64/128). Examples: w4, w8a16, w4a32:gs128."
+        ),
     )
     parser.add_argument(
         "--quantize-draft",
