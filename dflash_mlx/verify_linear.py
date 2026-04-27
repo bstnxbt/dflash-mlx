@@ -19,16 +19,13 @@ from dflash_mlx.verify_qmm import (
     _build_kernel_mma2big_pipe_8bit,
 )
 
-
 _VERIFY_MAX_N_DEFAULT = 100_000
-
 
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
-
 
 _PROJ_TAGS = {
     "mlp.gate_proj":        "mlp_gate",
@@ -43,13 +40,11 @@ _PROJ_TAGS = {
     "linear_attn.out_proj":    "gdn_o",
 }
 
-
 def _path_tag(path: str) -> str:
     for suffix, tag in _PROJ_TAGS.items():
         if path.endswith(suffix):
             return tag
     return "other"
-
 
 def is_verify_eligible(ql: nn.QuantizedLinear, path: str = "") -> bool:
     if not isinstance(ql, nn.QuantizedLinear):
@@ -81,7 +76,6 @@ def is_verify_eligible(ql: nn.QuantizedLinear, path: str = "") -> bool:
             return False
     return True
 
-
 class VerifyQuantizedLinear(nn.QuantizedLinear):
 
     @classmethod
@@ -106,7 +100,6 @@ class VerifyQuantizedLinear(nn.QuantizedLinear):
     def __call__(self, x: mx.array) -> mx.array:
         return self._call_fn(x)
 
-
 def _build_dispatch(obj: "VerifyQuantizedLinear"):
     w = obj.weight
     s = obj.scales
@@ -120,10 +113,6 @@ def _build_dispatch(obj: "VerifyQuantizedLinear"):
     N = int(w.shape[0])
     K = int(w.shape[1]) * (32 // bits)
 
-    # Fast path: pre-resolve kernel + pre-contiguous fixed tensors at install
-    # time so each forward call only needs contiguous(x) + one dtype branch.
-    # Eliminates: _should_use_verify, _auto_variant, _variant() env lookup,
-    # mx.contiguous for weights/scales/biases, and shape alignment checks.
     if (
         os.environ.get("DFLASH_VERIFY_QMM", "") == "1"
         and N % 32 == 0
@@ -135,7 +124,6 @@ def _build_dispatch(obj: "VerifyQuantizedLinear"):
             variant = "mma2big"
             K_PARTS = 1
 
-        # Force fixed tensors contiguous once so the closure never has to.
         w_c = mx.contiguous(w)
         s_c = mx.contiguous(s)
         b_c = mx.contiguous(b) if b is not None else b
@@ -211,8 +199,6 @@ def _build_dispatch(obj: "VerifyQuantizedLinear"):
                                            transpose=True, group_size=gs, bits=bits, mode=mode)
         return call
 
-    # Fallback: runtime dispatch through verify_matmul (handles disabled env,
-    # non-aligned shapes, future bits values, etc.)
     if has_bias:
         def call(x):
             m = 1
@@ -235,14 +221,7 @@ def _build_dispatch(obj: "VerifyQuantizedLinear"):
                                        transpose=True, group_size=gs, bits=bits, mode=mode)
     return call
 
-
 def prewarm_verify_kernels(model: nn.Module) -> int:
-    """Trigger Metal shader compilation for all installed VerifyQuantizedLinear layers.
-
-    Runs a dummy M=16 forward pass through one layer per unique (K, N, bits, gs)
-    shape so Metal compiles the kernel JIT before generation begins, eliminating
-    first-cycle latency.  Returns the number of unique shapes warmed.
-    """
     from mlx.utils import tree_flatten
 
     seen: set[tuple] = set()
@@ -260,7 +239,6 @@ def prewarm_verify_kernels(model: nn.Module) -> int:
         mx.eval(m(dummy))
         warmed += 1
     return warmed
-
 
 def install_verify_linears(
     model: nn.Module,
@@ -285,7 +263,6 @@ def install_verify_linears(
     leaves = tree_map_with_path(_maybe_swap, leaves, is_leaf=nn.Module.is_module)
     model.update_modules(leaves)
     return count
-
 
 def uninstall_verify_linears(model: nn.Module) -> int:
     count = 0

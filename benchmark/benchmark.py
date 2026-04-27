@@ -96,24 +96,10 @@ def _slugify_model_ref(model_ref: str | None) -> str:
     return label or "model"
 
 
-def _slugify_chip(chip: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", chip.lower()).strip("-")
-    return re.sub(r"-+", "-", slug) or "unknown-chip"
-
-
-def _default_results_path(
-    *,
-    target_model_ref: str | None,
-    max_new_tokens: int,
-    chip: str | None = None,
-    draft_quant: str | None = None,
-) -> Path:
-    name = f"{_slugify_model_ref(target_model_ref)}-{int(max_new_tokens)}"
-    if draft_quant:
-        slug = re.sub(r"[^a-z0-9]+", "-", draft_quant.lower()).strip("-")
-        name = f"{name}-dq-{slug}"
-    folder = _slugify_chip(chip) if chip else "unknown-chip"
-    return Path("benchmark/results") / folder / f"{name}.json"
+def _default_results_path(*, target_model_ref: str | None, max_new_tokens: int) -> Path:
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name = f"{_slugify_model_ref(target_model_ref)}-{int(max_new_tokens)}-{ts}"
+    return Path("benchmark/results") / f"{name}.json"
 
 
 def _strip_generation_payload(result: dict[str, Any], *, drop_phase_timings: bool = False) -> dict[str, Any]:
@@ -161,12 +147,10 @@ def _build_config(
     cooldown: int,
     target_model: str,
     draft_model: str,
-    draft_quant: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "target_model": target_model,
         "draft_model": draft_model,
-        "draft_quant": draft_quant,
         "max_new_tokens": int(max_new_tokens),
         "block_tokens": int(block_tokens),
         "cooldown": int(cooldown),
@@ -187,7 +171,6 @@ def _build_single_case_report(
     runs: list[dict[str, Any]],
     target_model: str,
     draft_model: str,
-    draft_quant: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     run_entries = [_format_run_entry(run) for run in runs]
     baseline_tps_values = [float(run["baseline_generation_tps"]) for run in runs]
@@ -211,7 +194,6 @@ def _build_single_case_report(
             cooldown=cooldown,
             target_model=target_model,
             draft_model=draft_model,
-            draft_quant=draft_quant,
         ),
         "runs": run_entries,
         "summary": {
@@ -374,7 +356,6 @@ def _generate_dflash_stream_once(
     max_new_tokens: int,
     use_chat_template: bool,
     block_tokens: int | None,
-    verify_chunk_tokens: int | None,
     stop_token_ids: list[int] | None,
     suppress_token_ids: list[int] | None,
     prompt_tokens_override: list[int] | None = None,
@@ -396,7 +377,6 @@ def _generate_dflash_stream_once(
         max_new_tokens=max_new_tokens,
         use_chat_template=use_chat_template,
         block_tokens=block_tokens,
-        verify_chunk_tokens=verify_chunk_tokens,
         stop_token_ids=stop_token_ids,
         suppress_token_ids=suppress_token_ids,
         prompt_tokens_override=prompt_tokens_override,
@@ -442,11 +422,10 @@ def _run_once_sequential(
     prompt: str,
     max_new_tokens: int,
     block_tokens: int,
-    verify_chunk_tokens: int | None,
     use_chat_template: bool,
     target_model_ref: str | None,
     draft_model_ref: str | None,
-    draft_quant: str | None,
+    quantize_draft: bool,
     no_eos: bool,
     split_sdpa: bool,
 ) -> dict[str, Any]:
@@ -488,7 +467,7 @@ def _run_once_sequential(
     draft_model, draft_meta = load_draft_bundle(
         draft_model_ref,
         lazy=True,
-        draft_quant=draft_quant,
+        quantize_draft=quantize_draft,
     )
     # Cross-check: DFlash tokenizer is a different instance; tokens must match.
     if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
@@ -517,7 +496,6 @@ def _run_once_sequential(
             max_new_tokens=max_new_tokens,
             use_chat_template=use_chat_template,
             block_tokens=block_tokens,
-            verify_chunk_tokens=verify_chunk_tokens,
             stop_token_ids=dflash_stop_token_ids,
             suppress_token_ids=dflash_suppress_token_ids,
             prompt_tokens_override=prompt_tokens,
@@ -556,11 +534,10 @@ def benchmark_once(
     prompt: str,
     max_new_tokens: int,
     block_tokens: int | None = None,
-    verify_chunk_tokens: int | None,
     use_chat_template: bool,
     target_model_ref: str | None,
     draft_model_ref: str | None,
-    draft_quant: str | None = None,
+    quantize_draft: bool = False,
     no_eos: bool = False,
     split_sdpa: bool = True,
     cooldown: int = 10,
@@ -571,11 +548,10 @@ def benchmark_once(
         prompt=prompt,
         max_new_tokens=max_new_tokens,
         block_tokens=block_tokens,
-        verify_chunk_tokens=verify_chunk_tokens,
         use_chat_template=use_chat_template,
         target_model_ref=target_model_ref,
         draft_model_ref=draft_model_ref,
-        draft_quant=draft_quant,
+        quantize_draft=quantize_draft,
         no_eos=no_eos,
         split_sdpa=split_sdpa,
     )
@@ -592,7 +568,6 @@ def benchmark_once(
         runs=[result],
         target_model=target_meta["resolved_model_ref"],
         draft_model=draft_meta["resolved_model_ref"],
-        draft_quant=draft_meta.get("draft_quant"),
     )
 
 
@@ -602,11 +577,10 @@ def benchmark_matrix(
     schedules: tuple[int, ...] = DEFAULT_SCHEDULES,
     repeat: int = DEFAULT_REPEAT,
     block_tokens: int | None = None,
-    verify_chunk_tokens: int | None = None,
     use_chat_template: bool = False,
     target_model_ref: str | None = None,
     draft_model_ref: str | None = None,
-    draft_quant: str | None = None,
+    quantize_draft: bool = False,
     no_eos: bool = False,
     split_sdpa: bool = True,
     cooldown: int = 10,
@@ -626,11 +600,10 @@ def benchmark_matrix(
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             block_tokens=block_tokens,
-            verify_chunk_tokens=verify_chunk_tokens,
             use_chat_template=use_chat_template,
             target_model_ref=target_model_ref,
             draft_model_ref=draft_model_ref,
-            draft_quant=draft_quant,
+            quantize_draft=quantize_draft,
             no_eos=no_eos,
             split_sdpa=split_sdpa,
         )
@@ -657,7 +630,6 @@ def benchmark_matrix(
         runs=runs,
         target_model=target_meta["resolved_model_ref"] if target_meta is not None else "",
         draft_model=draft_meta["resolved_model_ref"] if draft_meta is not None else "",
-        draft_quant=draft_meta.get("draft_quant") if draft_meta is not None else None,
     )
 
 
@@ -669,7 +641,6 @@ def main() -> None:
     parser.add_argument("--prompt", required=True, help="Prompt to benchmark.")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--block-tokens", type=int, default=16)
-    parser.add_argument("--verify-chunk-tokens", type=int, default=None)
     parser.add_argument("--matrix", action="store_true")
     parser.add_argument(
         "--repeat",
@@ -686,21 +657,7 @@ def main() -> None:
     parser.add_argument("--no-chat-template", action="store_true")
     parser.add_argument("--model", default=None)
     parser.add_argument("--draft", default=None)
-    parser.add_argument(
-        "--draft-quant",
-        default=None,
-        metavar="SPEC",
-        help=(
-            "Quantize the draft model. Format: w{W}[a{A}][:gs{G}] where "
-            "W=weight bits (2/4/8), A=activation bits (16=bfloat16, 32=float32), "
-            "G=group size (32/64/128). Examples: w4, w8a16, w4a32:gs128."
-        ),
-    )
-    parser.add_argument(
-        "--quantize-draft",
-        action="store_true",
-        help="Deprecated. Use --draft-quant w4a16 instead.",
-    )
+    parser.add_argument("--quantize-draft", action="store_true")
     parser.add_argument("--no-eos", action="store_true")
     parser.add_argument(
         "--split-sdpa",
@@ -715,11 +672,10 @@ def main() -> None:
 
     common_kwargs = {
         "block_tokens": args.block_tokens,
-        "verify_chunk_tokens": args.verify_chunk_tokens,
         "use_chat_template": not args.no_chat_template,
         "target_model_ref": args.model,
         "draft_model_ref": args.draft,
-        "draft_quant": args.draft_quant or ("w4a16" if args.quantize_draft else None),
+        "quantize_draft": args.quantize_draft,
         "no_eos": args.no_eos,
         "split_sdpa": args.split_sdpa,
         "cooldown": args.cooldown,
@@ -741,8 +697,6 @@ def main() -> None:
     output_path = _default_results_path(
         target_model_ref=args.model,
         max_new_tokens=args.max_tokens,
-        chip=result.get("hardware", {}).get("chip"),
-        draft_quant=common_kwargs.get("draft_quant"),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2) + "\n")

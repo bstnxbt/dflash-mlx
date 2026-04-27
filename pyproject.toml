@@ -11,7 +11,7 @@ license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [{name = "bstnxbt"}]
 dependencies = [
-    "mlx>=0.25.0",
+    "mlx>=0.31.0",
     "mlx-lm>=0.31.0",
 ]
 
@@ -22,6 +22,8 @@ Homepage = "https://github.com/bstnxbt/dflash-mlx"
 dflash = "dflash_mlx.generate:main"
 dflash-serve = "dflash_mlx.serve:main"
 dflash-benchmark = "benchmark.benchmark:main"
+dflash-opencode-bench = "benchmark.bench_opencode_session:main"
+dflash-pi-bench = "benchmark.bench_pi_session:main"
 
 [tool.setuptools.packages.find]
 include = ["dflash_mlx*", "benchmark*"]

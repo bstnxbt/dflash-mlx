@@ -15,12 +15,12 @@ from dflash_mlx.runtime import (
     stream_dflash_generate,
 )
 
-
 DRAFT_REGISTRY = {
     "Qwen3.5-4B": "z-lab/Qwen3.5-4B-DFlash",
     "Qwen3.5-9B": "z-lab/Qwen3.5-9B-DFlash",
     "Qwen3.5-27B": "z-lab/Qwen3.5-27B-DFlash",
     "Qwen3.5-35B-A3B": "z-lab/Qwen3.5-35B-A3B-DFlash",
+    "Qwen3.6-27B": "z-lab/Qwen3.6-27B-DFlash",
     "Qwen3.6-35B-A3B": "z-lab/Qwen3.6-35B-A3B-DFlash",
     "Qwen3-4B": "z-lab/Qwen3-4B-DFlash-b16",
     "Qwen3-8B": "z-lab/Qwen3-8B-DFlash-b16",
@@ -30,14 +30,11 @@ _NORMALIZED_DRAFT_REGISTRY = {
     key.lower(): value for key, value in DRAFT_REGISTRY.items()
 }
 
-
 def _supported_base_models() -> str:
     return ", ".join(DRAFT_REGISTRY.keys())
 
-
 def _strip_model_org(model_ref: str) -> str:
     return str(model_ref).rsplit("/", 1)[-1].strip()
-
 
 def get_stop_token_ids(tokenizer: Any) -> list[int]:
     eos_token_ids = list(getattr(tokenizer, "eos_token_ids", None) or [])
@@ -45,7 +42,6 @@ def get_stop_token_ids(tokenizer: Any) -> list[int]:
     if eos_token_id is not None and eos_token_id not in eos_token_ids:
         eos_token_ids.append(int(eos_token_id))
     return eos_token_ids
-
 
 def resolve_optional_draft_ref(model_ref: str, draft_ref: Optional[str]) -> Optional[str]:
     if draft_ref:
@@ -71,13 +67,11 @@ def resolve_optional_draft_ref(model_ref: str, draft_ref: Optional[str]) -> Opti
     best_match = max(matching_bases, key=len)
     return _NORMALIZED_DRAFT_REGISTRY[best_match]
 
-
 def decode_token(tokenizer: Any, token_id: int) -> str:
     try:
         return str(tokenizer.decode([int(token_id)]))
     except Exception:
         return str(tokenizer.decode(int(token_id)))
-
 
 def generation_tps_from_summary(summary: dict[str, Any]) -> float:
     elapsed_us = float(summary.get("elapsed_us", 0.0))
@@ -86,7 +80,6 @@ def generation_tps_from_summary(summary: dict[str, Any]) -> float:
     generation_tokens = int(summary.get("generation_tokens", 0))
     generation_us = max(0.0, elapsed_us - prefill_us)
     return (generation_tokens / (generation_us / 1e6)) if generation_us > 0.0 else 0.0
-
 
 def load_runtime_components(
     *,
@@ -109,7 +102,6 @@ def load_runtime_components(
             f"Failed to load DFlash draft model '{resolved_draft_ref}' for '{model_ref}'."
         ) from exc
     return target_model, tokenizer, draft_model, resolved_draft_ref
-
 
 def run_generate(
     *,
@@ -154,7 +146,6 @@ def run_generate(
     sys.stderr.flush()
     return 0
 
-
 def main() -> None:
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
@@ -175,7 +166,6 @@ def main() -> None:
             draft_ref=args.draft,
         )
     )
-
 
 if __name__ == "__main__":
     main()

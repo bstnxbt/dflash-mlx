@@ -1,11 +1,6 @@
 # Copyright 2026 bstnxbt
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
-"""Parity: `VerifyQuantizedLinear(x)` must equal `QuantizedLinear(x)` forward pass
-for M != 16 (AR / prefill stays stock). For M == 16, we only require that the
-output matches `verify_matmul(...)` directly — drift vs stock is known
-and accepted (measured e2e).
-"""
 from __future__ import annotations
 
 import os
@@ -49,7 +44,6 @@ def test_eligibility_rejects_large_N():
 
 @pytest.mark.parametrize("M", [1, 8, 32])
 def test_parity_non_verify(small_ql, M):
-    """For M != 16, VerifyQuantizedLinear must produce identical output to QuantizedLinear."""
     verify = VerifyQuantizedLinear.from_quantized(small_ql)
     x = mx.random.normal((M, 512)).astype(mx.bfloat16) * 0.5
     y_ref = small_ql(x)
@@ -60,7 +54,6 @@ def test_parity_non_verify(small_ql, M):
 
 
 def test_parity_verify_M16(small_ql):
-    """For M == 16, output must match `verify_matmul` directly (not stock)."""
     verify = VerifyQuantizedLinear.from_quantized(small_ql)
     x = mx.random.normal((16, 512)).astype(mx.bfloat16) * 0.5
     y_direct = verify_matmul(
@@ -73,7 +66,6 @@ def test_parity_verify_M16(small_ql):
 
 
 def test_swap_and_unswap(small_ql):
-    """End-to-end: build a tiny model, swap, verify count, unswap, verify reset."""
     class Tiny(nn.Module):
         def __init__(self):
             super().__init__()

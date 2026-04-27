@@ -6,11 +6,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from dflash_mlx.engine import FullAttentionEngine, HybridGDNEngine
-
+from dflash_mlx.engine.target_verifier import _target_text_model
+from dflash_mlx.verify_backend import FullAttentionEngine, HybridGDNEngine
 
 def detect_engine(target_model: Any) -> FullAttentionEngine | HybridGDNEngine:
-    from dflash_mlx.runtime import _target_text_model
     inner = _target_text_model(target_model)
     if hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx"):
         return HybridGDNEngine()

@@ -11,7 +11,6 @@ from mlx_lm.models.cache import _BaseCache
 
 from dflash_mlx.kernels import tape_replay_kernel
 
-
 class RecurrentRollbackCache(_BaseCache):
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
@@ -42,11 +41,6 @@ class RecurrentRollbackCache(_BaseCache):
     @state.setter
     def state(self, value) -> None:
         self.cache = value
-
-    def filter(self, batch_indices):
-        self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
-        if self.lengths is not None:
-            self.lengths = self.lengths[batch_indices]
 
     def extend(self, other):
         def cat(lhs, rhs):

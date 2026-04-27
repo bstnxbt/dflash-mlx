@@ -15,22 +15,49 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models import cache as cache_mod
 from mlx_lm.models import gated_delta as gated_delta_mod
-from mlx_lm.models.base import (
-    create_attention_mask,
-    create_ssm_mask,
-    scaled_dot_product_attention,
-)
+from mlx_lm.models.base import scaled_dot_product_attention
 from mlx_lm.utils import load, load_model
 
 from dflash_mlx.adapter import detect_engine
 from dflash_mlx.draft_backend import make_draft_backend
+from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
+from dflash_mlx.engine.config import (
+    _draft_window_override_enabled,
+    _effective_draft_window_size,
+    _is_unwindowed_full_attention_draft,
+    _profile_dflash_cycles_enabled,
+    _resolve_dflash_max_ctx,
+    _resolve_draft_window,
+    _resolve_verify_len_cap,
+)
+from dflash_mlx.engine.prefill import (
+    compute_snapshot_boundary,
+    init_target_hidden_from_snapshot,
+)
+from dflash_mlx.engine.rollback import (
+    arm_target_rollback_with_prefix as _arm_target_rollback_with_prefix,
+    cleanup_generation_caches as _cleanup_generation_caches,
+    clear_rollback_state as _clear_rollback_state,
+    restore_target_cache_after_acceptance as _restore_target_cache_after_acceptance,
+)
+from dflash_mlx.engine.target_verifier import (
+    _lm_head_logits,
+    _target_text_model,
+    _target_text_wrapper,
+    extract_context_feature_from_dict,
+    target_forward_with_hidden_states,
+    verify_target_block as _verify_target_block,
+)
 from dflash_mlx.model import (
     DFlashDraftModel,
     DFlashDraftModelArgs,
-    extract_context_feature,
+)
+from dflash_mlx.cache.codecs import hydrate_target_cache
+from dflash_mlx.cache.snapshot import (
+    DFlashPrefixSnapshot,
+    validate_prefix_snapshot as _validate_prefix_snapshot,
 )
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
-
 
 def resolve_model_ref(model_ref: str | Path | None, *, kind: str) -> str:
     if model_ref:
@@ -38,10 +65,12 @@ def resolve_model_ref(model_ref: str | Path | None, *, kind: str) -> str:
         return str(candidate if candidate.exists() else model_ref)
     raise ValueError(f"{kind} model reference is required")
 
+def default_split_sdpa_enabled(model_ref: str | Path | None) -> bool:
+    resolved_ref = resolve_model_ref(model_ref, kind="target")
+    return False
 
 def _get_dflash_model_classes(config: dict[str, Any]):
     return DFlashDraftModel, DFlashDraftModelArgs
-
 
 def _resolve_local_model_path(model_ref: str | Path) -> Path:
     candidate = Path(model_ref).expanduser()
@@ -58,7 +87,6 @@ def _resolve_local_model_path(model_ref: str | Path) -> Path:
     )
     return Path(snapshot_path)
 
-
 def _prepare_prompt_tokens(tokenizer: Any, prompt: str, *, use_chat_template: bool) -> list[int]:
     if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
         return list(
@@ -69,7 +97,6 @@ def _prepare_prompt_tokens(tokenizer: Any, prompt: str, *, use_chat_template: bo
             )
         )
     return list(tokenizer.encode(prompt))
-
 
 def build_suppress_token_mask(
     vocab_size: int,
@@ -88,7 +115,6 @@ def build_suppress_token_mask(
     token_array = mx.array(token_ids, dtype=mx.int32)
     return mx.any(mx.equal(vocab_indices[:, None], token_array[None, :]), axis=1)
 
-
 def greedy_tokens_with_mask(
     logits: mx.array,
     suppress_token_mask: Optional[mx.array] = None,
@@ -99,44 +125,6 @@ def greedy_tokens_with_mask(
     masked_logits = mx.where(suppress_token_mask, floor, logits)
     return mx.argmax(masked_logits, axis=-1).astype(mx.uint32)
 
-
-def _match_acceptance_length(
-    drafted_tokens: mx.array,
-    posterior_tokens: mx.array,
-) -> mx.array:
-    if int(drafted_tokens.shape[0]) == 0:
-        return mx.array(0, dtype=mx.int32)
-    matches = mx.equal(drafted_tokens, posterior_tokens).astype(mx.int32)
-    return mx.sum(mx.cumprod(matches, axis=0))
-
-
-def _concat_hidden_state_chunks(
-    hidden_state_chunks: list[list[mx.array]],
-) -> list[mx.array]:
-    if not hidden_state_chunks:
-        raise ValueError("expected at least one hidden-state chunk")
-    if len(hidden_state_chunks) == 1:
-        return hidden_state_chunks[0]
-    return [
-        mx.concatenate([chunk[index] for chunk in hidden_state_chunks], axis=1)
-        for index in range(len(hidden_state_chunks[0]))
-    ]
-
-
-def _concat_hidden_state_chunk_dicts(
-    hidden_state_chunks: list[dict[int, mx.array]],
-    capture_layer_ids: set[int],
-) -> dict[int, mx.array]:
-    if not hidden_state_chunks:
-        raise ValueError("expected at least one hidden-state chunk")
-    if len(hidden_state_chunks) == 1:
-        return hidden_state_chunks[0]
-    return {
-        layer_id: mx.concatenate([chunk[layer_id] for chunk in hidden_state_chunks], axis=1)
-        for layer_id in sorted(capture_layer_ids)
-    }
-
-
 def _eval_logits_and_captured(
     logits: mx.array,
     captured: list[mx.array] | dict[int, mx.array],
@@ -146,22 +134,6 @@ def _eval_logits_and_captured(
     else:
         mx.eval(logits, *captured)
 
-
-def _target_text_wrapper(target_model: Any) -> Any:
-    if hasattr(target_model, "model"):
-        return target_model
-    if hasattr(target_model, "language_model"):
-        return target_model.language_model
-    raise AttributeError(f"Unsupported target model wrapper: {type(target_model)!r}")
-
-
-def _target_text_model(target_model: Any) -> Any:
-    wrapper = _target_text_wrapper(target_model)
-    if hasattr(wrapper, "model"):
-        return wrapper.model
-    raise AttributeError(f"Unsupported target text model: {type(wrapper)!r}")
-
-
 def detect_target_family(target_model: Any) -> str:
     inner = _target_text_model(target_model)
     has_linear = any(
@@ -170,80 +142,17 @@ def detect_target_family(target_model: Any) -> str:
     )
     return "hybrid_gdn" if has_linear else "pure_attention"
 
-
 def _target_embed_tokens(target_model: Any) -> Any:
     return _target_text_model(target_model).embed_tokens
-
-
-def _lm_head_logits(target_model: Any, hidden_states: mx.array) -> mx.array:
-    wrapper = _target_text_wrapper(target_model)
-    if getattr(getattr(wrapper, "args", None), "tie_word_embeddings", True):
-        return wrapper.model.embed_tokens.as_linear(hidden_states)
-    return wrapper.lm_head(hidden_states)
-
-
-def extract_context_feature_from_dict(
-    captured_dict: dict[int, mx.array],
-    target_layer_ids: list[int],
-) -> mx.array:
-    selected = [captured_dict[layer_id + 1] for layer_id in target_layer_ids]
-    return mx.concatenate(selected, axis=-1)
-
-
-def _resolve_verify_len_cap(target_model: Any, block_tokens: int) -> int:
-    override_raw = os.environ.get("DFLASH_VERIFY_LEN", "").strip()
-    if override_raw:
-        try:
-            override = int(override_raw)
-        except ValueError:
-            override = 0
-        if override > 0:
-            return max(1, min(int(block_tokens), override))
-    return int(block_tokens)
-
-
-def _resolve_dflash_max_ctx() -> int:
-    raw = os.environ.get("DFLASH_MAX_CTX", "0").strip()
-    try:
-        max_ctx = int(raw)
-    except ValueError:
-        max_ctx = 0
-    if max_ctx <= 0:
-        return sys.maxsize
-    return max_ctx
-
-
-def _resolve_draft_window() -> tuple[int, int]:
-    sink = int(os.environ.get("DFLASH_DRAFT_SINK", "64").strip())
-    window = int(os.environ.get("DFLASH_DRAFT_WINDOW", "1024").strip())
-    return max(0, sink), max(1, window)
-
-
-def _profile_dflash_cycles_enabled() -> bool:
-    raw = os.environ.get("DFLASH_PROFILE", "").strip().lower()
-    return raw not in {"", "0", "false", "no"}
-
 
 def _ns_to_us(ns: int | float) -> float:
     return float(ns) / 1_000.0
 
-
 @dataclass(frozen=True)
 class DraftQuantSpec:
-    """Parsed weight/activation quantization spec for the draft model.
-
-    Supported format: ``w{W}[a{A}][:gs{G}]``
-    - ``W`` – weight bits: 2, 4, or 8
-    - ``A`` – activation bits: 16 (bfloat16, default) or 32 (float32)
-    - ``G`` – group size: 32, 64 (default), or 128
-
-    Examples: ``w4``, ``w8a16``, ``w4a32:gs128``
-    """
-
     weight_bits: int
     group_size: int
     act_bits: int
-
 
 _DRAFT_QUANT_RE = re.compile(
     r"^w(?P<wb>2|4|8)"
@@ -252,12 +161,7 @@ _DRAFT_QUANT_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def parse_draft_quant_spec(spec: str) -> DraftQuantSpec:
-    """Parse a quantization spec string into a :class:`DraftQuantSpec`.
-
-    Raises :exc:`ValueError` for unrecognised formats.
-    """
     m = _DRAFT_QUANT_RE.match(spec.strip())
     if not m:
         raise ValueError(
@@ -271,33 +175,13 @@ def parse_draft_quant_spec(spec: str) -> DraftQuantSpec:
     gs = int(m.group("gs") or 64)
     return DraftQuantSpec(weight_bits=wb, group_size=gs, act_bits=ab)
 
-
 def _resolve_draft_quant(draft_quant: str | None) -> DraftQuantSpec | None:
-    """Resolve the effective :class:`DraftQuantSpec` from arg + env vars.
-
-    Priority: explicit *draft_quant* arg > ``DFLASH_DRAFT_QUANT`` env var >
-    legacy ``DFLASH_QUANTIZE_DRAFT`` env var (maps to ``w4a16``).
-    """
     spec = draft_quant or os.environ.get("DFLASH_DRAFT_QUANT", "").strip()
-    if not spec:
-        # Backward-compat: old boolean env var → default w4a16
-        raw_legacy = os.environ.get("DFLASH_QUANTIZE_DRAFT", "").strip().lower()
-        if raw_legacy not in {"", "0", "false", "no"}:
-            spec = "w4a16"
     if not spec:
         return None
     return parse_draft_quant_spec(spec)
 
-
-
-
-def _linear_forward(x: mx.array, weight: mx.array, bias: Optional[mx.array]) -> mx.array:
-    out = x @ weight.T
-    return out if bias is None else out + bias
-
-
 _EXACT_SMALL_PROJ_PAD_M = 16
-
 
 class _ExactSmallProjPad(nn.Module):
     def __init__(self, linear: nn.Module, *, pad_m: int = _EXACT_SMALL_PROJ_PAD_M):
@@ -330,7 +214,6 @@ class _ExactSmallProjPad(nn.Module):
             return out[:, :seq_len, :]
         return self.linear(x)
 
-
 def _install_exact_small_proj_hooks(
     linear_attn: Any,
     *,
@@ -342,7 +225,6 @@ def _install_exact_small_proj_hooks(
             continue
         setattr(linear_attn, attr_name, _ExactSmallProjPad(proj, pad_m=pad_m))
 
-
 def _attention_num_heads(attn: Any) -> int:
     for attr in ("num_attention_heads", "n_heads"):
         value = getattr(attn, attr, None)
@@ -350,14 +232,12 @@ def _attention_num_heads(attn: Any) -> int:
             return int(value)
     raise AttributeError(f"{type(attn).__name__} missing attention head count attribute")
 
-
 def _attention_num_kv_heads(attn: Any) -> int:
     for attr in ("num_key_value_heads", "n_kv_heads"):
         value = getattr(attn, attr, None)
         if value is not None:
             return int(value)
     raise AttributeError(f"{type(attn).__name__} missing KV head count attribute")
-
 
 def _attention_has_gated_q_proj(attn: Any) -> bool:
     q_proj = getattr(attn, "q_proj", None)
@@ -372,7 +252,6 @@ def _attention_has_gated_q_proj(attn: Any) -> bool:
         return False
     expected_out_dim = 2 * num_attention_heads * int(q_norm_weight.shape[0])
     return int(q_proj_weight.shape[0]) == expected_out_dim
-
 
 def pack_target_model_weights_selective(
     target_model: Any,
@@ -395,7 +274,6 @@ def pack_target_model_weights_selective(
     }
     text_model._dflash_pack_info = pack_info
     return pack_info
-
 
 def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
     cls = type(linear_attn)
@@ -461,7 +339,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         if state is None:
             _, _, h_k, d_k = q.shape
             h_v, d_v = v.shape[-2:]
-            state = mx.zeros((B, h_v, d_v, d_k), dtype=q.dtype)
+            state = mx.zeros((B, h_v, d_v, d_k), dtype=mx.float32)
         state_in = state
 
         if (
@@ -498,6 +376,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
                 )
 
         cache[1] = state
+        cache.advance(S)
         out = self.norm(out, z)
         out_flat = out.reshape(B, S, -1)
         out = self.out_proj(out_flat)
@@ -510,7 +389,6 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
     cls.__call__ = speculative_call
     cls._dflash_speculative_call_installed = True
 
-
 def _split_sdpa_mask(
     mask: Optional[Any],
     *,
@@ -521,7 +399,6 @@ def _split_sdpa_mask(
     if mask is None or mask == "causal":
         return mask
     return mask[..., query_start:query_end, :key_end]
-
 
 def _split_sdpa_output(
     *,
@@ -557,9 +434,7 @@ def _split_sdpa_output(
         )
     return mx.concatenate(outputs, axis=2)
 
-
 _HYBRID_SDPA_EXACT_KV_THRESHOLD = 1024
-
 
 def _install_split_full_attention_hook(attn: Any) -> None:
     cls = type(attn)
@@ -671,7 +546,6 @@ def _install_split_full_attention_hook(attn: Any) -> None:
     cls.__call__ = split_call
     cls._dflash_split_full_attention_installed = True
 
-
 def _install_target_speculative_hooks(target_model: Any) -> None:
     text_model = _target_text_model(target_model)
     if getattr(text_model, "_dflash_speculative_hooks_installed", False):
@@ -686,7 +560,6 @@ def _install_target_speculative_hooks(target_model: Any) -> None:
         elif not getattr(layer, "is_linear", False) and hasattr(layer, "self_attn"):
             _install_split_full_attention_hook(layer.self_attn)
     text_model._dflash_speculative_hooks_installed = True
-
 
 def configure_full_attention_split(
     target_model: Any,
@@ -705,7 +578,6 @@ def configure_full_attention_split(
             layer.self_attn._dflash_split_sdpa_exact_kv_threshold = (
                 _HYBRID_SDPA_EXACT_KV_THRESHOLD
             )
-
 
 def make_target_cache(
     target_model: Any,
@@ -732,7 +604,6 @@ def make_target_cache(
                 caches.append(cache_mod.KVCache())
     return caches
 
-
 def load_target_bundle(
     model_ref: str | Path | None = None,
     *,
@@ -740,18 +611,23 @@ def load_target_bundle(
     pack_target_weights: bool = False,
     pack_attention_weights: bool = False,
     validate_packing: bool = True,
-    split_full_attention_sdpa: bool = True,
+    split_full_attention_sdpa: Optional[bool] = None,
     split_full_attention_chunk_size: int = 8,
     quantize_kv_cache: bool = False,
 ):
     resolved_ref = resolve_model_ref(model_ref, kind="target")
+    split_enabled = (
+        default_split_sdpa_enabled(resolved_ref)
+        if split_full_attention_sdpa is None
+        else bool(split_full_attention_sdpa)
+    )
     model, tokenizer, config = load(resolved_ref, lazy=lazy, return_config=True)
     target_family = detect_target_family(model)
     if target_family == "hybrid_gdn":
         _install_target_speculative_hooks(model)
         configure_full_attention_split(
             model,
-            enabled=split_full_attention_sdpa and not quantize_kv_cache,
+            enabled=split_enabled and not quantize_kv_cache,
             chunk_size=split_full_attention_chunk_size,
         )
     meta = {
@@ -759,6 +635,8 @@ def load_target_bundle(
         "config": config,
         "quantize_kv_cache": bool(quantize_kv_cache),
         "target_family": target_family,
+        "split_full_attention_sdpa": bool(split_enabled and not quantize_kv_cache),
+        "split_full_attention_sdpa_requested": split_full_attention_sdpa,
     }
     if pack_target_weights:
         meta["packing"] = pack_target_model_weights_selective(
@@ -767,32 +645,16 @@ def load_target_bundle(
             pack_mlp=True,
             pack_attention=pack_attention_weights,
         )
-    if _verify_enabled_for(config):
-        # verify_matmul is gated by DFLASH_VERIFY_QMM at call time; without
-        # the flag it falls back to mx.quantized_matmul, making the swap a
-        # no-op. setdefault preserves any explicit user override.
+    verify_linear_enabled = _verify_enabled_for(config)
+    meta["verify_linear_enabled"] = bool(verify_linear_enabled)
+    if verify_linear_enabled:
         os.environ.setdefault("DFLASH_VERIFY_QMM", "1")
         from dflash_mlx.verify_linear import install_verify_linears
         n_swapped = install_verify_linears(model)
         meta["verify_linear_swapped"] = n_swapped
     return model, tokenizer, meta
 
-
 def _verify_enabled_for(config: Any) -> bool:
-    """Decide whether to swap `nn.QuantizedLinear` → `VerifyQuantizedLinear`.
-
-    Explicit env var wins:
-      DFLASH_VERIFY_LINEAR=1  → always on
-      DFLASH_VERIFY_LINEAR=0  → always off
-
-    Default (env unset or empty): auto-enable on models where verify M=16
-    kernel measurably helps end-to-end. Conservative rule:
-      - MoE (num_experts > 0) → ON. Bench shows +6-11 % tps on 35B-A3B.
-      - Dense with num_hidden_layers >= 40 → ON. 27B (64 layers) gains +8 %.
-      - Dense with num_hidden_layers < 40 → OFF. 9B/4B regress (-17 to -29 %)
-        because small-shape projections are Python-overhead-bound and the
-        M=16 specialization does not amortize.
-    """
     override = os.environ.get("DFLASH_VERIFY_LINEAR", "").strip()
     if override == "1":
         return True
@@ -802,19 +664,27 @@ def _verify_enabled_for(config: Any) -> bool:
         text_cfg = config.get("text_config", config) if isinstance(config, dict) else config
         num_experts = int(text_cfg.get("num_experts", 0) or 0)
         num_layers = int(text_cfg.get("num_hidden_layers", 0) or 0)
+        hidden_size = int(text_cfg.get("hidden_size", 0) or 0)
+        num_heads = int(text_cfg.get("num_attention_heads", 0) or 0)
+        num_kv_heads = int(text_cfg.get("num_key_value_heads", 0) or 0)
     except Exception:
         return False
     if num_experts > 0:
+        if (
+            num_layers == 40
+            and hidden_size == 2048
+            and num_heads == 16
+            and num_kv_heads == 2
+        ):
+            return False
         return True
     return num_layers >= 40
-
 
 def load_draft_bundle(
     model_ref: str | Path | None = None,
     *,
     lazy: bool = True,
     draft_quant: str | None = None,
-    # Deprecated: use draft_quant="w4a16" instead.
     quantize_draft: bool = False,
 ):
     resolved_ref = resolve_model_ref(model_ref, kind="draft")
@@ -824,25 +694,17 @@ def load_draft_bundle(
         lazy=lazy,
         get_model_classes=_get_dflash_model_classes,
     )
-    # Backward compat: bool flag maps to w4a16
     if quantize_draft and not draft_quant:
         draft_quant = "w4a16"
     quant_spec = _resolve_draft_quant(draft_quant)
     if quant_spec is not None:
         nn.quantize(model, bits=quant_spec.weight_bits, group_size=quant_spec.group_size)
         if quant_spec.weight_bits in (4, 8):
-            # The draft always runs at M=16 (block_tokens) — the exact shape
-            # the verify MMA kernel is tuned for. Set the env flag before
-            # installing so VerifyQuantizedLinear actually routes to the Metal
-            # kernel and doesn't silently fall back to mx.quantized_matmul.
             os.environ.setdefault("DFLASH_VERIFY_QMM", "1")
             from dflash_mlx.verify_linear import install_verify_linears, prewarm_verify_kernels
             install_verify_linears(model)
             prewarm_verify_kernels(model)
         if quant_spec.act_bits == 32:
-            # Cast non-packed parameters (norms, biases, quantization scales)
-            # to float32 AFTER install_verify_linears so the VerifyQuantizedLinear
-            # copies bfloat16 scales (half the memory) before we upcast the rest.
             def _cast_to_f32(_, x: mx.array) -> mx.array:
                 if x.dtype not in (mx.uint32, mx.int32):
                     return x.astype(mx.float32)
@@ -860,1208 +722,16 @@ def load_draft_bundle(
             if quant_spec is not None
             else None
         ),
-        # Kept for backward compat
         "quantize_draft": quant_spec is not None,
     }
 
-
-def target_forward_with_hidden_states(
-    target_model: Any,
-    *,
-    input_ids: Optional[mx.array] = None,
-    cache: Optional[list[Any]] = None,
-    input_embeddings: Optional[mx.array] = None,
-    capture_layer_ids: Optional[set[int]] = None,
-) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]:
-    inner = _target_text_model(target_model)
-    hidden_states = input_embeddings if input_embeddings is not None else inner.embed_tokens(input_ids)
-    if cache is None:
-        cache = [None] * len(inner.layers)
-    capture_all = capture_layer_ids is None
-    if capture_all:
-        captured: list[mx.array] | dict[int, mx.array] = [hidden_states]
-    else:
-        capture_layer_ids = set(capture_layer_ids)
-        captured = {0: hidden_states} if 0 in capture_layer_ids else {}
-    h = hidden_states
-
-    if hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx"):
-        fa_mask = create_attention_mask(hidden_states, cache[inner.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[inner.ssm_idx])
-        for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache, strict=True)):
-            mask = ssm_mask if getattr(layer, "is_linear", False) else fa_mask
-            h = layer(h, mask=mask, cache=layer_cache)
-            capture_key = layer_index + 1
-            if capture_all:
-                captured.append(h)
-            elif capture_layer_ids is not None and capture_key in capture_layer_ids:
-                captured[capture_key] = h
-    else:
-        mask = create_attention_mask(hidden_states, cache[0])
-        for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache, strict=True)):
-            h = layer(h, mask, layer_cache)
-            capture_key = layer_index + 1
-            if capture_all:
-                captured.append(h)
-            elif capture_layer_ids is not None and capture_key in capture_layer_ids:
-                captured[capture_key] = h
-    normalized = inner.norm(h)
-    logits = _lm_head_logits(target_model, normalized)
-    return logits, captured
-
-
-def trim_cache_to(cache_entries: list[Any], size: int) -> int:
-    if not cache_entries:
-        return 0
-    current_size = int(getattr(cache_entries[0], "offset", 0) or 0)
-    if current_size <= size:
-        return 0
-    return int(cache_mod.trim_prompt_cache(cache_entries, current_size - size) or 0)
-
-
-def _arm_target_rollback(cache_entries: list[Any]) -> None:
-    for cache_entry in cache_entries:
-        if hasattr(cache_entry, "arm_rollback"):
-            cache_entry.arm_rollback()
-
-
-def _arm_target_rollback_with_prefix(
-    cache_entries: list[Any],
-    *,
-    prefix_len: int,
-) -> None:
-    for cache_entry in cache_entries:
-        if hasattr(cache_entry, "arm_rollback"):
-            cache_entry.arm_rollback(prefix_len=int(prefix_len))
-
-
-def _clear_rollback_state(cache_entry: Any) -> None:
-    if hasattr(cache_entry, "clear_transients"):
-        cache_entry.clear_transients()
-        return
-    if hasattr(cache_entry, "_armed"):
-        cache_entry._armed = False
-    if hasattr(cache_entry, "_tape"):
-        cache_entry._tape = None
-    if hasattr(cache_entry, "_tape_k"):
-        cache_entry._tape_k = None
-    if hasattr(cache_entry, "_tape_g"):
-        cache_entry._tape_g = None
-    if hasattr(cache_entry, "_tape_qkv"):
-        cache_entry._tape_qkv = None
-    if hasattr(cache_entry, "_snapshot"):
-        cache_entry._snapshot = None
-
-
-def _cleanup_generation_caches(
-    target_cache: list[Any],
-    draft_cache: list[Any],
-) -> None:
-    for cache_entry in target_cache:
-        if hasattr(cache_entry, "clear_transients"):
-            cache_entry.clear_transients()
-    draft_cache.clear()
-    target_cache.clear()
-
-
-def _restore_target_cache_after_acceptance(
-    cache_entries: list[Any],
-    *,
-    target_len: int,
-    acceptance_length: int,
-    drafted_tokens: int = 0,
-) -> int:
-    replay_ns_total = 0
-    fully_accepted = drafted_tokens > 0 and acceptance_length == drafted_tokens
-    for cache_entry in cache_entries:
-        if hasattr(cache_entry, "rollback"):
-            if fully_accepted:
-                _clear_rollback_state(cache_entry)
-                continue
-            replay_start_ns = time.perf_counter_ns()
-            cache_entry.rollback(acceptance_length)
-            replay_ns_total += time.perf_counter_ns() - replay_start_ns
-        elif hasattr(cache_entry, "trim"):
-            offset = int(getattr(cache_entry, "offset", 0) or 0)
-            if offset > target_len:
-                replay_start_ns = time.perf_counter_ns()
-                cache_entry.trim(offset - target_len)
-                replay_ns_total += time.perf_counter_ns() - replay_start_ns
-        elif hasattr(cache_entry, "offset"):
-            offset = int(getattr(cache_entry, "offset", 0) or 0)
-            if offset > target_len:
-                cache_entry.offset = target_len
-        elif hasattr(cache_entry, "crop"):
-            cache_entry.crop(target_len)
-    return replay_ns_total
-
-
-def _verify_target_block(
-    *,
-    target_model: Any,
-    verify_ids: mx.array,
-    target_cache: list[Any],
-    verify_chunk_tokens: Optional[int],
-    capture_layer_ids: Optional[set[int]] = None,
-) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]:
-    total_tokens = int(verify_ids.shape[1])
-    if total_tokens <= 0:
-        raise ValueError("verify block must contain at least one token")
-
-    chunk_size = max(1, int(verify_chunk_tokens or total_tokens))
-    if chunk_size >= total_tokens:
-        verify_logits, verify_hidden_states = target_forward_with_hidden_states(
-            target_model,
-            input_ids=verify_ids,
-            cache=target_cache,
-            capture_layer_ids=capture_layer_ids,
-        )
-        return verify_logits, verify_hidden_states
-
-    logits_chunks: list[mx.array] = []
-    hidden_state_chunks: list[list[mx.array]] | list[dict[int, mx.array]]
-    hidden_state_chunks = []
-    for offset in range(0, total_tokens, chunk_size):
-        verify_chunk = verify_ids[:, offset : offset + chunk_size]
-        chunk_logits, chunk_hidden_states = target_forward_with_hidden_states(
-            target_model,
-            input_ids=verify_chunk,
-            cache=target_cache,
-            capture_layer_ids=capture_layer_ids,
-        )
-        logits_chunks.append(chunk_logits)
-        hidden_state_chunks.append(chunk_hidden_states)
-
-    if capture_layer_ids is None:
-        return mx.concatenate(logits_chunks, axis=1), _concat_hidden_state_chunks(hidden_state_chunks)
-    return (
-        mx.concatenate(logits_chunks, axis=1),
-        _concat_hidden_state_chunk_dicts(hidden_state_chunks, capture_layer_ids),
-    )
-
-
-def generate_baseline_once(
-    *,
-    target_model: Any,
-    tokenizer: Any,
-    prompt: str,
-    max_new_tokens: int,
-    use_chat_template: bool = False,
-    stop_token_ids: Optional[list[int]] = None,
-    suppress_token_ids: Optional[list[int]] = None,
-    prompt_tokens_override: Optional[list[int]] = None,
-    quantize_kv_cache: bool = False,
-) -> dict[str, Any]:
-    if hasattr(mx, "reset_peak_memory"):
-        try:
-            mx.reset_peak_memory()
-        except Exception:
-            pass
-    prompt_tokens = (
-        list(prompt_tokens_override)
-        if prompt_tokens_override is not None
-        else _prepare_prompt_tokens(tokenizer, prompt, use_chat_template=use_chat_template)
-    )
-    stop_token_ids = list(stop_token_ids or [])
-
-    if max_new_tokens <= 0:
-        return {
-            "elapsed_us": 0.0,
-            "prompt_token_count": len(prompt_tokens),
-            "generated_token_ids": [],
-            "generation_tokens": 0,
-        }
-
-    prompt_array = mx.array(prompt_tokens, dtype=mx.uint32)[None]
-    cache = make_target_cache(
-        target_model,
-        enable_speculative_linear_cache=False,
-        quantize_kv_cache=quantize_kv_cache,
-    )
-    start_ns = time.perf_counter_ns()
-
-    prefill_start_ns = time.perf_counter_ns()
-    logits = target_model(prompt_array, cache=cache)
-    mx.eval(logits)
-    prefill_ns = time.perf_counter_ns() - prefill_start_ns
-    suppress_token_mask = build_suppress_token_mask(int(logits.shape[-1]), suppress_token_ids)
-    next_token = int(greedy_tokens_with_mask(logits[:, -1, :], suppress_token_mask).item())
-    generated_tokens = [next_token]
-
-    while len(generated_tokens) < max_new_tokens:
-        if next_token in stop_token_ids:
-            break
-        token_array = mx.array([[next_token]], dtype=mx.uint32)
-        logits = target_model(token_array, cache=cache)
-        next_token = int(greedy_tokens_with_mask(logits[:, -1, :], suppress_token_mask).item())
-        generated_tokens.append(next_token)
-
-    elapsed_us = (time.perf_counter_ns() - start_ns) / 1_000.0
-    return {
-        "elapsed_us": elapsed_us,
-        "prefill_us": prefill_ns / 1_000.0,
-        "prompt_token_count": len(prompt_tokens),
-        "generated_token_ids": generated_tokens,
-        "generation_tokens": len(generated_tokens),
-        "peak_memory_gb": float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else None,
-    }
-
-
-def stream_baseline_generate(
-    *,
-    target_model: Any,
-    tokenizer: Any,
-    prompt: str,
-    max_new_tokens: int,
-    use_chat_template: bool = False,
-    stop_token_ids: Optional[list[int]] = None,
-    suppress_token_ids: Optional[list[int]] = None,
-    prompt_tokens_override: Optional[list[int]] = None,
-    quantize_kv_cache: bool = False,
-    fallback_reason: Optional[str] = None,
-) -> Iterator[dict[str, Any]]:
-    prompt_tokens = (
-        list(prompt_tokens_override)
-        if prompt_tokens_override is not None
-        else _prepare_prompt_tokens(tokenizer, prompt, use_chat_template=use_chat_template)
-    )
-    prompt_len = len(prompt_tokens)
-    stop_token_ids = list(stop_token_ids or [])
-    prompt_array = mx.array(prompt_tokens, dtype=mx.uint32)[None]
-    cache = make_target_cache(
-        target_model,
-        enable_speculative_linear_cache=False,
-        quantize_kv_cache=quantize_kv_cache,
-    )
-    start_ns = time.perf_counter_ns()
-    _yield_pause_ns = 0
-
-    prefill_start_ns = time.perf_counter_ns()
-    logits = target_model(prompt_array, cache=cache)
-    mx.eval(logits)
-    prefill_ns = time.perf_counter_ns() - prefill_start_ns
-    suppress_token_mask = build_suppress_token_mask(int(logits.shape[-1]), suppress_token_ids)
-    next_token = int(greedy_tokens_with_mask(logits[:, -1, :], suppress_token_mask).item())
-    generated_tokens = [next_token]
-
-    _pre_yield = time.perf_counter_ns()
-    yield {
-        "event": "prefill",
-        "prefill_us": prefill_ns / 1_000.0,
-        "prompt_token_count": prompt_len,
-        "fallback_ar": True,
-        "fallback_reason": fallback_reason,
-    }
-    _yield_pause_ns += time.perf_counter_ns() - _pre_yield
-
-    _pre_yield = time.perf_counter_ns()
-    yield {
-        "event": "token",
-        "token_id": next_token,
-        "generated_tokens": 1,
-        "acceptance_ratio": 0.0,
-        "cycles_completed": 0,
-        "fallback_ar": True,
-        "fallback_reason": fallback_reason,
-    }
-    _yield_pause_ns += time.perf_counter_ns() - _pre_yield
-
-    while len(generated_tokens) < max_new_tokens:
-        if next_token in stop_token_ids:
-            break
-        token_array = mx.array([[next_token]], dtype=mx.uint32)
-        logits = target_model(token_array, cache=cache)
-        next_token = int(greedy_tokens_with_mask(logits[:, -1, :], suppress_token_mask).item())
-        generated_tokens.append(next_token)
-        _pre_yield = time.perf_counter_ns()
-        yield {
-            "event": "token",
-            "token_id": next_token,
-            "generated_tokens": len(generated_tokens),
-            "acceptance_ratio": 0.0,
-            "cycles_completed": 0,
-            "fallback_ar": True,
-            "fallback_reason": fallback_reason,
-        }
-        _yield_pause_ns += time.perf_counter_ns() - _pre_yield
-
-    elapsed_us = (time.perf_counter_ns() - start_ns - _yield_pause_ns) / 1_000.0
-    del cache
-    if hasattr(mx, "clear_cache"):
-        mx.clear_cache()
-    yield {
-        "event": "summary",
-        "elapsed_us": elapsed_us,
-        "prompt_token_count": prompt_len,
-        "generated_token_ids": generated_tokens,
-        "generation_tokens": len(generated_tokens),
-        "accepted_from_draft": 0,
-        "acceptance_ratio": 0.0,
-        "cycles_completed": 0,
-        "phase_timings_us": {
-            "prefill": prefill_ns / 1_000.0,
-            "draft": 0.0,
-            "draft_prefill": 0.0,
-            "draft_incremental": 0.0,
-            "verify": 0.0,
-            "replay": 0.0,
-            "commit": 0.0,
-        },
-        "verify_len_cap": None,
-        "fallback_ar": True,
-        "fallback_reason": fallback_reason,
-    }
-
-
-def generate_dflash_once(
-    *,
-    target_model: Any,
-    tokenizer: Any,
-    draft_model: DFlashDraftModel,
-    prompt: str,
-    max_new_tokens: int,
-    use_chat_template: bool = False,
-    block_tokens: Optional[int] = None,
-    verify_chunk_tokens: Optional[int] = None,
-    stop_token_ids: Optional[list[int]] = None,
-    suppress_token_ids: Optional[list[int]] = None,
-    prompt_tokens_override: Optional[list[int]] = None,
-    quantize_kv_cache: bool = False,
-) -> dict[str, Any]:
-    if hasattr(mx, "reset_peak_memory"):
-        try:
-            mx.reset_peak_memory()
-        except Exception:
-            pass
-    if quantize_kv_cache:
-        configure_full_attention_split(target_model, enabled=False)
-    draft_sink_size, draft_window_size = _resolve_draft_window()
-
-    prompt_tokens = (
-        list(prompt_tokens_override)
-        if prompt_tokens_override is not None
-        else _prepare_prompt_tokens(tokenizer, prompt, use_chat_template=use_chat_template)
-    )
-    prompt_len = len(prompt_tokens)
-    dflash_max_ctx = _resolve_dflash_max_ctx()
-    if prompt_len >= dflash_max_ctx:
-        fallback_reason = f"prompt_len={prompt_len} >= DFLASH_MAX_CTX={dflash_max_ctx}"
-        baseline = generate_baseline_once(
-            target_model=target_model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            use_chat_template=use_chat_template,
-            stop_token_ids=stop_token_ids,
-            suppress_token_ids=suppress_token_ids,
-            prompt_tokens_override=prompt_tokens,
-            quantize_kv_cache=quantize_kv_cache,
-        )
-        baseline.update(
-            {
-                "accepted_from_draft": 0,
-                "acceptance_ratio": 0.0,
-                "cycles_completed": 0,
-                "phase_timings_us": {
-                    "prefill": baseline["elapsed_us"],
-                    "draft": 0.0,
-                    "draft_prefill": 0.0,
-                    "draft_incremental": 0.0,
-                    "verify": 0.0,
-                    "replay": 0.0,
-                    "commit": 0.0,
-                },
-                "speculative_linear_cache": False,
-                "verify_chunk_tokens": None,
-                "verify_len_cap": None,
-                "quantize_kv_cache": bool(quantize_kv_cache),
-                "fallback_ar": True,
-                "fallback_reason": fallback_reason,
-            }
-        )
-        return baseline
-    prompt_array = mx.array(prompt_tokens, dtype=mx.uint32)[None]
-    stop_token_ids = list(stop_token_ids or [])
-    stop_token_array = (
-        mx.array(stop_token_ids, dtype=mx.uint32) if stop_token_ids else None
-    )
-
-    use_speculative_linear_cache = verify_chunk_tokens is None
-    engine = detect_engine(target_model)
-    draft_backend = make_draft_backend()
-    target_cache = make_target_cache(
-        target_model,
-        enable_speculative_linear_cache=use_speculative_linear_cache,
-        quantize_kv_cache=quantize_kv_cache,
-    )
-
-    draft_cache = draft_backend.make_cache(
-        draft_model=draft_model,
-        sink_size=draft_sink_size,
-        window_size=draft_window_size,
-    )
-    target_layer_id_list = list(draft_model.target_layer_ids)
-    capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
-    mask_token_id = int(draft_model.mask_token_id)
-
-    try:
-        start_ns = time.perf_counter_ns()
-        prefill_start_ns = time.perf_counter_ns()
-        prefill_step_size = 2048
-        prefill_logits = None
-        target_hidden: Optional[mx.array] = None
-        for chunk_start in range(0, prompt_len, prefill_step_size):
-            chunk_end = min(chunk_start + prefill_step_size, prompt_len)
-            chunk_ids = prompt_array[:, chunk_start:chunk_end]
-            prefill_logits, prefill_hidden_states = target_forward_with_hidden_states(
-                target_model,
-                input_ids=chunk_ids,
-                cache=target_cache,
-                capture_layer_ids=capture_layer_ids,
-            )
-            _eval_logits_and_captured(prefill_logits, prefill_hidden_states)
-            feat = extract_context_feature_from_dict(
-                prefill_hidden_states,
-                target_layer_id_list,
-            )
-            if target_hidden is None:
-                target_hidden = mx.zeros(
-                    (feat.shape[0], prompt_len, feat.shape[-1]),
-                    dtype=feat.dtype,
-                )
-            target_hidden[:, chunk_start:chunk_end, :] = feat
-            mx.eval(target_hidden)
-            del feat, prefill_hidden_states
-        if hasattr(mx, "clear_cache"):
-            mx.clear_cache()
-        prefill_ns = time.perf_counter_ns() - prefill_start_ns
-
-        suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
-        staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
-
-        draft_block_size = int(draft_model.block_size)
-        requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
-        effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
-        generated_token_buffer = mx.full((max_new_tokens,), mask_token_id, dtype=mx.uint32)
-        block_token_buffer = mx.full((effective_block_tokens,), mask_token_id, dtype=mx.uint32)
-        mask_token_tail = mx.full(
-            (max(0, effective_block_tokens - 1),),
-            mask_token_id,
-            dtype=mx.uint32,
-        )
-        generated_token_count = 0
-        accepted_from_draft = 0
-        cycles_completed = 0
-        verify_len_cap = _resolve_verify_len_cap(target_model, effective_block_tokens)
-        start = prompt_len
-
-        draft_ns_total = 0
-        draft_prefill_ns = 0
-        draft_incremental_ns = 0
-        verify_ns_total = 0
-        replay_ns_total = 0
-        commit_ns_total = 0
-        seen_draft_cycle = False
-        acceptance_history: list[int] = []
-        profile_cycles = _profile_dflash_cycles_enabled()
-        cycle_profiles: list[dict[str, Any]] = []
-        profile_totals_ns = {
-            "draft": 0,
-            "verify": 0,
-            "acceptance": 0,
-            "hidden_extraction": 0,
-            "rollback": 0,
-            "other": 0,
-            "cycle_total": 0,
-        }
-        prefetched_draft: Optional[dict[str, Any]] = None
-
-        while generated_token_count < max_new_tokens:
-            cycle_start_ns = time.perf_counter_ns()
-            draft_cycle_ns = 0
-            verify_cycle_ns = 0
-            replay_cycle_ns = 0
-            commit_cycle_ns = 0
-            acceptance_cycle_ns = 0
-            hidden_extract_cycle_ns = 0
-            remaining = max_new_tokens - generated_token_count
-            block_len = max(1, min(effective_block_tokens, remaining))
-            block_token_buffer[:block_len] = mask_token_id
-            block_token_buffer[:1] = staged_first
-            block_token_ids = block_token_buffer[:block_len]
-            current_staged_first = staged_first
-            drafted = None
-
-            if block_len > 1:
-                if profile_cycles:
-                    draft_start_ns = time.perf_counter_ns()
-                    drafted = draft_backend.draft_greedy(
-                        target_model=target_model,
-                        draft_model=draft_model,
-                        draft_cache=draft_cache,
-                        staged_first=current_staged_first,
-                        target_hidden=target_hidden,
-                        block_len=block_len,
-                        mask_token_tail=mask_token_tail,
-                        suppress_token_mask=suppress_token_mask,
-                        async_launch=False,
-                    )
-                    block_token_ids[1:block_len] = drafted
-                    draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
-                else:
-                    if (
-                        prefetched_draft is not None
-                        and int(prefetched_draft["block_len"]) == block_len
-                    ):
-                        drafted = prefetched_draft["drafted"]
-                        current_staged_first = prefetched_draft["staged_first"]
-                    else:
-                        draft_start_ns = time.perf_counter_ns()
-                        drafted = draft_backend.draft_greedy(
-                            target_model=target_model,
-                            draft_model=draft_model,
-                            draft_cache=draft_cache,
-                            staged_first=current_staged_first,
-                            target_hidden=target_hidden,
-                            block_len=block_len,
-                            mask_token_tail=mask_token_tail,
-                            suppress_token_mask=suppress_token_mask,
-                            async_launch=True,
-                        )
-                        draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
-                    prefetched_draft = None
-                draft_ns_total += draft_cycle_ns
-                if not seen_draft_cycle:
-                    draft_prefill_ns += draft_cycle_ns
-                    seen_draft_cycle = True
-                else:
-                    draft_incremental_ns += draft_cycle_ns
-
-            verify_token_count = min(block_len, verify_len_cap)
-            if profile_cycles or block_len <= 1:
-                verify_token_ids = block_token_ids[:verify_token_count]
-            elif verify_token_count <= 1:
-                verify_token_ids = current_staged_first[:1]
-            else:
-                verify_token_ids = mx.concatenate(
-                    [current_staged_first[:1], drafted[: verify_token_count - 1]],
-                    axis=0,
-                )
-            verify_ids = verify_token_ids[None]
-            if use_speculative_linear_cache:
-                engine.arm_rollback(target_cache, prefix_len=start)
-            verify_start_ns = time.perf_counter_ns()
-            verify_logits, verify_hidden_states = engine.verify(
-                target_model=target_model,
-                verify_ids=verify_ids,
-                target_cache=target_cache,
-                verify_chunk_tokens=verify_chunk_tokens,
-                capture_layer_ids=capture_layer_ids,
-            )
-            if profile_cycles:
-                _eval_logits_and_captured(verify_logits, verify_hidden_states)
-            verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
-            verify_ns_total += verify_cycle_ns
-
-            acceptance_start_ns = time.perf_counter_ns()
-            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
-            if not profile_cycles:
-                mx.async_eval(posterior, *verify_hidden_states.values())
-            acceptance_len = int(
-                _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
-            )
-            acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
-            acceptance_history.append(acceptance_len)
-
-            hidden_extract_start_ns = time.perf_counter_ns()
-            committed_hidden = extract_context_feature_from_dict(
-                verify_hidden_states,
-                target_layer_id_list,
-            )[:, : (1 + acceptance_len), :]
-            if profile_cycles:
-                mx.eval(committed_hidden, posterior)
-            else:
-                mx.async_eval(committed_hidden)
-            hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
-
-            commit_count = 1 + acceptance_len
-            committed_segment = verify_token_ids[:commit_count]
-            generated_token_buffer[generated_token_count : generated_token_count + commit_count] = committed_segment
-            generated_token_count += commit_count
-            accepted_from_draft += acceptance_len
-            staged_first_next = posterior[acceptance_len : acceptance_len + 1]
-
-            if not profile_cycles:
-                next_remaining = max_new_tokens - generated_token_count
-                next_block_len = max(1, min(effective_block_tokens, next_remaining))
-                if next_remaining > 0 and next_block_len > 1:
-                    draft_start_ns = time.perf_counter_ns()
-                    next_drafted = draft_backend.draft_greedy(
-                        target_model=target_model,
-                        draft_model=draft_model,
-                        draft_cache=draft_cache,
-                        staged_first=staged_first_next,
-                        target_hidden=committed_hidden,
-                        block_len=next_block_len,
-                        mask_token_tail=mask_token_tail,
-                        suppress_token_mask=suppress_token_mask,
-                        async_launch=True,
-                    )
-                    launch_ns = time.perf_counter_ns() - draft_start_ns
-                    draft_ns_total += launch_ns
-                    draft_incremental_ns += launch_ns
-                    prefetched_draft = {
-                        "block_len": next_block_len,
-                        "staged_first": staged_first_next,
-                        "drafted": next_drafted,
-                    }
-                else:
-                    prefetched_draft = None
-
-            commit_start_ns = time.perf_counter_ns()
-            start += commit_count
-            target_hidden = committed_hidden
-            replay_cycle_ns = engine.rollback(
-                target_cache,
-                target_len=start,
-                acceptance_len=acceptance_len,
-                drafted_tokens=block_len - 1,
-            )
-            replay_ns_total += replay_cycle_ns
-            cycles_completed += 1
-            commit_wall_ns = time.perf_counter_ns() - commit_start_ns
-            commit_ns_total += commit_wall_ns
-            commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
-
-            stop_hit = False
-            if stop_token_array is not None:
-                stop_hit = bool(
-                    mx.any(
-                        mx.equal(
-                            committed_segment[:, None],
-                            stop_token_array[None, :],
-                        )
-                    ).item()
-                )
-            if stop_hit:
-                break
-
-            staged_first = staged_first_next
-
-            if profile_cycles:
-                cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
-                named_ns = (
-                    draft_cycle_ns
-                    + verify_cycle_ns
-                    + acceptance_cycle_ns
-                    + hidden_extract_cycle_ns
-                    + replay_cycle_ns
-                )
-                other_cycle_ns = max(0, cycle_total_ns - named_ns)
-                cycle_profiles.append(
-                    {
-                        "cycle": cycles_completed,
-                        "block_len": int(block_len),
-                        "commit_count": int(commit_count),
-                        "acceptance_len": int(acceptance_len),
-                        "draft_us": _ns_to_us(draft_cycle_ns),
-                        "verify_us": _ns_to_us(verify_cycle_ns),
-                        "acceptance_us": _ns_to_us(acceptance_cycle_ns),
-                        "hidden_extraction_us": _ns_to_us(hidden_extract_cycle_ns),
-                        "rollback_us": _ns_to_us(replay_cycle_ns),
-                        "other_us": _ns_to_us(other_cycle_ns),
-                        "cycle_total_us": _ns_to_us(cycle_total_ns),
-                    }
-                )
-                profile_totals_ns["draft"] += draft_cycle_ns
-                profile_totals_ns["verify"] += verify_cycle_ns
-                profile_totals_ns["acceptance"] += acceptance_cycle_ns
-                profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
-                profile_totals_ns["rollback"] += replay_cycle_ns
-                profile_totals_ns["other"] += other_cycle_ns
-                profile_totals_ns["cycle_total"] += cycle_total_ns
-
-        elapsed_us = (time.perf_counter_ns() - start_ns) / 1_000.0
-        generated_token_ids = (
-            generated_token_buffer[:generated_token_count].tolist()
-            if generated_token_count > 0
-            else []
-        )
-        first_20 = acceptance_history[:20]
-        last_20 = acceptance_history[-20:]
-        result = {
-            "elapsed_us": elapsed_us,
-            "prompt_token_count": prompt_len,
-            "generated_token_ids": generated_token_ids,
-            "generation_tokens": len(generated_token_ids),
-            "accepted_from_draft": accepted_from_draft,
-            "acceptance_ratio": (
-                accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
-            ),
-            "block_tokens": effective_block_tokens,
-            "cycles_completed": cycles_completed,
-            "phase_timings_us": {
-                "prefill": prefill_ns / 1_000.0,
-                "draft": draft_ns_total / 1_000.0,
-                "draft_prefill": draft_prefill_ns / 1_000.0,
-                "draft_incremental": draft_incremental_ns / 1_000.0,
-                "verify": verify_ns_total / 1_000.0,
-                "replay": replay_ns_total / 1_000.0,
-                "commit": commit_ns_total / 1_000.0,
-            },
-            "speculative_linear_cache": use_speculative_linear_cache,
-            "verify_chunk_tokens": int(verify_chunk_tokens) if verify_chunk_tokens else None,
-            "verify_len_cap": int(verify_len_cap),
-            "quantize_kv_cache": bool(quantize_kv_cache),
-            "tokens_per_cycle": (len(generated_token_ids) / cycles_completed) if cycles_completed > 0 else 0.0,
-            "acceptance_history": list(acceptance_history),
-            "acceptance_first_20_avg": (sum(first_20) / len(first_20)) if first_20 else 0.0,
-            "acceptance_last_20_avg": (sum(last_20) / len(last_20)) if last_20 else 0.0,
-            "peak_memory_gb": float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else None,
-        }
-        if profile_cycles:
-            result["cycle_profile_us"] = cycle_profiles
-            result["cycle_profile_totals_us"] = {key: _ns_to_us(value) for key, value in profile_totals_ns.items()}
-        return result
-    finally:
-        _cleanup_generation_caches(target_cache, draft_cache)
-        del draft_cache
-        del target_cache
-        if hasattr(mx, "clear_cache"):
-            mx.clear_cache()
-
-
-def stream_dflash_generate(
-    *,
-    target_model: Any,
-    tokenizer: Any,
-    draft_model: DFlashDraftModel,
-    prompt: str,
-    max_new_tokens: int,
-    use_chat_template: bool = False,
-    block_tokens: Optional[int] = None,
-    verify_chunk_tokens: Optional[int] = None,
-    stop_token_ids: Optional[list[int]] = None,
-    suppress_token_ids: Optional[list[int]] = None,
-    prompt_tokens_override: Optional[list[int]] = None,
-    quantize_kv_cache: bool = False,
-) -> Iterator[dict[str, Any]]:
-    if quantize_kv_cache:
-        configure_full_attention_split(target_model, enabled=False)
-    draft_sink_size, draft_window_size = _resolve_draft_window()
-
-    prompt_tokens = (
-        list(prompt_tokens_override)
-        if prompt_tokens_override is not None
-        else _prepare_prompt_tokens(tokenizer, prompt, use_chat_template=use_chat_template)
-    )
-    fallback_ar = False
-    fallback_reason: Optional[str] = None
-
-    prompt_len = len(prompt_tokens)
-    dflash_max_ctx = _resolve_dflash_max_ctx()
-    if prompt_len >= dflash_max_ctx:
-        fallback_reason = f"prompt_len={prompt_len} >= DFLASH_MAX_CTX={dflash_max_ctx}"
-        yield from stream_baseline_generate(
-            target_model=target_model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            use_chat_template=use_chat_template,
-            stop_token_ids=stop_token_ids,
-            suppress_token_ids=suppress_token_ids,
-            prompt_tokens_override=prompt_tokens,
-            quantize_kv_cache=quantize_kv_cache,
-            fallback_reason=fallback_reason,
-        )
-        return
-    prompt_array = mx.array(prompt_tokens, dtype=mx.uint32)[None]
-    stop_token_ids = list(stop_token_ids or [])
-    stop_token_array = (
-        mx.array(stop_token_ids, dtype=mx.uint32) if stop_token_ids else None
-    )
-
-    use_speculative_linear_cache = verify_chunk_tokens is None
-    engine = detect_engine(target_model)
-    draft_backend = make_draft_backend()
-    target_cache = make_target_cache(
-        target_model,
-        enable_speculative_linear_cache=use_speculative_linear_cache,
-        quantize_kv_cache=quantize_kv_cache,
-    )
-    draft_cache = draft_backend.make_cache(
-        draft_model=draft_model,
-        sink_size=draft_sink_size,
-        window_size=draft_window_size,
-    )
-    target_layer_id_list = list(draft_model.target_layer_ids)
-    capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
-    profile_cycles = _profile_dflash_cycles_enabled()
-
-    try:
-        start_ns = time.perf_counter_ns()
-        _yield_pause_ns = 0
-        prefill_start_ns = time.perf_counter_ns()
-        prefill_step_size = 2048
-        prefill_logits = None
-        target_hidden: Optional[mx.array] = None
-        for chunk_start in range(0, prompt_len, prefill_step_size):
-            chunk_end = min(chunk_start + prefill_step_size, prompt_len)
-            chunk_ids = prompt_array[:, chunk_start:chunk_end]
-            prefill_logits, prefill_hidden_states = target_forward_with_hidden_states(
-                target_model,
-                input_ids=chunk_ids,
-                cache=target_cache,
-                capture_layer_ids=capture_layer_ids,
-            )
-            _eval_logits_and_captured(prefill_logits, prefill_hidden_states)
-            feat = extract_context_feature_from_dict(
-                prefill_hidden_states,
-                target_layer_id_list,
-            )
-            if target_hidden is None:
-                target_hidden = mx.zeros(
-                    (feat.shape[0], prompt_len, feat.shape[-1]),
-                    dtype=feat.dtype,
-                )
-            target_hidden[:, chunk_start:chunk_end, :] = feat
-            mx.eval(target_hidden)
-            del feat, prefill_hidden_states
-            _pre_yield = time.perf_counter_ns()
-            yield {
-                "event": "prefill_progress",
-                "tokens_processed": chunk_end,
-                "tokens_total": prompt_len,
-            }
-            _yield_pause_ns += time.perf_counter_ns() - _pre_yield
-        if hasattr(mx, "clear_cache"):
-            mx.clear_cache()
-        prefill_ns = time.perf_counter_ns() - prefill_start_ns
-
-        suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
-        staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
-
-        _pre_yield = time.perf_counter_ns()
-        yield {
-            "event": "prefill",
-            "prefill_us": prefill_ns / 1_000.0,
-            "prompt_token_count": prompt_len,
-        }
-        _yield_pause_ns += time.perf_counter_ns() - _pre_yield
-
-        first_token_yielded = False
-        if max_new_tokens > 0:
-            first_token_yielded = True
-            _pre_yield = time.perf_counter_ns()
-            yield {
-                "event": "token",
-                "token_id": int(staged_first.item()),
-                "generated_tokens": 1,
-                "acceptance_ratio": 0.0,
-                "cycles_completed": 0,
-            }
-            _yield_pause_ns += time.perf_counter_ns() - _pre_yield
-
-        draft_block_size = int(draft_model.block_size)
-        requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
-        effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
-        block_token_buffer = mx.full(
-            (effective_block_tokens,),
-            int(draft_model.mask_token_id),
-            dtype=mx.uint32,
-        )
-        mask_token_tail = mx.full(
-            (max(0, effective_block_tokens - 1),),
-            int(draft_model.mask_token_id),
-            dtype=mx.uint32,
-        )
-        generated_token_ids: list[int] = []
-        accepted_from_draft = 0
-        cycles_completed = 0
-        verify_len_cap = _resolve_verify_len_cap(target_model, effective_block_tokens)
-        start = prompt_len
-
-        draft_ns_total = 0
-        draft_prefill_ns = 0
-        draft_incremental_ns = 0
-        verify_ns_total = 0
-        replay_ns_total = 0
-        commit_ns_total = 0
-        seen_draft_cycle = False
-        acceptance_history: list[int] = []
-        cycle_profiles: list[dict[str, Any]] = []
-        profile_totals_ns = {
-            "draft": 0,
-            "verify": 0,
-            "acceptance": 0,
-            "hidden_extraction": 0,
-            "rollback": 0,
-            "other": 0,
-            "cycle_total": 0,
-        }
-        prefetched_draft: Optional[dict[str, Any]] = None
-
-        while len(generated_token_ids) < max_new_tokens:
-            cycle_start_ns = time.perf_counter_ns()
-            draft_cycle_ns = 0
-            verify_cycle_ns = 0
-            replay_cycle_ns = 0
-            commit_cycle_ns = 0
-            acceptance_cycle_ns = 0
-            hidden_extract_cycle_ns = 0
-            remaining = max_new_tokens - len(generated_token_ids)
-            block_len = max(1, min(effective_block_tokens, remaining))
-            block_token_buffer[:block_len] = int(draft_model.mask_token_id)
-            block_token_buffer[:1] = staged_first
-            block_token_ids = block_token_buffer[:block_len]
-            current_staged_first = staged_first
-            drafted = None
-
-            if block_len > 1:
-                if profile_cycles:
-                    draft_start_ns = time.perf_counter_ns()
-                    drafted = draft_backend.draft_greedy(
-                        target_model=target_model,
-                        draft_model=draft_model,
-                        draft_cache=draft_cache,
-                        staged_first=current_staged_first,
-                        target_hidden=target_hidden,
-                        block_len=block_len,
-                        mask_token_tail=mask_token_tail,
-                        suppress_token_mask=suppress_token_mask,
-                        async_launch=False,
-                    )
-                    block_token_ids[1:block_len] = drafted
-                else:
-                    if (
-                        prefetched_draft is not None
-                        and int(prefetched_draft["block_len"]) == block_len
-                    ):
-                        drafted = prefetched_draft["drafted"]
-                        current_staged_first = prefetched_draft["staged_first"]
-                    else:
-                        draft_start_ns = time.perf_counter_ns()
-                        drafted = draft_backend.draft_greedy(
-                            target_model=target_model,
-                            draft_model=draft_model,
-                            draft_cache=draft_cache,
-                            staged_first=current_staged_first,
-                            target_hidden=target_hidden,
-                            block_len=block_len,
-                            mask_token_tail=mask_token_tail,
-                            suppress_token_mask=suppress_token_mask,
-                            async_launch=True,
-                        )
-                        draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
-                    prefetched_draft = None
-                draft_ns_total += draft_cycle_ns
-                if not seen_draft_cycle:
-                    draft_prefill_ns += draft_cycle_ns
-                    seen_draft_cycle = True
-                else:
-                    draft_incremental_ns += draft_cycle_ns
-
-            verify_token_count = min(block_len, verify_len_cap)
-            if profile_cycles or block_len <= 1:
-                verify_token_ids = block_token_ids[:verify_token_count]
-            elif verify_token_count <= 1:
-                verify_token_ids = current_staged_first[:1]
-            else:
-                verify_token_ids = mx.concatenate(
-                    [current_staged_first[:1], drafted[: verify_token_count - 1]],
-                    axis=0,
-                )
-            verify_ids = verify_token_ids[None]
-            engine.arm_rollback(target_cache, prefix_len=start)
-            verify_start_ns = time.perf_counter_ns()
-            verify_logits, verify_hidden_states = engine.verify(
-                target_model=target_model,
-                verify_ids=verify_ids,
-                target_cache=target_cache,
-                verify_chunk_tokens=verify_chunk_tokens,
-                capture_layer_ids=capture_layer_ids,
-            )
-            if profile_cycles:
-                _eval_logits_and_captured(verify_logits, verify_hidden_states)
-            verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
-            verify_ns_total += verify_cycle_ns
-
-            acceptance_start_ns = time.perf_counter_ns()
-            posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
-            if not profile_cycles:
-                mx.async_eval(posterior, *verify_hidden_states.values())
-            acceptance_len = int(
-                _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
-            )
-            acceptance_history.append(acceptance_len)
-            acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
-            hidden_extract_start_ns = time.perf_counter_ns()
-            committed_hidden = extract_context_feature_from_dict(
-                verify_hidden_states,
-                target_layer_id_list,
-            )[:, : (1 + acceptance_len), :]
-            if profile_cycles:
-                mx.eval(committed_hidden, posterior)
-            else:
-                mx.async_eval(committed_hidden)
-            hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
-
-            commit_count = 1 + acceptance_len
-            committed_segment = verify_token_ids[:commit_count]
-            commit_start_ns = time.perf_counter_ns()
-            start += commit_count
-            target_hidden = committed_hidden
-            replay_cycle_ns = engine.rollback(
-                target_cache,
-                target_len=start,
-                acceptance_len=acceptance_len,
-                drafted_tokens=block_len - 1,
-            )
-            replay_ns_total += replay_cycle_ns
-            cycles_completed += 1
-            commit_wall_ns = time.perf_counter_ns() - commit_start_ns
-            commit_ns_total += commit_wall_ns
-            commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
-
-            accepted_from_draft += acceptance_len
-            staged_first_next = posterior[acceptance_len : acceptance_len + 1]
-            if not profile_cycles:
-                next_remaining = max_new_tokens - len(generated_token_ids) - commit_count
-                next_block_len = max(1, min(effective_block_tokens, next_remaining))
-                if next_remaining > 0 and next_block_len > 1:
-                    draft_start_ns = time.perf_counter_ns()
-                    next_drafted = draft_backend.draft_greedy(
-                        target_model=target_model,
-                        draft_model=draft_model,
-                        draft_cache=draft_cache,
-                        staged_first=staged_first_next,
-                        target_hidden=committed_hidden,
-                        block_len=next_block_len,
-                        mask_token_tail=mask_token_tail,
-                        suppress_token_mask=suppress_token_mask,
-                        async_launch=True,
-                    )
-                    launch_ns = time.perf_counter_ns() - draft_start_ns
-                    draft_ns_total += launch_ns
-                    draft_incremental_ns += launch_ns
-                    prefetched_draft = {
-                        "block_len": next_block_len,
-                        "staged_first": staged_first_next,
-                        "drafted": next_drafted,
-                    }
-                else:
-                    prefetched_draft = None
-            committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
-            for token_id in committed_ids:
-                if len(generated_token_ids) >= max_new_tokens:
-                    break
-                generated_token_ids.append(token_id)
-                if first_token_yielded:
-                    first_token_yielded = False
-                    continue
-                _pre_yield = time.perf_counter_ns()
-                yield {
-                    "event": "token",
-                    "token_id": token_id,
-                    "generated_tokens": len(generated_token_ids),
-                    "acceptance_ratio": (
-                        accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
-                    ),
-                    "cycles_completed": cycles_completed,
-                }
-                _yield_pause_ns += time.perf_counter_ns() - _pre_yield
-
-            stop_hit = False
-            if stop_token_array is not None:
-                stop_hit = bool(
-                    mx.any(
-                        mx.equal(
-                            committed_segment[:, None],
-                            stop_token_array[None, :],
-                        )
-                    ).item()
-                )
-            if stop_hit:
-                break
-
-            staged_first = staged_first_next
-
-            if profile_cycles:
-                cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
-                named_ns = (
-                    draft_cycle_ns
-                    + verify_cycle_ns
-                    + acceptance_cycle_ns
-                    + hidden_extract_cycle_ns
-                    + replay_cycle_ns
-                )
-                other_cycle_ns = max(0, cycle_total_ns - named_ns)
-                cycle_profiles.append(
-                    {
-                        "cycle": cycles_completed,
-                        "block_len": int(block_len),
-                        "commit_count": int(commit_count),
-                        "acceptance_len": int(acceptance_len),
-                        "draft_us": _ns_to_us(draft_cycle_ns),
-                        "verify_us": _ns_to_us(verify_cycle_ns),
-                        "acceptance_us": _ns_to_us(acceptance_cycle_ns),
-                        "hidden_extraction_us": _ns_to_us(hidden_extract_cycle_ns),
-                        "rollback_us": _ns_to_us(replay_cycle_ns),
-                        "other_us": _ns_to_us(other_cycle_ns),
-                        "cycle_total_us": _ns_to_us(cycle_total_ns),
-                    }
-                )
-                profile_totals_ns["draft"] += draft_cycle_ns
-                profile_totals_ns["verify"] += verify_cycle_ns
-                profile_totals_ns["acceptance"] += acceptance_cycle_ns
-                profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
-                profile_totals_ns["rollback"] += replay_cycle_ns
-                profile_totals_ns["other"] += other_cycle_ns
-                profile_totals_ns["cycle_total"] += cycle_total_ns
-
-        elapsed_us = (time.perf_counter_ns() - start_ns - _yield_pause_ns) / 1_000.0
-        first_20 = acceptance_history[:20]
-        last_20 = acceptance_history[-20:]
-        summary = {
-            "event": "summary",
-            "elapsed_us": elapsed_us,
-            "prompt_token_count": prompt_len,
-            "generated_token_ids": generated_token_ids,
-            "generation_tokens": len(generated_token_ids),
-            "accepted_from_draft": accepted_from_draft,
-            "acceptance_ratio": (
-                accepted_from_draft / len(generated_token_ids) if generated_token_ids else 0.0
-            ),
-            "block_tokens": effective_block_tokens,
-            "cycles_completed": cycles_completed,
-            "phase_timings_us": {
-                "prefill": prefill_ns / 1_000.0,
-                "draft": draft_ns_total / 1_000.0,
-                "draft_prefill": draft_prefill_ns / 1_000.0,
-                "draft_incremental": draft_incremental_ns / 1_000.0,
-                "verify": verify_ns_total / 1_000.0,
-                "replay": replay_ns_total / 1_000.0,
-                "commit": commit_ns_total / 1_000.0,
-            },
-            "verify_len_cap": int(verify_len_cap),
-            "speculative_linear_cache": bool(use_speculative_linear_cache),
-            "verify_chunk_tokens": int(verify_chunk_tokens) if verify_chunk_tokens else None,
-            "quantize_kv_cache": bool(quantize_kv_cache),
-            "tokens_per_cycle": (len(generated_token_ids) / cycles_completed) if cycles_completed > 0 else 0.0,
-            "acceptance_history": list(acceptance_history),
-            "acceptance_first_20_avg": (sum(first_20) / len(first_20)) if first_20 else 0.0,
-            "acceptance_last_20_avg": (sum(last_20) / len(last_20)) if last_20 else 0.0,
-            "peak_memory_gb": float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else None,
-        }
-        if profile_cycles:
-            summary["cycle_profile_us"] = cycle_profiles
-            summary["cycle_profile_totals_us"] = {
-                key: _ns_to_us(value) for key, value in profile_totals_ns.items()
-            }
-        yield summary
-    finally:
-        _cleanup_generation_caches(target_cache, draft_cache)
-        del draft_cache
-        del target_cache
-        if hasattr(mx, "clear_cache"):
-            mx.clear_cache()
+def stream_dflash_generate(**kwargs: Any) -> Iterator[dict[str, Any]]:
+    gen_stream = mx.default_stream(mx.default_device())
+    with mx.stream(gen_stream):
+        yield from _stream_dflash_generate_impl(**kwargs)
+
+
+from dflash_mlx.engine.fallback import stream_baseline_generate  # noqa: E402
+from dflash_mlx.engine.spec_epoch import (  # noqa: E402
+    stream_dflash_generate_impl as _stream_dflash_generate_impl,
+)

@@ -1,18 +1,6 @@
 # Copyright 2026 bstnxbt
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
-"""V1 gate — numerical parity of verify_qmm vs mx.quantized_matmul.
-
-Shapes: 3 real MLP shapes (Qwen3.5-27B-4bit) + random sweep + edge cases.
-Tolerances: 2% max-rel (STATUS.md gate), 8e-3 abs for bf16, 4e-3 for fp16.
-
-Runs against the stub initially (stub = mx.quantized_matmul → error always 0).
-Once the kernel lands, same test exercises the real kernel via DFLASH_VERIFY_QMM=1.
-
-Usage:
-  uv run pytest tests/test_verify_parity.py -v                      # stub mode
-  DFLASH_VERIFY_QMM=1 uv run pytest tests/test_verify_parity.py -v      # real kernel
-"""
 from __future__ import annotations
 
 import itertools
@@ -36,7 +24,6 @@ REAL_MLP_SHAPES = [
 
 
 def _quantize_ref(w_fp, gs, bits):
-    """Run MLX's own quantize so the packed format is guaranteed-consistent with qmm."""
     return mx.quantize(w_fp, group_size=gs, bits=bits)
 
 
@@ -112,7 +99,6 @@ def test_random_shapes(name, M, K, N):
 # ---- sanity meta --------------------------------------------------------
 
 def test_stub_mode_reports_identity_when_disabled():
-    """Stub path: is_enabled=False → always stock → zero delta."""
     if is_enabled():
         pytest.skip("DFLASH_VERIFY_QMM=1, skip stub sanity")
     max_abs, max_rel, _ = _run_case("stub_sanity", 16, 5120, 8, mx.bfloat16, GROUP_SIZE)

@@ -13,7 +13,6 @@ from dflash_mlx.model import (
     DFlashDraftModel,
 )
 
-
 class EagerDraftBackend:
     def make_cache(
         self,
@@ -68,7 +67,6 @@ class EagerDraftBackend:
         else:
             mx.eval(draft_logits)
         return drafted
-
 
 def make_draft_backend() -> EagerDraftBackend:
     return EagerDraftBackend()
