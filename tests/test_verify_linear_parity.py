@@ -1,6 +1,7 @@
 # Copyright 2026 bstnxbt
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
+
 from __future__ import annotations
 
 import os
@@ -12,13 +13,12 @@ import pytest
 
 os.environ.setdefault("DFLASH_VERIFY_QMM", "1")
 
-from dflash_mlx.verify_qmm import verify_matmul  # noqa: E402
-from dflash_mlx.verify_linear import (  # noqa: E402
+from dflash_mlx.verify_qmm import verify_matmul
+from dflash_mlx.verify_linear import (
     VerifyQuantizedLinear,
     is_verify_eligible,
     install_verify_linears,
 )
-
 
 @pytest.fixture(scope="module")
 def small_ql():
@@ -29,10 +29,8 @@ def small_ql():
     ql = nn.QuantizedLinear.from_linear(lin, group_size=gs, bits=bits)
     return ql
 
-
 def test_eligibility_basic(small_ql):
     assert is_verify_eligible(small_ql)
-
 
 def test_eligibility_rejects_large_N():
     gs, bits = 64, 4
@@ -40,7 +38,6 @@ def test_eligibility_rejects_large_N():
     lin.weight = mx.random.normal((150_000, 512)).astype(mx.bfloat16) * 0.01
     ql = nn.QuantizedLinear.from_linear(lin, group_size=gs, bits=bits)
     assert not is_verify_eligible(ql)
-
 
 @pytest.mark.parametrize("M", [1, 8, 32])
 def test_parity_non_verify(small_ql, M):
@@ -52,7 +49,6 @@ def test_parity_non_verify(small_ql, M):
     assert mx.allclose(y_ref, y_verify, atol=0, rtol=0).item(), \
         "Non-verify path must be bit-identical (both route through stock qmm)"
 
-
 def test_parity_verify_M16(small_ql):
     verify = VerifyQuantizedLinear.from_quantized(small_ql)
     x = mx.random.normal((16, 512)).astype(mx.bfloat16) * 0.5
@@ -63,7 +59,6 @@ def test_parity_verify_M16(small_ql):
     y_verify = verify(x)
     mx.eval(y_direct, y_verify)
     assert mx.allclose(y_direct, y_verify, atol=0, rtol=0).item()
-
 
 def test_swap_and_unswap(small_ql):
     class Tiny(nn.Module):
@@ -83,12 +78,11 @@ def test_swap_and_unswap(small_ql):
     assert isinstance(m.proj_a, VerifyQuantizedLinear)
     assert isinstance(m.proj_b, VerifyQuantizedLinear)
     assert not isinstance(m.proj_bad, VerifyQuantizedLinear)
-    # Forward still works (shape only — proj_bad stays stock)
+
     x = mx.random.normal((16, 512)).astype(mx.bfloat16) * 0.5
     y = m.proj_a(x); mx.eval(y); assert y.shape == (16, 1024)
     n2 = uninstall_verify_linears(m)
     assert n2 == 2
-
 
 def _mk_linear(in_dims, out_dims):
     lin = nn.Linear(in_dims, out_dims, bias=False)

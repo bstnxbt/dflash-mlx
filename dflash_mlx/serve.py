@@ -9,6 +9,7 @@ import logging
 import sys
 import time
 import warnings
+from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError, version as package_version
 
 warnings.filterwarnings("ignore", message="mlx_lm.server is not recommended")
@@ -47,24 +48,22 @@ from dflash_mlx.server.metrics import (
     log_bench_post as _log_bench_post,
     write_summary_line as _write_summary_line,
 )
-from dflash_mlx.generate import get_stop_token_ids
 from dflash_mlx.server.model_provider import (
     DFlashModelProvider,
     wait_for_initial_model_load as _wait_for_initial_model_load,
 )
-from dflash_mlx.cache.policies import prefix_cache_enabled
-from dflash_mlx.engine.config import _resolve_target_fa_window
-from dflash_mlx.runtime import stream_dflash_generate
+from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
+from dflash_mlx.runtime_context import with_metal_limits
 from dflash_mlx.server.prefix_cache_flow import (
     PrefixCacheFlow,
     get_dflash_prefix_cache as _get_dflash_prefix_cache,
     log_prefix_cache_stats,
+    shutdown_dflash_prefix_cache,
 )
 from dflash_mlx.server.prefix_cache_manager import (
     build_prefix_key as _build_prefix_key,
 )
 from dflash_mlx.server.request_loop import consume_dflash_events
-
 
 def _read_project_version() -> str:
     try:
@@ -72,9 +71,36 @@ def _read_project_version() -> str:
     except PackageNotFoundError:
         return "unknown"
 
+def _bytes_to_gib(value: int) -> str:
+    return f"{float(value) / (1024 ** 3):.1f} GiB"
+
+def _format_limit_request(value) -> str:
+    if isinstance(value, int):
+        return _bytes_to_gib(value)
+    return str(value)
+
+def _format_metal_limit(label: str, request, bytes_value: int | None, applied: bool) -> str:
+    action = _bytes_to_gib(bytes_value) if applied and bytes_value is not None else "not set"
+    return f"{label}: {_format_limit_request(request)} -> {action}"
 
 _DFLASH_REQUEST_COUNTER = itertools.count(1)
 
+def _build_prompt_regime(args, tokenizer) -> dict[str, object]:
+    chat_template_args = getattr(args, "chat_template_args", None)
+    if not isinstance(chat_template_args, dict):
+        chat_template_args = {}
+    return {
+        "request_tokenization": "mlx_lm.server",
+        "runtime_prompt_input": "prompt_tokens_override",
+        "chat_template": True,
+        "chat_template_args": dict(chat_template_args),
+        "enable_thinking": bool(chat_template_args.get("enable_thinking", False)),
+        "use_default_chat_template": bool(
+            getattr(args, "use_default_chat_template", False)
+        ),
+        "custom_chat_template": bool(getattr(args, "chat_template", None)),
+        "tokenizer_class": type(tokenizer).__name__,
+    }
 
 class DFlashResponseGenerator(mlx_server.ResponseGenerator):
     def _serve_single(self, request):
@@ -82,7 +108,9 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
         rqueue, request, args = request_tuple
 
         request_id = next(_DFLASH_REQUEST_COUNTER)
-        bench_active = _bench_enabled()
+        runtime_context = self.model_provider.cli_args.runtime_context
+        trace_config = runtime_context.diagnostics.trace
+        bench_active = _bench_enabled(trace_config)
 
         if args.max_tokens <= 256:
             sys.stderr.write(
@@ -99,6 +127,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 if bench_active:
                     wall_ms = (time.perf_counter_ns() - wall_t0) / 1e6
                     _bench_log_post(
+                        trace_config,
                         request_id=request_id,
                         mode_used="ar_fastpath",
                         max_tokens=int(args.max_tokens),
@@ -147,6 +176,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 draft_model=draft_model,
                 tokenizer=tokenizer,
                 prompt=prompt,
+                runtime_context=runtime_context,
             )
             ctx.prompt_cache_count = prefix_flow.hit_tokens
 
@@ -161,6 +191,8 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 prompt_tokens_override=prompt,
                 prefix_snapshot=prefix_flow.snapshot,
                 stable_prefix_len=prefix_flow.stable_prefix_len,
+                prefix_cache=prefix_flow.cache,
+                runtime_context=runtime_context,
             )
             loop_result = consume_dflash_events(
                 event_iter=event_iter,
@@ -176,6 +208,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 sm_state=sm_state,
                 bench_active=bench_active,
                 request_id=request_id,
+                runtime_context=runtime_context,
             )
             summary_event = loop_result.summary_event
 
@@ -200,16 +233,35 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                     cache_insert_ms=loop_result.cache_insert_ms,
                     finish_reason=loop_result.finish_reason,
                     max_tokens=args.max_tokens,
+                    prompt_regime=_build_prompt_regime(args, tokenizer),
+                    memory_waterfall_peak=loop_result.memory_waterfall_peak,
+                    diagnostics=runtime_context.diagnostics,
                 )
-            if hasattr(mx, "get_peak_memory"):
+            try:
+                mlx_active_gb = float(mx.get_active_memory()) / 1e9 if hasattr(mx, "get_active_memory") else 0.0
+                mlx_cache_gb = float(mx.get_cache_memory()) / 1e9 if hasattr(mx, "get_cache_memory") else 0.0
+                mlx_peak_gb = float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else 0.0
+                import os as _os, resource as _resource, subprocess as _sp
+                rusage = _resource.getrusage(_resource.RUSAGE_SELF)
+                rss_peak_gb = float(rusage.ru_maxrss) / 1e9
+                rss_now_gb = 0.0
                 try:
-                    peak_gb = float(mx.get_peak_memory()) / 1e9
-                    sys.stderr.write(
-                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] req#{request_id} peak_memory={peak_gb:.2f} GB\n"
-                    )
-                    sys.stderr.flush()
+                    out = _sp.check_output(
+                        ["ps", "-o", "rss=", "-p", str(_os.getpid())],
+                        stderr=_sp.DEVNULL, timeout=2,
+                    ).decode().strip()
+                    rss_now_gb = float(out) * 1024.0 / 1e9
                 except Exception:
                     pass
+                untracked_gb = max(0.0, rss_now_gb - mlx_active_gb - mlx_cache_gb)
+                sys.stderr.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] req#{request_id} "
+                    f"mlx_active={mlx_active_gb:.2f} mlx_cache={mlx_cache_gb:.2f} mlx_peak={mlx_peak_gb:.2f} "
+                    f"rss_now={rss_now_gb:.2f} rss_peak={rss_peak_gb:.2f} untracked={untracked_gb:.2f} GB\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
             rqueue.put(None)
         except Exception as e:
             rqueue.put(e)
@@ -257,8 +309,11 @@ def _print_startup_banner(
         draft_suffix = " (explicit)"
     else:
         draft_suffix = " (auto-detected)"
-    target_fa_window = _resolve_target_fa_window()
-    pc_enabled = prefix_cache_enabled()
+    runtime_config = getattr(model_provider.cli_args, "runtime_config", None)
+    target_fa_window = (
+        int(runtime_config.target_fa_window) if runtime_config is not None else 0
+    )
+    pc_enabled = bool(runtime_config.prefix_cache) if runtime_config is not None else False
     if target_fa_window > 0:
         pc_status = "disabled (--target-fa-window)"
     else:
@@ -266,6 +321,7 @@ def _print_startup_banner(
     target_fa_status = (
         "full KV" if target_fa_window == 0 else f"rotating window {target_fa_window}"
     )
+    metal_limits = getattr(model_provider.cli_args, "metal_limits", None)
     raw_lines = [
         f"DFlash v{dflash_version} - speculative decoding engine",
         f"Target:       {target_ref}",
@@ -275,6 +331,67 @@ def _print_startup_banner(
         f"Target FA KV: {target_fa_status}",
         f"Server:       {server_name} on port {port}",
     ]
+    if runtime_config is not None:
+        l2_status = (
+            f"on ({runtime_config.prefix_cache_l2_dir}, "
+            f"{_bytes_to_gib(runtime_config.prefix_cache_l2_max_bytes)})"
+            if runtime_config.prefix_cache_l2
+            else "off"
+        )
+        bench_log_dir = runtime_config.bench_log_dir or "off"
+        diagnostics_mode = getattr(model_provider.cli_args, "diagnostics", "off")
+        diagnostics_dir = getattr(model_provider.cli_args, "diagnostics_dir_resolved", "")
+        raw_lines.extend(
+            [
+                f"Profile:      {runtime_config.profile}",
+                f"Prefill step: {runtime_config.prefill_step_size}",
+                (
+                    "Draft cache:  "
+                    f"sink={runtime_config.draft_sink_size} "
+                    f"window={runtime_config.draft_window_size}"
+                ),
+                f"Verify cap:   {runtime_config.verify_len_cap or 'block'}",
+                f"Clear cache:  {'boundary' if runtime_config.clear_cache_boundaries else 'off'}",
+                (
+                    "L1 cache:     "
+                    f"{'on' if runtime_config.prefix_cache else 'off'} "
+                    f"entries={runtime_config.prefix_cache_max_entries} "
+                    f"bytes={_bytes_to_gib(runtime_config.prefix_cache_max_bytes)}"
+                ),
+                f"L2 cache:     {l2_status}",
+                f"Max snapshot: {runtime_config.max_snapshot_tokens}",
+                f"Waterfall:    {'on' if runtime_config.memory_waterfall else 'off'}",
+                f"Bench logs:   {bench_log_dir}",
+                f"Diagnostics:  {diagnostics_mode}",
+                f"Diagnostics dir: {diagnostics_dir or 'off'}",
+                f"Verify mode:  {runtime_config.verify_mode}",
+            ]
+        )
+    if metal_limits is not None:
+        if metal_limits.metal_available:
+            raw_lines.extend(
+                [
+                    _format_metal_limit(
+                        "Wired limit",
+                        metal_limits.wired_request,
+                        metal_limits.wired_bytes,
+                        metal_limits.wired_applied,
+                    ),
+                    _format_metal_limit(
+                        "Cache limit",
+                        metal_limits.cache_request,
+                        metal_limits.cache_bytes,
+                        metal_limits.cache_applied,
+                    ),
+                ]
+            )
+        else:
+            raw_lines.extend(
+                [
+                    "Wired limit:  Metal unavailable -> not set",
+                    "Cache limit:  Metal unavailable -> not set",
+                ]
+            )
 
     width = max(len(line) for line in raw_lines)
     use_color = sys.stderr.isatty()
@@ -304,18 +421,25 @@ def _run_with_dflash_server(host: str, port: int, model_provider: DFlashModelPro
     if group.rank() == 0:
         _wait_for_initial_model_load(model_provider, timeout_s=300.0)
         _print_startup_banner(port=port, model_provider=model_provider)
-        mlx_server._run_http_server(
-            host,
-            port,
-            response_generator,
-            handler_class=DFlashAPIHandler,
-        )
+        try:
+            mlx_server._run_http_server(
+                host,
+                port,
+                response_generator,
+                handler_class=DFlashAPIHandler,
+            )
+        finally:
+            shutdown_dflash_prefix_cache()
     else:
         response_generator.join()
 
-def main() -> None:
-    args = normalize_cli_args(_build_parser().parse_args())
-    configure_metal_limits()
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
+    parser = _build_parser()
+    if prog is not None:
+        parser.prog = prog
+    args = normalize_cli_args(parser.parse_args(list(argv) if argv is not None else None))
+    metal_limits = configure_metal_limits(args)
+    args.runtime_context = with_metal_limits(args.runtime_context, metal_limits)
     configure_logging(args.log_level)
     _run_with_dflash_server(args.host, args.port, DFlashModelProvider(args))
 

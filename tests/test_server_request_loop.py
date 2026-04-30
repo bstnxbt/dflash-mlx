@@ -1,9 +1,12 @@
+# Copyright 2026 bstnxbt
+# MIT License — see LICENSE file
+# Based on DFlash (arXiv:2602.06036)
+
 from __future__ import annotations
 
 from queue import SimpleQueue
 
 from dflash_mlx.server.request_loop import consume_dflash_events
-
 
 class FakeDetokenizer:
     def __init__(self):
@@ -23,15 +26,12 @@ class FakeDetokenizer:
     def finalize(self):
         self.last_segment = ""
 
-
 class FakeTokenizer:
     def __init__(self):
         self.detokenizer = FakeDetokenizer()
 
-
 class FakeContext:
     _should_stop = False
-
 
 class ClosableEvents:
     def __init__(self, events):
@@ -43,7 +43,6 @@ class ClosableEvents:
 
     def close(self):
         self.closed = True
-
 
 def test_consume_dflash_events_streams_pending_token_and_summary():
     rqueue = SimpleQueue()

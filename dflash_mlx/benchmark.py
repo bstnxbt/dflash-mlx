@@ -2,17 +2,18 @@
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
 
-
 import argparse
 import gc
-import json
 import os
 import platform
 import re
+import shlex
 import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -20,16 +21,50 @@ import mlx.core as mx
 from mlx_lm import stream_generate as mlx_stream_generate
 from mlx_lm.utils import load as load_pristine_target
 
+from dflash_mlx.artifacts import create_run_dir, write_json, write_jsonl, write_manifest
+from dflash_mlx.metal_limits import apply_metal_limits
 from dflash_mlx.runtime import (
+    get_stop_token_ids,
     load_draft_bundle,
     load_target_bundle,
     resolve_model_ref,
     stream_dflash_generate,
 )
+from dflash_mlx.runtime_context import (
+    RuntimeContext,
+    build_offline_runtime_context,
+)
 
-DEFAULT_SCHEDULES: tuple[int, ...] = (8, 16, 32)
-DEFAULT_REPEAT = 3
+DEFAULT_PROMPT = "Explain speculative decoding in two paragraphs."
+DEFAULT_CONTEXT_SEED = (
+    "DFlash benchmark long-context filler. The task is to preserve distant "
+    "context while generating a concise answer at the end.\n"
+)
+CONTROLLED_FLAG_NAMES = (
+    "prompt",
+    "max_tokens",
+    "block_tokens",
+    "ctx",
+    "include_memory",
+    "no_memory",
+    "repeat",
+    "cooldown",
+    "model",
+    "draft",
+    "use_chat_template",
+    "quantize_draft",
+    "no_eos",
+    "split_sdpa",
+    "target_fa_window",
+    "draft_sink_size",
+    "draft_window_size",
+    "verify_len_cap",
+    "out",
+)
 
+class _BenchmarkHelpFormatter(argparse.RawTextHelpFormatter):
+    def __init__(self, prog: str):
+        super().__init__(prog, max_help_position=28, width=100)
 
 def _git_hash_short() -> str:
     try:
@@ -39,6 +74,11 @@ def _git_hash_short() -> str:
     except Exception:
         return "unknown"
 
+def _package_version(name: str) -> str:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "unknown"
 
 def _hardware_info() -> dict[str, str]:
     return {
@@ -50,9 +90,10 @@ def _hardware_info() -> dict[str, str]:
             // (1024**3)
         ),
         "mlx_version": mx.__version__,
+        "mlx_lm_version": _package_version("mlx-lm"),
+        "dflash_mlx_version": _package_version("dflash-mlx"),
         "python": platform.python_version(),
     }
-
 
 def _get_thermal_pressure() -> str:
     try:
@@ -72,7 +113,6 @@ def _get_thermal_pressure() -> str:
         pass
     return "unknown"
 
-
 def _warn_if_throttled(thermal_pressure: str) -> None:
     if thermal_pressure == "nominal":
         return
@@ -82,12 +122,10 @@ def _warn_if_throttled(thermal_pressure: str) -> None:
         file=sys.stderr,
     )
 
-
 def _slugify_prompt_id(prompt: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", prompt.lower()).strip("_")
     slug = re.sub(r"_+", "_", slug)
     return slug[:48] or "prompt"
-
 
 def _slugify_model_ref(model_ref: str | None) -> str:
     resolved = resolve_model_ref(model_ref, kind="target")
@@ -96,12 +134,15 @@ def _slugify_model_ref(model_ref: str | None) -> str:
     label = re.sub(r"-+", "-", label).strip("-")
     return label or "model"
 
+def _benchmark_mode(args: argparse.Namespace) -> str:
+    if int(args.ctx) > 0:
+        return "synthetic-context"
+    if int(args.repeat) > 1:
+        return "repeated"
+    return "smoke"
 
-def _default_results_path(*, target_model_ref: str | None, max_new_tokens: int) -> Path:
-    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    name = f"{_slugify_model_ref(target_model_ref)}-{int(max_new_tokens)}-{ts}"
-    return Path("benchmark/results") / f"{name}.json"
-
+def _benchmark_label(args: argparse.Namespace) -> str:
+    return f"{_benchmark_mode(args)}-{_slugify_model_ref(args.model)}"
 
 def _strip_generation_payload(result: dict[str, Any], *, drop_phase_timings: bool = False) -> dict[str, Any]:
     cleaned = dict(result)
@@ -111,7 +152,6 @@ def _strip_generation_payload(result: dict[str, Any], *, drop_phase_timings: boo
         if "prefill" in phase_timings and "prefill_us" not in cleaned:
             cleaned["prefill_us"] = float(phase_timings["prefill"])
     return cleaned
-
 
 def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
     baseline = dict(run["baseline"])
@@ -137,7 +177,6 @@ def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
         "speedup": float(run["generation_speedup_vs_baseline"]) if run["generation_speedup_vs_baseline"] is not None else None,
     }
 
-
 def _build_config(
     *,
     prompt: str,
@@ -146,35 +185,56 @@ def _build_config(
     block_tokens: int,
     repeat: int,
     cooldown: int,
-    target_model: str,
-    draft_model: str,
+    model: str,
+    draft: str,
+    use_chat_template: bool,
+    quantize_draft: bool,
+    no_eos: bool,
+    split_sdpa: bool,
     target_fa_window: int,
+    draft_sink_size: int,
+    draft_window_size: int,
+    verify_len_cap: int,
 ) -> dict[str, Any]:
     return {
-        "target_model": target_model,
-        "draft_model": draft_model,
-        "max_new_tokens": int(max_new_tokens),
+        "model": model,
+        "draft": draft,
+        "max_tokens": int(max_new_tokens),
         "block_tokens": int(block_tokens),
+        "repeat": int(repeat),
         "cooldown": int(cooldown),
+        "use_chat_template": bool(use_chat_template),
+        "quantize_draft": bool(quantize_draft),
+        "no_eos": bool(no_eos),
+        "split_sdpa": bool(split_sdpa),
+        "target_fa_window": int(target_fa_window),
+        "draft_sink_size": int(draft_sink_size),
+        "draft_window_size": int(draft_window_size),
+        "verify_len_cap": int(verify_len_cap),
         "prompt": prompt,
         "prompt_tokens": int(prompt_tokens),
         "prompt_id": _slugify_prompt_id(prompt),
-        "repeat": int(repeat),
         "git_hash": _git_hash_short(),
-        "target_fa_window": int(target_fa_window),
     }
-
 
 def _build_single_case_report(
     *,
     prompt: str,
     max_new_tokens: int,
+    block_tokens: int,
     repeat: int,
     cooldown: int,
     runs: list[dict[str, Any]],
-    target_model: str,
-    draft_model: str,
+    model: str,
+    draft: str,
+    use_chat_template: bool,
+    quantize_draft: bool,
+    no_eos: bool,
+    split_sdpa: bool,
     target_fa_window: int,
+    draft_sink_size: int,
+    draft_window_size: int,
+    verify_len_cap: int,
 ) -> dict[str, Any]:
     run_entries = [_format_run_entry(run) for run in runs]
     baseline_tps_values = [float(run["baseline_generation_tps"]) for run in runs]
@@ -182,23 +242,25 @@ def _build_single_case_report(
     speedup_values = [float(run["generation_speedup_vs_baseline"]) for run in runs if run["generation_speedup_vs_baseline"] is not None]
     acceptance_ratio_values = [float(run["dflash"]["acceptance_ratio"]) for run in runs]
     prompt_tokens = int(runs[0]["baseline"]["prompt_token_count"]) if runs else 0
-    effective_block_tokens = (
-        int(runs[0]["dflash"].get("block_tokens"))
-        if runs and runs[0].get("dflash", {}).get("block_tokens") is not None
-        else None
-    )
     return {
         "hardware": _hardware_info(),
         "config": _build_config(
             prompt=prompt,
             prompt_tokens=prompt_tokens,
             max_new_tokens=max_new_tokens,
-            block_tokens=effective_block_tokens,
+            block_tokens=block_tokens,
             repeat=repeat,
             cooldown=cooldown,
-            target_model=target_model,
-            draft_model=draft_model,
+            model=model,
+            draft=draft,
+            use_chat_template=use_chat_template,
+            quantize_draft=quantize_draft,
+            no_eos=no_eos,
+            split_sdpa=split_sdpa,
             target_fa_window=target_fa_window,
+            draft_sink_size=draft_sink_size,
+            draft_window_size=draft_window_size,
+            verify_len_cap=verify_len_cap,
         ),
         "runs": run_entries,
         "summary": {
@@ -211,26 +273,55 @@ def _build_single_case_report(
         },
     }
 
+def _attach_memory_summary(result: dict[str, Any]) -> None:
+    baseline_peaks = [
+        float(run.get("baseline", {}).get("peak_memory_gb"))
+        for run in result.get("runs", [])
+        if run.get("baseline", {}).get("peak_memory_gb") is not None
+    ]
+    dflash_peaks = [
+        float(run.get("dflash", {}).get("peak_memory_gb"))
+        for run in result.get("runs", [])
+        if run.get("dflash", {}).get("peak_memory_gb") is not None
+    ]
+    result.setdefault("summary", {}).update(
+        {
+            "baseline_peak_memory_gb_median": statistics.median(baseline_peaks)
+            if baseline_peaks
+            else None,
+            "dflash_peak_memory_gb_median": statistics.median(dflash_peaks)
+            if dflash_peaks
+            else None,
+        }
+    )
 
-def get_stop_token_ids(tokenizer: Any) -> list[int]:
-    eos_token_ids = list(getattr(tokenizer, "eos_token_ids", None) or [])
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_token_id is not None and eos_token_id not in eos_token_ids:
-        eos_token_ids.append(int(eos_token_id))
-    return eos_token_ids
+def _select_prompt(args: argparse.Namespace) -> str:
+    if args.prompt:
+        base = str(args.prompt)
+    else:
+        base = DEFAULT_PROMPT
+    if args.ctx <= 0:
+        return base
 
+    seed = base + "\n\n" + DEFAULT_CONTEXT_SEED
+
+    target_chars = max(int(args.ctx) * 4, len(seed))
+    repeats = (target_chars // len(seed)) + 1
+    body = (seed * repeats)[:target_chars]
+    return (
+        body
+        + "\n\nFinal task: answer the user request using the context above. "
+        "Keep the answer concise."
+    )
 
 def _speedup(baseline_elapsed: float, dflash_elapsed: float) -> float | None:
     return baseline_elapsed / dflash_elapsed if dflash_elapsed > 0.0 else None
 
-
 def _generation_speedup(baseline_tps: float, dflash_tps: float) -> float | None:
     return dflash_tps / baseline_tps if baseline_tps > 0.0 else None
 
-
 def _ttft_ms_from_baseline(result: dict[str, Any]) -> float:
     return float(result.get("prefill_us", 0.0)) / 1_000.0
-
 
 def _ttft_ms_from_dflash(result: dict[str, Any]) -> float:
     ttft_us = result.get("ttft_us")
@@ -238,7 +329,6 @@ def _ttft_ms_from_dflash(result: dict[str, Any]) -> float:
         return float(ttft_us) / 1_000.0
     phase_timings = dict(result.get("phase_timings_us", {}))
     return float(phase_timings.get("prefill", 0.0)) / 1_000.0
-
 
 def _generation_tps_from_baseline(result: dict[str, Any]) -> float:
     if "generation_tps" in result:
@@ -249,7 +339,6 @@ def _generation_tps_from_baseline(result: dict[str, Any]) -> float:
     generation_us = max(0.0, elapsed_us - prefill_us)
     return (generation_tokens / (generation_us / 1e6)) if generation_us > 0.0 else 0.0
 
-
 def _generation_tps_from_dflash(result: dict[str, Any]) -> float:
     elapsed_us = float(result.get("elapsed_us", 0.0))
     phase_timings = dict(result.get("phase_timings_us", {}))
@@ -258,12 +347,10 @@ def _generation_tps_from_dflash(result: dict[str, Any]) -> float:
     generation_us = max(0.0, elapsed_us - prefill_us)
     return (generation_tokens / (generation_us / 1e6)) if generation_us > 0.0 else 0.0
 
-
 def _load_pristine_target_bundle(model_ref: str | None):
     resolved_ref = resolve_model_ref(model_ref, kind="target")
     model, tokenizer, config = load_pristine_target(resolved_ref, lazy=True, return_config=True)
     return model, tokenizer, {"resolved_model_ref": resolved_ref, "config": config}
-
 
 def _generate_stock_baseline_once(
     *,
@@ -281,8 +368,6 @@ def _generate_stock_baseline_once(
         except Exception:
             pass
 
-    # Pre-tokenized input: feed token IDs directly (mlx_stream_generate accepts List[int]).
-    # This guarantees baseline + DFlash see byte-identical prompt tokens.
     if prompt_tokens_override is not None:
         baseline_input: Any = list(prompt_tokens_override)
     elif use_chat_template and hasattr(tokenizer, "apply_chat_template"):
@@ -351,7 +436,6 @@ def _generate_stock_baseline_once(
         "peak_memory_gb": float(final_response.peak_memory),
     }
 
-
 def _generate_dflash_stream_once(
     *,
     target_model: Any,
@@ -363,6 +447,7 @@ def _generate_dflash_stream_once(
     block_tokens: int | None,
     stop_token_ids: list[int] | None,
     suppress_token_ids: list[int] | None,
+    runtime_context: RuntimeContext,
     prompt_tokens_override: list[int] | None = None,
 ) -> dict[str, Any]:
     if hasattr(mx, "reset_peak_memory"):
@@ -385,6 +470,7 @@ def _generate_dflash_stream_once(
         stop_token_ids=stop_token_ids,
         suppress_token_ids=suppress_token_ids,
         prompt_tokens_override=prompt_tokens_override,
+        runtime_context=runtime_context,
     )
     try:
         for event in stream:
@@ -406,7 +492,6 @@ def _generate_dflash_stream_once(
     )
     return summary
 
-
 def _release_loaded_models() -> None:
     gc.collect()
     if hasattr(mx, "clear_cache"):
@@ -421,7 +506,6 @@ def _release_loaded_models() -> None:
         except Exception:
             pass
 
-
 def _run_once_sequential(
     *,
     prompt: str,
@@ -434,12 +518,14 @@ def _run_once_sequential(
     no_eos: bool,
     split_sdpa: bool,
     target_fa_window: int = 0,
+    draft_sink_size: int = 64,
+    draft_window_size: int = 1024,
+    verify_len_cap: int = 0,
 ) -> dict[str, Any]:
     pristine_target_model, pristine_tokenizer, pristine_meta = _load_pristine_target_bundle(
         target_model_ref
     )
-    # Pre-tokenize ONCE with pristine tokenizer. Same token IDs feed both paths —
-    # no reliance on str→encode round-trip equality across tokenizer versions.
+
     if use_chat_template and hasattr(pristine_tokenizer, "apply_chat_template"):
         prompt_tokens = list(
             pristine_tokenizer.apply_chat_template(
@@ -469,18 +555,24 @@ def _run_once_sequential(
     tokenizer = None
     draft_model = None
     try:
-        os.environ["DFLASH_TARGET_FA_WINDOW"] = str(int(target_fa_window))
+        runtime_context = build_offline_runtime_context(
+            target_fa_window=target_fa_window,
+            draft_sink_size=draft_sink_size,
+            draft_window_size=draft_window_size,
+            verify_len_cap=verify_len_cap,
+        )
         target_model, tokenizer, target_meta = load_target_bundle(
             target_model_ref,
             lazy=True,
             split_full_attention_sdpa=split_sdpa,
+            verify_config=runtime_context.verify,
         )
         draft_model, draft_meta = load_draft_bundle(
             draft_model_ref,
             lazy=True,
             quantize_draft=quantize_draft,
         )
-        # Cross-check: DFlash tokenizer is a different instance; tokens must match.
+
         if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
             dflash_prompt_tokens = list(
                 tokenizer.apply_chat_template(
@@ -509,6 +601,7 @@ def _run_once_sequential(
             stop_token_ids=dflash_stop_token_ids,
             suppress_token_ids=dflash_suppress_token_ids,
             prompt_tokens_override=prompt_tokens,
+            runtime_context=runtime_context,
         )
     finally:
         if target_model is not None:
@@ -541,7 +634,6 @@ def _run_once_sequential(
         "pristine_target_meta": pristine_meta,
     }
 
-
 def benchmark_once(
     *,
     prompt: str,
@@ -554,6 +646,9 @@ def benchmark_once(
     no_eos: bool = False,
     split_sdpa: bool = True,
     target_fa_window: int = 0,
+    draft_sink_size: int = 64,
+    draft_window_size: int = 1024,
+    verify_len_cap: int = 0,
     cooldown: int = 10,
 ) -> dict[str, Any]:
     thermal_pressure = _get_thermal_pressure()
@@ -569,6 +664,9 @@ def benchmark_once(
         no_eos=no_eos,
         split_sdpa=split_sdpa,
         target_fa_window=target_fa_window,
+        draft_sink_size=draft_sink_size,
+        draft_window_size=draft_window_size,
+        verify_len_cap=verify_len_cap,
     )
     target_meta = result.pop("target_meta")
     draft_meta = result.pop("draft_meta")
@@ -578,20 +676,27 @@ def benchmark_once(
     return _build_single_case_report(
         prompt=prompt,
         max_new_tokens=max_new_tokens,
+        block_tokens=block_tokens if block_tokens is not None else 16,
         repeat=1,
         cooldown=cooldown,
         runs=[result],
-        target_model=target_meta["resolved_model_ref"],
-        draft_model=draft_meta["resolved_model_ref"],
+        model=target_meta["resolved_model_ref"],
+        draft=draft_meta["resolved_model_ref"],
+        use_chat_template=use_chat_template,
+        quantize_draft=quantize_draft,
+        no_eos=no_eos,
+        split_sdpa=split_sdpa,
         target_fa_window=target_fa_window,
+        draft_sink_size=draft_sink_size,
+        draft_window_size=draft_window_size,
+        verify_len_cap=verify_len_cap,
     )
 
-
-def benchmark_matrix(
+def benchmark_repeated(
     *,
-    prompts: tuple[str, ...] = (),
-    schedules: tuple[int, ...] = DEFAULT_SCHEDULES,
-    repeat: int = DEFAULT_REPEAT,
+    prompt: str,
+    max_new_tokens: int,
+    repeat: int = 1,
     block_tokens: int | None = None,
     use_chat_template: bool = False,
     target_model_ref: str | None = None,
@@ -600,14 +705,13 @@ def benchmark_matrix(
     no_eos: bool = False,
     split_sdpa: bool = True,
     target_fa_window: int = 0,
+    draft_sink_size: int = 64,
+    draft_window_size: int = 1024,
+    verify_len_cap: int = 0,
     cooldown: int = 10,
 ) -> dict[str, Any]:
     target_meta: dict[str, Any] | None = None
     draft_meta: dict[str, Any] | None = None
-    if len(prompts) != 1 or len(schedules) != 1:
-        raise ValueError("benchmark_matrix currently expects exactly one prompt and one schedule.")
-    prompt = prompts[0]
-    max_new_tokens = schedules[0]
     runs: list[dict[str, Any]] = []
 
     for run_index in range(1, repeat + 1):
@@ -624,6 +728,9 @@ def benchmark_matrix(
             no_eos=no_eos,
             split_sdpa=split_sdpa,
             target_fa_window=target_fa_window,
+            draft_sink_size=draft_sink_size,
+            draft_window_size=draft_window_size,
+            verify_len_cap=verify_len_cap,
         )
         if target_meta is None:
             target_meta = run.pop("target_meta")
@@ -643,62 +750,295 @@ def benchmark_matrix(
     return _build_single_case_report(
         prompt=prompt,
         max_new_tokens=max_new_tokens,
+        block_tokens=block_tokens if block_tokens is not None else 16,
         repeat=repeat,
         cooldown=cooldown,
         runs=runs,
-        target_model=target_meta["resolved_model_ref"] if target_meta is not None else "",
-        draft_model=draft_meta["resolved_model_ref"] if draft_meta is not None else "",
+        model=target_meta["resolved_model_ref"] if target_meta is not None else "",
+        draft=draft_meta["resolved_model_ref"] if draft_meta is not None else "",
+        use_chat_template=use_chat_template,
+        quantize_draft=quantize_draft,
+        no_eos=no_eos,
+        split_sdpa=split_sdpa,
         target_fa_window=target_fa_window,
+        draft_sink_size=draft_sink_size,
+        draft_window_size=draft_window_size,
+        verify_len_cap=verify_len_cap,
     )
 
-
-def main() -> None:
-    if mx.metal.is_available():
-        wired_limit = mx.device_info()["max_recommended_working_set_size"]
-        mx.set_cache_limit(wired_limit // 4)
-    parser = argparse.ArgumentParser(description="Benchmark baseline MLX vs DFlash MLX runtime.")
-    parser.add_argument("--prompt", required=True, help="Prompt to benchmark.")
-    parser.add_argument("--max-tokens", type=int, default=64)
-    parser.add_argument("--block-tokens", type=int, default=16)
-    parser.add_argument("--matrix", action="store_true")
+def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Benchmark baseline MLX vs DFlash MLX runtime.",
+        formatter_class=_BenchmarkHelpFormatter,
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help=f"Prompt to benchmark. Default: {DEFAULT_PROMPT!r}.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        metavar="INT",
+        type=int,
+        default=64,
+        help="Number of tokens to generate. Default: 64.",
+    )
+    parser.add_argument(
+        "--block-tokens",
+        metavar="INT",
+        type=int,
+        default=16,
+        help="DFlash speculative verify block size. Default: 16.",
+    )
+    parser.add_argument(
+        "--ctx",
+        metavar="INT",
+        type=int,
+        default=0,
+        help="Build an approximate long-context prompt of INT tokens. Default: 0.",
+    )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Omit peak memory medians from the summary. Default: memory summary enabled.",
+    )
     parser.add_argument(
         "--repeat",
+        metavar="INT",
         type=int,
         default=None,
-        help="Number of measured runs. Uses matrix mode automatically when > 1.",
+        help="Number of measured runs. Default: 1.",
     )
     parser.add_argument(
         "--cooldown",
+        metavar="SECONDS",
         type=int,
         default=10,
-        help="Seconds between runs for thermal stabilization.",
+        help="Sleep between measured runs. Default: 10.",
     )
-    parser.add_argument("--no-chat-template", action="store_true")
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--draft", default=None)
-    parser.add_argument("--quantize-draft", action="store_true")
-    parser.add_argument("--no-eos", action="store_true")
+    parser.add_argument(
+        "--model",
+        metavar="HF_REF_OR_PATH",
+        default=None,
+        help="Target model. Default: auto-resolved default target.",
+    )
+    parser.add_argument(
+        "--draft",
+        metavar="HF_REF_OR_PATH",
+        default=None,
+        help="DFlash draft model. Default: auto-resolved from target.",
+    )
+    parser.add_argument(
+        "--no-chat-template",
+        action="store_true",
+        help="Disable tokenizer chat template. Default: chat template enabled.",
+    )
+    parser.add_argument(
+        "--quantize-draft",
+        action="store_true",
+        help="Quantize draft model after load. Default: disabled.",
+    )
+    parser.add_argument(
+        "--no-eos",
+        action="store_true",
+        help="Suppress EOS so generation reaches --max-tokens. Default: EOS enabled.",
+    )
     parser.add_argument(
         "--split-sdpa",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable split_full_attention_sdpa when loading the target model (default: enabled).",
+        help="Enable split full-attention SDPA on target. Default: enabled.",
     )
     parser.add_argument(
         "--target-fa-window",
+        metavar="INT",
         type=int,
         default=0,
+        help="Experimental verifier FA KV window. Default: 0 = full KV.",
+    )
+    parser.add_argument(
+        "--draft-sink-size",
+        metavar="INT",
+        type=int,
+        default=64,
+        help="Draft context cache sink tokens. Default: 64.",
+    )
+    parser.add_argument(
+        "--draft-window-size",
+        metavar="INT",
+        type=int,
+        default=1024,
+        help="Draft context cache rolling window tokens. Default: 1024.",
+    )
+    parser.add_argument(
+        "--verify-len-cap",
+        metavar="INT",
+        type=int,
+        default=0,
+        help="Max tokens verified per target forward. Default: 0 = block size.",
+    )
+    parser.add_argument(
+        "--out",
+        metavar="PATH",
+        default=None,
         help=(
-            "Experimental target verifier full-attention KV window. "
-            "0 keeps full KV cache; N>0 uses rotating KV cache for target FA layers only."
+            "Artifact output directory. Default: "
+            ".artifacts/dflash/benchmarks/<timestamp>-<mode>-<model>."
         ),
     )
-    args = parser.parse_args()
-    repeat = args.repeat if args.repeat is not None else (DEFAULT_REPEAT if args.matrix else 1)
+    return parser
+
+def _controlled_flag_values(
+    args: argparse.Namespace,
+    output_path: Path,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = config or {}
+    return {
+        "prompt": args.prompt,
+        "max_tokens": int(args.max_tokens),
+        "block_tokens": int(args.block_tokens),
+        "ctx": int(args.ctx),
+        "include_memory": not bool(args.no_memory),
+        "no_memory": bool(args.no_memory),
+        "repeat": int(args.repeat),
+        "cooldown": int(args.cooldown),
+        "model": config.get("model", args.model),
+        "draft": config.get("draft", args.draft),
+        "use_chat_template": not bool(args.no_chat_template),
+        "quantize_draft": bool(args.quantize_draft),
+        "no_eos": bool(args.no_eos),
+        "split_sdpa": bool(args.split_sdpa),
+        "target_fa_window": int(args.target_fa_window),
+        "draft_sink_size": int(args.draft_sink_size),
+        "draft_window_size": int(args.draft_window_size),
+        "verify_len_cap": int(args.verify_len_cap),
+        "out": str(output_path),
+    }
+
+def _explicit_flag_values(
+    args: argparse.Namespace,
+    argv: list[str],
+    output_path: Path,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    option_to_name = {
+        "--prompt": "prompt",
+        "--max-tokens": "max_tokens",
+        "--block-tokens": "block_tokens",
+        "--ctx": "ctx",
+        "--no-memory": "no_memory",
+        "--repeat": "repeat",
+        "--cooldown": "cooldown",
+        "--model": "model",
+        "--draft": "draft",
+        "--no-chat-template": "use_chat_template",
+        "--quantize-draft": "quantize_draft",
+        "--no-eos": "no_eos",
+        "--split-sdpa": "split_sdpa",
+        "--no-split-sdpa": "split_sdpa",
+        "--target-fa-window": "target_fa_window",
+        "--draft-sink-size": "draft_sink_size",
+        "--draft-window-size": "draft_window_size",
+        "--verify-len-cap": "verify_len_cap",
+        "--out": "out",
+    }
+    seen = {option_to_name[token] for token in argv if token in option_to_name}
+    values = _controlled_flag_values(args, output_path, config)
+    return {name: values[name] for name in CONTROLLED_FLAG_NAMES if name in seen}
+
+def _build_invocation(
+    args: argparse.Namespace,
+    output_path: Path,
+    argv: list[str],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "command": _format_command(argv),
+        "argv": argv,
+        "output_path": str(output_path),
+        "output_dir": str(output_path),
+        "explicit_flags": _explicit_flag_values(args, argv[1:], output_path, config),
+        "effective": _controlled_flag_values(args, output_path, config),
+        "protocol_order": ["baseline", "dflash"],
+        "same_prompt_token_ids": True,
+        "primary_metric": "post_prefill_generation_tps",
+    }
+
+def _format_command(argv: list[str]) -> str:
+    if not argv:
+        return ""
+    if " " in argv[0]:
+        tail = shlex.join(argv[1:])
+        return argv[0] if not tail else f"{argv[0]} {tail}"
+    return shlex.join(argv)
+
+def _print_summary(result: dict[str, Any], output_path: Path) -> None:
+    summary = result.get("summary", {})
+    print("Summary:")
+    print(f"  baseline generation_tps median: {summary.get('baseline_tps_median')}")
+    print(f"  dflash generation_tps median  : {summary.get('dflash_tps_median')}")
+    print(f"  speedup median                : {summary.get('speedup_median')}")
+    print(f"  acceptance median             : {summary.get('acceptance_ratio_median')}")
+    if "baseline_peak_memory_gb_median" in summary or "dflash_peak_memory_gb_median" in summary:
+        print(f"  baseline peak memory median   : {summary.get('baseline_peak_memory_gb_median')}")
+        print(f"  dflash peak memory median     : {summary.get('dflash_peak_memory_gb_median')}")
+    print(f"Artifacts written to: {output_path}")
+
+def _summary_markdown(result: dict[str, Any]) -> str:
+    config = result.get("config", {})
+    summary = result.get("summary", {})
+    lines = [
+        "# DFlash Benchmark",
+        "",
+        f"- mode: {config.get('benchmark_mode')}",
+        f"- model: {config.get('model')}",
+        f"- draft: {config.get('draft')}",
+        f"- max_tokens: {config.get('max_tokens')}",
+        f"- block_tokens: {config.get('block_tokens')}",
+        f"- prompt_tokens: {config.get('prompt_tokens')}",
+        "",
+        "## Summary",
+        "",
+        f"- baseline generation tps median: {summary.get('baseline_tps_median')}",
+        f"- dflash generation tps median: {summary.get('dflash_tps_median')}",
+        f"- speedup median: {summary.get('speedup_median')}",
+        f"- acceptance ratio median: {summary.get('acceptance_ratio_median')}",
+    ]
+    if "baseline_peak_memory_gb_median" in summary or "dflash_peak_memory_gb_median" in summary:
+        lines.extend(
+            [
+                f"- baseline peak memory median: {summary.get('baseline_peak_memory_gb_median')}",
+                f"- dflash peak memory median: {summary.get('dflash_peak_memory_gb_median')}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
+    apply_metal_limits()
+    parser = build_parser(prog=prog)
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    repeat = args.repeat if args.repeat is not None else 1
+    args.repeat = repeat
     if repeat < 1:
         raise ValueError("--repeat must be >= 1")
+    if args.ctx < 0:
+        raise ValueError("--ctx must be >= 0")
     if args.target_fa_window < 0:
         raise ValueError("--target-fa-window must be >= 0")
+    if args.draft_sink_size < 0:
+        raise ValueError("--draft-sink-size must be >= 0")
+    if args.draft_window_size <= 0:
+        raise ValueError("--draft-window-size must be > 0")
+    if args.verify_len_cap < 0:
+        raise ValueError("--verify-len-cap must be >= 0")
+    prompt = _select_prompt(args)
+    output_path = create_run_dir(
+        "benchmark",
+        _benchmark_label(args),
+        explicit_path=args.out,
+    )
 
     common_kwargs = {
         "block_tokens": args.block_tokens,
@@ -709,30 +1049,62 @@ def main() -> None:
         "no_eos": args.no_eos,
         "split_sdpa": args.split_sdpa,
         "target_fa_window": args.target_fa_window,
+        "draft_sink_size": args.draft_sink_size,
+        "draft_window_size": args.draft_window_size,
+        "verify_len_cap": args.verify_len_cap,
         "cooldown": args.cooldown,
     }
-    if args.matrix or repeat > 1:
-        result = benchmark_matrix(
-            prompts=(args.prompt,),
-            schedules=(args.max_tokens,),
+    if repeat > 1:
+        result = benchmark_repeated(
+            prompt=prompt,
+            max_new_tokens=args.max_tokens,
             repeat=repeat,
             **common_kwargs,
         )
     else:
         result = benchmark_once(
-            prompt=args.prompt,
+            prompt=prompt,
             max_new_tokens=args.max_tokens,
             **common_kwargs,
         )
 
-    output_path = _default_results_path(
-        target_model_ref=args.model,
-        max_new_tokens=args.max_tokens,
+    result["config"].update(
+        {
+            "max_tokens": int(args.max_tokens),
+            "block_tokens": int(args.block_tokens),
+            "ctx": int(args.ctx),
+            "include_memory": not bool(args.no_memory),
+            "no_memory": bool(args.no_memory),
+            "benchmark_mode": _benchmark_mode(args),
+            "repeat": int(repeat),
+            "cooldown": int(args.cooldown),
+            "use_chat_template": not bool(args.no_chat_template),
+            "quantize_draft": bool(args.quantize_draft),
+            "no_eos": bool(args.no_eos),
+            "split_sdpa": bool(args.split_sdpa),
+            "target_fa_window": int(args.target_fa_window),
+            "draft_sink_size": int(args.draft_sink_size),
+            "draft_window_size": int(args.draft_window_size),
+            "verify_len_cap": int(args.verify_len_cap),
+        }
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result, indent=2))
-
+    if not args.no_memory:
+        _attach_memory_summary(result)
+    result["invocation"] = _build_invocation(args, output_path, list(sys.argv), result["config"])
+    write_manifest(
+        output_path,
+        kind="benchmark",
+        label=_benchmark_label(args),
+        argv=list(sys.argv),
+        model=result["config"].get("model"),
+        draft=result["config"].get("draft"),
+        effective_config=result["config"],
+    )
+    write_json(output_path / "invocation.json", result["invocation"])
+    write_json(output_path / "summary.json", result)
+    write_jsonl(output_path / "runs.jsonl", list(result.get("runs", [])))
+    (output_path / "summary.md").write_text(_summary_markdown(result))
+    _print_summary(result, output_path)
 
 if __name__ == "__main__":
     main()

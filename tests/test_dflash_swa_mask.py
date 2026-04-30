@@ -1,3 +1,7 @@
+# Copyright 2026 bstnxbt
+# MIT License — see LICENSE file
+# Based on DFlash (arXiv:2602.06036)
+
 import mlx.core as mx
 
 from dflash_mlx import runtime
@@ -7,7 +11,6 @@ from dflash_mlx.model import (
     DFlashDraftModel,
     DFlashDraftModelArgs,
 )
-
 
 def _args(**overrides):
     base = {
@@ -31,13 +34,11 @@ def _args(**overrides):
     base.update(overrides)
     return DFlashDraftModelArgs(**base)
 
-
 def test_dflash_attention_marks_only_sliding_layers():
     model = DFlashDraftModel(_args())
 
     assert model.layers[0].self_attn.sliding_window == 3
     assert model.layers[1].self_attn.sliding_window is None
-
 
 def test_sliding_attention_mask_matches_full_causal_window():
     attn = DFlashAttention(_args(), layer_idx=0)
@@ -54,7 +55,6 @@ def test_sliding_attention_mask_matches_full_causal_window():
 
     assert mask.shape == expected.shape
     assert bool(mx.all(mask == expected).item())
-
 
 def test_sliding_attention_mask_respects_truncated_context_cache_positions():
     cache = ContextOnlyDraftKVCache(sink_size=2, window_size=3)
@@ -84,12 +84,10 @@ def test_sliding_attention_mask_respects_truncated_context_cache_positions():
     assert positions.tolist() == [0, 1, 3, 4, 5]
     assert bool(mx.all(mask == expected).item())
 
-
 def test_context_cache_selects_only_retained_spans_for_long_initial_context():
     cache = ContextOnlyDraftKVCache(sink_size=2, window_size=3)
 
     assert cache.context_spans_to_append(8) == [(0, 2), (5, 8)]
-
 
 def test_context_cache_sparse_append_preserves_logical_positions_and_offset():
     cache = ContextOnlyDraftKVCache(sink_size=2, window_size=3)
@@ -109,7 +107,6 @@ def test_context_cache_sparse_append_preserves_logical_positions_and_offset():
     assert cache.offset == 8
     assert cache.cache_length() == 5
     assert cache.position_indices().tolist() == [0, 1, 5, 6, 7]
-
 
 def test_context_cache_later_long_append_keeps_new_tail_only():
     cache = ContextOnlyDraftKVCache(sink_size=2, window_size=3)
@@ -140,12 +137,10 @@ def test_context_cache_later_long_append_keeps_new_tail_only():
     assert cache.cache_length() == 5
     assert cache.position_indices().tolist() == [0, 1, 11, 12, 13]
 
-
 def test_full_attention_layer_keeps_existing_unmasked_behavior():
     attn = DFlashAttention(_args(), layer_idx=1)
 
     assert attn._attention_mask(block_len=3, query_offset=5, key_len=8) is None
-
 
 def test_sliding_attention_disables_unmasked_fast_cross_attention(monkeypatch):
     attn = DFlashAttention(_args(), layer_idx=0)
@@ -161,13 +156,11 @@ def test_sliding_attention_disables_unmasked_fast_cross_attention(monkeypatch):
 
     assert out.shape == hidden.shape
 
-
 def test_effective_draft_window_never_under_model_swa_window():
     draft_model = DFlashDraftModel(_args(sliding_window=2048))
 
     assert runtime._effective_draft_window_size(draft_model, 1024) == 2048
     assert runtime._effective_draft_window_size(draft_model, 4096) == 4096
-
 
 def test_effective_draft_window_expands_unwindowed_full_attention_to_context():
     draft_model = DFlashDraftModel(
@@ -182,7 +175,6 @@ def test_effective_draft_window_expands_unwindowed_full_attention_to_context():
         )
         == 4096
     )
-
 
 def test_effective_draft_window_can_keep_explicit_user_window():
     draft_model = DFlashDraftModel(

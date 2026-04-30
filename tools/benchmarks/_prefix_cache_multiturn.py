@@ -1,26 +1,7 @@
-"""Multi-turn bench comparing the DFlash runtime WITH vs WITHOUT the prefix cache.
+# Copyright 2026 bstnxbt
+# MIT License — see LICENSE file
+# Based on DFlash (arXiv:2602.06036)
 
-Simulates an agentic session of N turns where each turn's prompt extends
-the previous turn's prompt by a small user message (prompt grows monotonically).
-
-Measures per turn:
-  - TTFT (first token latency)
-  - total wall (prefill + generation)
-  - prompt_len
-
-Prints a side-by-side table. Uses an in-process runtime — same model loaded
-once, two runs (off then on). Same seed, same prompts, same max_tokens.
-
-Usage:
-    PYTHONPATH=$PWD .venv/bin/python -m benchmark.bench_prefix_cache_multiturn
-
-Env knobs:
-    BENCH_TARGET   HF ref for target (default mlx-community/Qwen3.6-27B-4bit)
-    BENCH_DRAFT    HF ref for draft  (default z-lab/Qwen3.6-27B-DFlash)
-    BENCH_TURNS    number of turns (default 10)
-    BENCH_SYSTEM_TOKENS   approximate system prompt size (default 800)
-    BENCH_MAX_TOKENS      tokens to generate per turn (default 48)
-"""
 
 from __future__ import annotations
 
@@ -28,37 +9,41 @@ import json
 import os
 import sys
 import time
+from collections.abc import Sequence
 from typing import Any, Optional
 
 from mlx_lm import stream_generate as mlxlm_stream_generate
 
 from dflash_mlx.generate import load_runtime_components
-from dflash_mlx.prefix_cache import (
-    DFlashPrefixCache,
-    DFlashPrefixKey,
+from dflash_mlx.cache.codecs import (
     build_snapshot,
     target_cache_is_serializable,
 )
-from dflash_mlx.runtime import _resolve_draft_window, stream_dflash_generate
-
+from dflash_mlx.cache.fingerprints import DFlashPrefixKey
+from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
+from dflash_mlx.runtime import stream_dflash_generate
+from dflash_mlx.runtime_context import build_runtime_context, runtime_config_from_profile
 
 def _tokenize(tokenizer: Any, text: str) -> list[int]:
     if hasattr(tokenizer, "encode"):
         return [int(t) for t in tokenizer.encode(text)]
     return [int(t) for t in tokenizer(text)]
 
-
-def _build_key(target_ref: str, draft_ref: str, draft_model: Any) -> DFlashPrefixKey:
+def _build_key(
+    target_ref: str,
+    draft_ref: str,
+    draft_model: Any,
+    runtime_context: Any,
+) -> DFlashPrefixKey:
     capture = tuple(int(x) for x in getattr(draft_model, "target_layer_ids", ()) or ())
-    sink, window = _resolve_draft_window()
+    runtime_config = runtime_context.runtime
     return DFlashPrefixKey(
         target_model_id=target_ref,
         draft_model_id=draft_ref,
         capture_layer_ids=capture,
-        draft_sink_size=int(sink),
-        draft_window_size=int(window),
+        draft_sink_size=int(runtime_config.draft_sink_size),
+        draft_window_size=int(runtime_config.draft_window_size),
     )
-
 
 def _run_one_turn(
     *,
@@ -70,6 +55,7 @@ def _run_one_turn(
     prefix_snapshot=None,
     cache_to_populate: Optional[DFlashPrefixCache] = None,
     cache_key: Optional[DFlashPrefixKey] = None,
+    runtime_context: Any,
 ) -> dict[str, Any]:
     start = time.perf_counter_ns()
     first_token_us: Optional[float] = None
@@ -77,6 +63,7 @@ def _run_one_turn(
     from_snapshot = False
     snap_len_used = 0
     inserted = False
+    breakdown: dict[str, Any] = {}
     stream = stream_dflash_generate(
         target_model=target_model,
         tokenizer=tokenizer,
@@ -86,10 +73,22 @@ def _run_one_turn(
         use_chat_template=False,
         prompt_tokens_override=prompt_tokens,
         prefix_snapshot=prefix_snapshot,
+        runtime_context=runtime_context,
     )
     try:
         for event in stream:
             ev = event.get("event")
+            if ev == "prefill":
+                breakdown = {
+                    "prefill_us": float(event.get("prefill_us") or 0.0),
+                    "rebuild_us": float(event.get("phase_rebuild_us") or 0.0),
+                    "cold_us": float(event.get("phase_cold_us") or 0.0),
+                    "seam_us": float(event.get("phase_seam_us") or 0.0),
+                    "tail_us": float(event.get("phase_tail_us") or 0.0),
+                    "snap_prefix_len": int(event.get("snap_prefix_len") or 0),
+                    "snapshot_boundary": int(event.get("snapshot_boundary") or 0),
+                }
+                continue
             if ev == "prefill_snapshot_ready":
                 from_snapshot = bool(event.get("from_snapshot", False))
                 snap_len_used = int(event.get("snap_prefix_len", 0))
@@ -124,7 +123,7 @@ def _run_one_turn(
         stream.close()
 
     total_us = (time.perf_counter_ns() - start) / 1_000.0
-    return {
+    out = {
         "ttft_us": first_token_us,
         "total_us": total_us,
         "n_tokens": n_tokens,
@@ -133,10 +132,10 @@ def _run_one_turn(
         "snap_prefix_len": snap_len_used,
         "inserted": inserted,
     }
-
+    out.update(breakdown)
+    return out
 
 def _build_turn_prompts(tokenizer: Any, n_turns: int, system_target_tokens: int) -> list[list[int]]:
-    """Agentic-style prompts: shared system preamble, then growing user turns."""
     system_lorem = (
         "You are an expert software engineer in a long-running chat with a power user. "
         "The user is working on GPU programming, CUDA, Metal, and MLX runtime internals. "
@@ -145,8 +144,7 @@ def _build_turn_prompts(tokenizer: Any, n_turns: int, system_target_tokens: int)
         "GQA, KV cache, and rollback semantics clearly. "
     ) * 6
     system_tokens = _tokenize(tokenizer, system_lorem)
-    # Pad/trim to target size. The bench is meant to model long agentic
-    # system/tool prefixes, so keep extending the stable prefix when requested.
+
     filler = (
         "Follow the repository's coding style. Preserve scope. Prefer small diffs. "
         "Explain runtime tradeoffs with concrete measurements. Avoid generated artifacts. "
@@ -184,13 +182,12 @@ def _build_turn_prompts(tokenizer: Any, n_turns: int, system_target_tokens: int)
         user_text = user_turns[i % len(user_turns)] + "\n"
         running = running + _tokenize(tokenizer, user_text)
         prompts.append(list(running + assistant_cue))
-        # Simulate a reply that the caller appended before turn i+1.
+
         running = running + assistant_cue + _tokenize(
             tokenizer,
             assistant_filler + f" (reply #{i+1})\n",
         )
     return prompts
-
 
 def _run_mlxlm_turn(
     *,
@@ -199,12 +196,6 @@ def _run_mlxlm_turn(
     prompt_tokens: list[int],
     max_tokens: int,
 ) -> dict[str, Any]:
-    """Run one turn through mlx_lm.stream_generate — honest AR baseline.
-
-    Fresh implicit cache every turn (no session reuse), matching the typical
-    naive mlx_lm caller pattern. This is what DFlash competes against
-    head-to-head.
-    """
     start = time.perf_counter_ns()
     first_token_us: Optional[float] = None
     n_tokens = 0
@@ -230,7 +221,6 @@ def _run_mlxlm_turn(
         "inserted": False,
     }
 
-
 def _session_mlxlm(
     *,
     target_model: Any,
@@ -238,7 +228,6 @@ def _session_mlxlm(
     prompts: list[list[int]],
     max_tokens: int,
 ) -> list[dict[str, Any]]:
-    """mlx_lm baseline AR session, fresh cache each turn."""
     results: list[dict[str, Any]] = []
     for i, prompt_tokens in enumerate(prompts):
         res = _run_mlxlm_turn(
@@ -259,7 +248,6 @@ def _session_mlxlm(
         )
     return results
 
-
 def _session(
     *,
     target_model: Any,
@@ -270,6 +258,7 @@ def _session(
     use_cache: bool,
     cache: Optional[DFlashPrefixCache],
     key: Optional[DFlashPrefixKey],
+    runtime_context: Any,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for i, prompt_tokens in enumerate(prompts):
@@ -286,6 +275,7 @@ def _session(
             prefix_snapshot=prefix_snapshot,
             cache_to_populate=cache if use_cache else None,
             cache_key=key if use_cache else None,
+            runtime_context=runtime_context,
         )
         res["turn"] = i + 1
         res["matched_lookup"] = matched
@@ -297,22 +287,34 @@ def _session(
             f"total={res['total_us']/1000:7.1f}ms "
             f"tokens={res['n_tokens']:3d} "
             f"match={matched:5d} "
-            f"from_snap={str(res['from_snapshot']):>5s}"
+            f"from_snap={str(res['from_snapshot']):>5s} "
+            f"| pf={res.get('prefill_us', 0)/1000:6.1f}ms "
+            f"reb={res.get('rebuild_us', 0)/1000:5.1f} "
+            f"cold={res.get('cold_us', 0)/1000:6.1f} "
+            f"seam={res.get('seam_us', 0)/1000:5.1f} "
+            f"tail={res.get('tail_us', 0)/1000:5.1f} "
+            f"snap={res.get('snap_prefix_len', 0):4d}/{res.get('snapshot_boundary', 0):4d}"
         )
     return results
 
-
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     import argparse
     p = argparse.ArgumentParser(
         description="Multi-turn prefix-cache bench (DFlash with/without cache vs mlx_lm AR)."
     )
-    p.add_argument("--target", default=os.environ.get("BENCH_TARGET", "mlx-community/Qwen3.6-27B-4bit"))
-    p.add_argument("--draft", default=os.environ.get("BENCH_DRAFT", "z-lab/Qwen3.6-27B-DFlash"))
-    p.add_argument("--turns", type=int, default=int(os.environ.get("BENCH_TURNS", "10")))
-    p.add_argument("--system-tokens", type=int, default=int(os.environ.get("BENCH_SYSTEM_TOKENS", "800")))
-    p.add_argument("--max-tokens", type=int, default=int(os.environ.get("BENCH_MAX_TOKENS", "48")))
-    args = p.parse_args()
+    p.add_argument("--target", default="mlx-community/Qwen3.6-27B-4bit",
+                   help="HF target model ref")
+    p.add_argument("--draft", default="z-lab/Qwen3.6-27B-DFlash",
+                   help="HF draft model ref")
+    p.add_argument("--turns", type=int, default=10,
+                   help="number of turns")
+    p.add_argument("--system-tokens", type=int, default=800,
+                   help="approximate system prompt size in tokens")
+    p.add_argument("--max-tokens", type=int, default=48,
+                   help="tokens generated per turn")
+    p.add_argument("--out", default=None,
+                   help="JSON output path (auto-generated if omitted)")
+    args = p.parse_args(list(argv) if argv is not None else None)
     target_ref = args.target
     draft_ref = args.draft
     n_turns = args.turns
@@ -326,12 +328,12 @@ def main() -> int:
         model_ref=target_ref,
         draft_ref=draft_ref,
     )
+    runtime_context = build_runtime_context(runtime_config_from_profile(profile="balanced"))
     print(f"Loaded. resolved_draft={resolved_draft}")
 
     prompts = _build_turn_prompts(tokenizer, n_turns, system_target_tokens)
     print(f"Prompt lengths: {[len(p) for p in prompts]}")
 
-    # Warmup the runtime once (unmeasured) to pay MLX JIT cost.
     print("Warmup (8 tokens, no cache)...")
     _run_one_turn(
         target_model=target_model,
@@ -339,6 +341,7 @@ def main() -> int:
         draft_model=draft_model,
         prompt_tokens=prompts[0][:64],
         max_tokens=8,
+        runtime_context=runtime_context,
     )
 
     print("\n=== mlx_lm AR (pure baseline, fresh cache per turn) ===")
@@ -359,11 +362,12 @@ def main() -> int:
         use_cache=False,
         cache=None,
         key=None,
+        runtime_context=runtime_context,
     )
 
     print("\n=== DFlash + PREFIX CACHE (new feature) ===")
     cache = DFlashPrefixCache(max_entries=16)
-    key = _build_key(target_ref, resolved_draft or draft_ref, draft_model)
+    key = _build_key(target_ref, resolved_draft or draft_ref, draft_model, runtime_context)
     cached = _session(
         target_model=target_model,
         tokenizer=tokenizer,
@@ -373,6 +377,7 @@ def main() -> int:
         use_cache=True,
         cache=cache,
         key=key,
+        runtime_context=runtime_context,
     )
 
     print("\n=== SUMMARY: mlx_lm AR  vs  DFlash off  vs  DFlash+cache ===")
@@ -430,9 +435,9 @@ def main() -> int:
     )
     print("cache stats:", cache.stats())
 
-    out_path = os.environ.get(
-        "BENCH_OUT",
-        f"benchmark/results/apple-m5-max/prefix_cache_multiturn_{time.strftime('%Y%m%dT%H%M%SZ')}.json",
+    out_path = args.out or (
+        ".artifacts/dflash/benchmarks/"
+        f"{time.strftime('%Y%m%d-%H%M%S')}-prefix-cache-multiturn/summary.json"
     )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
@@ -466,7 +471,6 @@ def main() -> int:
         )
     print(f"Results written to {out_path}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

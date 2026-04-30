@@ -10,9 +10,13 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from dflash_mlx.bench_logger import log_cycle as _bench_log_cycle
+from dflash_mlx.engine.memory_waterfall import (
+    collect_memory_waterfall,
+    format_memory_waterfall_summary,
+    merge_memory_waterfall_peak,
+)
 from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 from dflash_mlx.server.protocol import make_response, match_stream_token
-
 
 @dataclass
 class RequestLoopResult:
@@ -25,7 +29,7 @@ class RequestLoopResult:
     cache_lookup_ms: float
     cache_hit_tokens: int
     cache_insert_ms: float
-
+    memory_waterfall_peak: Optional[dict[str, Any]] = None
 
 def consume_dflash_events(
     *,
@@ -42,6 +46,7 @@ def consume_dflash_events(
     sm_state: Optional[Any] = None,
     bench_active: bool = False,
     request_id: int = 0,
+    runtime_context: Optional[Any] = None,
 ) -> RequestLoopResult:
     detokenizer = tokenizer.detokenizer
     if hasattr(detokenizer, "reset"):
@@ -62,13 +67,27 @@ def consume_dflash_events(
     live_prompt_len = len(prompt)
     printed_prefill_progress = False
     client_done = False
+    memory_peak: Optional[dict[str, Any]] = None
+    diagnostics = (
+        runtime_context.diagnostics
+        if runtime_context is not None
+        else None
+    )
+    trace = diagnostics.trace if diagnostics is not None else None
+    memory_enabled = bool(diagnostics is not None and diagnostics.memory_waterfall)
 
     try:
         for event in event_iter:
             event_name = event.get("event")
             if bench_active and event_name == "cycle_complete":
                 cycle_event = {k: v for k, v in event.items() if k != "event"}
-                _bench_log_cycle(request_id=request_id, **cycle_event)
+                _bench_log_cycle(trace, request_id=request_id, **cycle_event)
+                continue
+            if event_name == "memory_waterfall":
+                memory_event = {k: v for k, v in event.items() if k != "event"}
+                memory_peak = merge_memory_waterfall_peak(memory_peak, memory_event)
+                if bench_active:
+                    _bench_log_cycle(trace, request_id=request_id, **memory_event)
                 continue
             if event_name in ("prefill", "prefill_progress"):
                 processed = int(
@@ -202,6 +221,14 @@ def consume_dflash_events(
         close = getattr(event_iter, "close", None)
         if close is not None:
             close()
+        if memory_enabled:
+            memory_event = collect_memory_waterfall(
+                phase="after_cleanup",
+                prefix_cache=prefix_flow.cache if prefix_flow is not None else None,
+            )
+            memory_peak = merge_memory_waterfall_peak(memory_peak, memory_event)
+            if bench_active:
+                _bench_log_cycle(trace, request_id=request_id, **memory_event)
 
     detokenizer.finalize()
     tail = detokenizer.last_segment
@@ -216,6 +243,13 @@ def consume_dflash_events(
             )
         )
 
+    if memory_peak:
+        sys.stderr.write(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"{format_memory_waterfall_summary(memory_peak)}\n"
+        )
+        sys.stderr.flush()
+
     return RequestLoopResult(
         summary_event=summary_event,
         request_start_ns=request_start_ns,
@@ -226,8 +260,8 @@ def consume_dflash_events(
         cache_lookup_ms=prefix_flow.lookup_ms if prefix_flow is not None else 0.0,
         cache_hit_tokens=prefix_flow.hit_tokens if prefix_flow is not None else 0,
         cache_insert_ms=prefix_flow.insert_ms if prefix_flow is not None else 0.0,
+        memory_waterfall_peak=memory_peak,
     )
-
 
 def _context_should_stop(ctx: Any) -> bool:
     return bool(getattr(ctx, "_should_stop", False))

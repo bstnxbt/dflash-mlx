@@ -1,21 +1,7 @@
-"""HTTP/SSE proxy in front of an OpenAI-compatible LLM server.
+# Copyright 2026 bstnxbt
+# MIT License — see LICENSE file
+# Based on DFlash (arXiv:2602.06036)
 
-Logs every /v1/chat/completions request body and every SSE chunk
-(with millisecond timestamps relative to the request arrival) so the
-caller can answer "why is one backend faster" instead of just "by how
-much".
-
-Layout written under --out-dir:
-    requests/NNN.json   — verbatim request body
-    sse/NNN.jsonl       — one JSON object per SSE event with t_ms
-    proxy.log           — proxy-level events (start, error, finish)
-
-Run standalone:
-    python -m benchmark.agentic_proxy \\
-        --listen-port 9788 \\
-        --upstream-url http://127.0.0.1:8000 \\
-        --out-dir /path/to/run_dir
-"""
 
 from __future__ import annotations
 
@@ -27,15 +13,16 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from dflash_mlx.artifacts import create_run_dir
 
 _REQ_LOCK = threading.Lock()
 _REQ_INDEX = 0
-
 
 def _next_req_idx() -> int:
     global _REQ_INDEX
@@ -43,10 +30,8 @@ def _next_req_idx() -> int:
         _REQ_INDEX += 1
         return _REQ_INDEX
 
-
 def _json_compact(obj: Any) -> bytes:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
 
 def _parse_sse_event(block: bytes) -> dict[str, Any]:
     text = block.decode("utf-8", errors="replace")
@@ -75,19 +60,16 @@ def _parse_sse_event(block: bytes) -> dict[str, Any]:
         out["fields"] = fields
     return out
 
-
 class TraceHandler(BaseHTTPRequestHandler):
     server_version = "agentic-proxy/1.0"
-    out_dir: Path  # set on subclass
+    out_dir: Path
     upstream_host: str
     upstream_port: int
     upstream_scheme: str
     proxy_log_path: Path
 
-    def log_message(self, *_, **__):  # silence default access log
+    def log_message(self, *_, **__):
         pass
-
-    # ---------- helpers ----------
 
     def _proxy_log(self, msg: str) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -99,10 +81,8 @@ class TraceHandler(BaseHTTPRequestHandler):
             return http.client.HTTPSConnection(self.upstream_host, self.upstream_port, timeout=600)
         return http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=600)
 
-    # ---------- routing ----------
-
     def do_GET(self):
-        # transparent forward (e.g. /v1/models)
+
         self._forward_simple("GET")
 
     def do_POST(self):
@@ -155,7 +135,6 @@ class TraceHandler(BaseHTTPRequestHandler):
         req_path.parent.mkdir(parents=True, exist_ok=True)
         sse_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # stash request meta + body
         meta = {
             "idx": idx,
             "method": "POST",
@@ -188,9 +167,6 @@ class TraceHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        # forward status + headers. For streaming SSE we re-emit
-        # Transfer-Encoding: chunked AND actually frame each write as a
-        # chunk — BaseHTTPRequestHandler does not do that for us.
         self.send_response(resp.status)
         forwarded_hdrs = []
         for k, v in resp.getheaders():
@@ -203,7 +179,7 @@ class TraceHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
         self.end_headers()
 
-        sse_f = sse_path.open("a", buffering=1)  # line-buffered so partial logs survive kills
+        sse_f = sse_path.open("a", buffering=1)
         sse_f.write(json.dumps({
             "type": "meta",
             "t_ms": 0.0,
@@ -235,10 +211,7 @@ class TraceHandler(BaseHTTPRequestHandler):
                 pass
             self._proxy_log(f"req#{idx} done t_total_ms={t_total:.1f}")
 
-    # ---------- SSE streaming ----------
-
     def _write_chunk(self, data: bytes) -> None:
-        """HTTP/1.1 chunked transfer encoding."""
         if not data:
             return
         self.wfile.write(f"{len(data):x}\r\n".encode("ascii"))
@@ -254,9 +227,7 @@ class TraceHandler(BaseHTTPRequestHandler):
             pass
 
     def _stream_sse(self, idx: int, t0: float, resp, sse_f):
-        # SSE events end with a blank line (\n\n). We read line by line,
-        # forward each chunk to the client with proper HTTP chunked framing,
-        # and accumulate logical events for logging.
+
         buf: list[bytes] = []
         first_byte_logged = False
         client_alive = True
@@ -273,7 +244,7 @@ class TraceHandler(BaseHTTPRequestHandler):
                     t = (time.perf_counter() - t0) * 1000.0
                     sse_f.write(json.dumps({"type": "first_byte", "t_ms": t}) + "\n")
                     first_byte_logged = True
-                # forward as a single chunk
+
                 if client_alive:
                     try:
                         self._write_chunk(line)
@@ -299,7 +270,6 @@ class TraceHandler(BaseHTTPRequestHandler):
         t_ms = (time.perf_counter() - t0) * 1000.0
         sse_f.write(json.dumps({"type": kind, "t_ms": t_ms, "payload": payload}, ensure_ascii=False) + "\n")
 
-
 def _make_handler(out_dir: Path, upstream_url: str):
     parsed = urlparse(upstream_url)
     if not parsed.hostname or not parsed.port:
@@ -315,16 +285,15 @@ def _make_handler(out_dir: Path, upstream_url: str):
     Bound.proxy_log_path = out_dir / "proxy.log"
     return Bound
 
-
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--listen-host", default="127.0.0.1")
     p.add_argument("--listen-port", type=int, required=True)
     p.add_argument("--upstream-url", required=True, help="e.g. http://127.0.0.1:8000")
-    p.add_argument("--out-dir", required=True)
-    args = p.parse_args()
+    p.add_argument("--out-dir", default=None)
+    args = p.parse_args(list(argv) if argv is not None else None)
 
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else create_run_dir("trace", "proxy")
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "requests").mkdir(exist_ok=True)
     (out_dir / "sse").mkdir(exist_ok=True)
@@ -334,6 +303,7 @@ def main() -> int:
     sys.stderr.write(
         f"[proxy] listen={args.listen_host}:{args.listen_port} upstream={args.upstream_url} out={out_dir}\n"
     )
+    sys.stderr.write(f"Output: {out_dir}\n")
     sys.stderr.flush()
     try:
         srv.serve_forever()
@@ -342,7 +312,6 @@ def main() -> int:
     finally:
         srv.server_close()
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

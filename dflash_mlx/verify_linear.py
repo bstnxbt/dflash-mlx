@@ -1,15 +1,20 @@
 # Copyright 2026 bstnxbt
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
+
 from __future__ import annotations
 
-import os
 from typing import Callable, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
 
+from dflash_mlx.internal_debug import (
+    verify_include as _debug_verify_include,
+    verify_max_n as _debug_verify_max_n,
+    verify_qmm_enabled as _debug_verify_qmm_enabled,
+)
 from dflash_mlx.verify_qmm import (
     verify_matmul,
     _auto_variant,
@@ -20,12 +25,6 @@ from dflash_mlx.verify_qmm import (
 )
 
 _VERIFY_MAX_N_DEFAULT = 100_000
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except ValueError:
-        return default
 
 _PROJ_TAGS = {
     "mlp.gate_proj":        "mlp_gate",
@@ -60,9 +59,9 @@ def is_verify_eligible(ql: nn.QuantizedLinear, path: str = "") -> bool:
     K = int(w.shape[1]) * (32 // ql.bits)
     if N % 32 != 0 or K % 32 != 0:
         return False
-    if N >= _env_int("DFLASH_VERIFY_MAX_N", _VERIFY_MAX_N_DEFAULT):
+    if N >= _debug_verify_max_n(_VERIFY_MAX_N_DEFAULT):
         return False
-    include = os.environ.get("DFLASH_VERIFY_INCLUDE", "all").strip().lower()
+    include = _debug_verify_include()
     if include not in ("", "all"):
         tag = _path_tag(path)
         allowed = {s.strip() for s in include.split(",") if s.strip()}
@@ -79,7 +78,12 @@ def is_verify_eligible(ql: nn.QuantizedLinear, path: str = "") -> bool:
 class VerifyQuantizedLinear(nn.QuantizedLinear):
 
     @classmethod
-    def from_quantized(cls, ql: nn.QuantizedLinear) -> "VerifyQuantizedLinear":
+    def from_quantized(
+        cls,
+        ql: nn.QuantizedLinear,
+        *,
+        enable_qmm: Optional[bool] = None,
+    ) -> "VerifyQuantizedLinear":
         obj = cls.__new__(cls)
         nn.Module.__init__(obj)
         obj.group_size = ql.group_size
@@ -92,7 +96,7 @@ class VerifyQuantizedLinear(nn.QuantizedLinear):
         if "bias" in ql:
             obj.bias = ql.bias
 
-        object.__setattr__(obj, "_call_fn", _build_dispatch(obj))
+        object.__setattr__(obj, "_call_fn", _build_dispatch(obj, enable_qmm=enable_qmm))
 
         obj.freeze()
         return obj
@@ -100,7 +104,11 @@ class VerifyQuantizedLinear(nn.QuantizedLinear):
     def __call__(self, x: mx.array) -> mx.array:
         return self._call_fn(x)
 
-def _build_dispatch(obj: "VerifyQuantizedLinear"):
+def _build_dispatch(
+    obj: "VerifyQuantizedLinear",
+    *,
+    enable_qmm: Optional[bool] = None,
+):
     w = obj.weight
     s = obj.scales
     b = getattr(obj, "biases", None)
@@ -113,11 +121,13 @@ def _build_dispatch(obj: "VerifyQuantizedLinear"):
     N = int(w.shape[0])
     K = int(w.shape[1]) * (32 // bits)
 
-    if (
-        os.environ.get("DFLASH_VERIFY_QMM", "") == "1"
-        and N % 32 == 0
-        and K % 32 == 0
-    ):
+    qmm_enabled = (
+        _debug_verify_qmm_enabled()
+        if enable_qmm is None
+        else bool(enable_qmm)
+    )
+
+    if qmm_enabled and N % 32 == 0 and K % 32 == 0:
         variant, auto_kp = _auto_variant(K, N)
         K_PARTS = auto_kp
         if variant == "mma2big_pipe" and K % (32 * K_PARTS) != 0:
@@ -244,6 +254,7 @@ def install_verify_linears(
     model: nn.Module,
     *,
     predicate: Optional[Callable[[str, nn.QuantizedLinear], bool]] = None,
+    enable_qmm: Optional[bool] = None,
 ) -> int:
     if predicate is None:
         predicate = lambda path, m: is_verify_eligible(m, path=path)
@@ -256,7 +267,7 @@ def install_verify_linears(
             return m
         if isinstance(m, nn.QuantizedLinear) and predicate(path, m):
             count += 1
-            return VerifyQuantizedLinear.from_quantized(m)
+            return VerifyQuantizedLinear.from_quantized(m, enable_qmm=enable_qmm)
         return m
 
     leaves = model.leaf_modules()

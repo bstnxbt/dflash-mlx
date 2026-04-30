@@ -1,3 +1,7 @@
+# Copyright 2026 bstnxbt
+# MIT License — see LICENSE file
+# Based on DFlash (arXiv:2602.06036)
+
 from __future__ import annotations
 
 import os
@@ -11,24 +15,19 @@ from dflash_mlx.cache.codecs import target_cache_is_serializable
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
-from dflash_mlx.engine.config import _resolve_target_fa_window
 from dflash_mlx.engine.rollback import restore_target_cache_after_acceptance
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
-
 class _FakeLinearAttn:
     conv_kernel_size = 4
-
 
 class _FakeGdnLayer:
     is_linear = True
     linear_attn = _FakeLinearAttn()
 
-
 class _FakeFaLayer:
     is_linear = False
     self_attn = object()
-
 
 class _FakeTarget:
     def __init__(self) -> None:
@@ -40,7 +39,6 @@ class _FakeTarget:
             ]
         )
 
-
 def _make_prefix_key(target_fa_window: int) -> DFlashPrefixKey:
     return DFlashPrefixKey(
         target_model_id="target",
@@ -51,6 +49,14 @@ def _make_prefix_key(target_fa_window: int) -> DFlashPrefixKey:
         target_fa_window=target_fa_window,
     )
 
+def _runtime_context(*, target_fa_window: int = 0, prefix_cache: bool = True):
+    return SimpleNamespace(
+        runtime=SimpleNamespace(
+            target_fa_window=target_fa_window,
+            prefix_cache=prefix_cache,
+        ),
+        diagnostics=SimpleNamespace(trace=None),
+    )
 
 def _keys(n_tokens: int, *, offset: int = 0) -> mx.array:
     return (
@@ -58,25 +64,33 @@ def _keys(n_tokens: int, *, offset: int = 0) -> mx.array:
         .reshape(1, 1, n_tokens, 4)
     )
 
+def test_target_fa_window_startup_env_parser(monkeypatch):
+    from dflash_mlx.server.config import build_parser, normalize_cli_args
 
-def test_target_fa_window_env_parser(monkeypatch):
     monkeypatch.delenv("DFLASH_TARGET_FA_WINDOW", raising=False)
-    assert _resolve_target_fa_window() == 0
+    args = build_parser().parse_args(["--model", "target"])
+    normalize_cli_args(args)
+    assert args.runtime_config.target_fa_window == 0
 
     monkeypatch.setenv("DFLASH_TARGET_FA_WINDOW", "2048")
-    assert _resolve_target_fa_window() == 2048
+    args = build_parser().parse_args(["--model", "target"])
+    normalize_cli_args(args)
+    assert args.runtime_config.target_fa_window == 2048
 
     monkeypatch.setenv("DFLASH_TARGET_FA_WINDOW", "")
-    assert _resolve_target_fa_window() == 0
+    args = build_parser().parse_args(["--model", "target"])
+    normalize_cli_args(args)
+    assert args.runtime_config.target_fa_window == 0
 
     monkeypatch.setenv("DFLASH_TARGET_FA_WINDOW", "-1")
-    with pytest.raises(ValueError):
-        _resolve_target_fa_window()
+    args = build_parser().parse_args(["--model", "target"])
+    with pytest.raises(SystemExit, match="target_fa_window"):
+        normalize_cli_args(args)
 
     monkeypatch.setenv("DFLASH_TARGET_FA_WINDOW", "not-int")
-    with pytest.raises(ValueError):
-        _resolve_target_fa_window()
-
+    args = build_parser().parse_args(["--model", "target"])
+    with pytest.raises(SystemExit):
+        normalize_cli_args(args)
 
 def test_target_cache_default_keeps_fa_kvcache_and_gdn_rollback(monkeypatch):
     import dflash_mlx.runtime as runtime
@@ -94,17 +108,16 @@ def test_target_cache_default_keeps_fa_kvcache_and_gdn_rollback(monkeypatch):
     assert isinstance(caches[1], RecurrentRollbackCache)
     assert isinstance(caches[2], KVCache)
 
-
 def test_target_cache_window_rotates_fa_only_and_leaves_gdn_unchanged(monkeypatch):
     import dflash_mlx.runtime as runtime
 
-    monkeypatch.setenv("DFLASH_TARGET_FA_WINDOW", "2048")
     monkeypatch.setattr(runtime, "_install_target_speculative_hooks", lambda _model: None)
 
     caches = runtime.make_target_cache(
         _FakeTarget(),
         enable_speculative_linear_cache=True,
         quantize_kv_cache=False,
+        target_fa_window=2048,
     )
 
     assert isinstance(caches[0], RotatingKVCache)
@@ -114,18 +127,16 @@ def test_target_cache_window_rotates_fa_only_and_leaves_gdn_unchanged(monkeypatc
     assert caches[2].max_size == 2048
     assert target_cache_is_serializable(caches) is False
 
-
 def test_target_cache_window_rejects_quantized_target_kv(monkeypatch):
     import dflash_mlx.runtime as runtime
 
-    monkeypatch.setenv("DFLASH_TARGET_FA_WINDOW", "2048")
-    with pytest.raises(ValueError, match="DFLASH_TARGET_FA_WINDOW"):
+    with pytest.raises(ValueError, match="target_fa_window"):
         runtime.make_target_cache(
             _FakeTarget(),
             enable_speculative_linear_cache=False,
             quantize_kv_cache=True,
+            target_fa_window=2048,
         )
-
 
 def test_prefix_cache_fingerprint_separates_target_fa_window():
     prompt = [1, 2, 3, 4]
@@ -134,7 +145,7 @@ def test_prefix_cache_fingerprint_separates_target_fa_window():
     assert key_full != key_windowed
 
     cache = DFlashPrefixCache(max_entries=4)
-    snap = DFlashPrefixSnapshot(
+    snap = DFlashPrefixSnapshot.from_full_target_hidden(
         token_ids=tuple(prompt),
         fa_states=(),
         gdn_states=(),
@@ -146,7 +157,6 @@ def test_prefix_cache_fingerprint_separates_target_fa_window():
     matched, found = cache.lookup(prompt, key_windowed)
     assert matched == 0
     assert found is None
-
 
 def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
     import dflash_mlx.server.prefix_cache_flow as flow_mod
@@ -163,8 +173,6 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
         def convert_tokens_to_ids(self, tokens):
             return [-1 for _ in tokens]
 
-    monkeypatch.setenv("DFLASH_PREFIX_CACHE", "1")
-    monkeypatch.setenv("DFLASH_TARGET_FA_WINDOW", "2048")
     monkeypatch.setattr(flow_mod, "_DFLASH_PREFIX_CACHE_SINGLETON", DFlashPrefixCache())
 
     flow = flow_mod.PrefixCacheFlow.for_request(
@@ -172,13 +180,13 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
         draft_model=FakeDraft(),
         tokenizer=FakeTokenizer(),
         prompt=[1, 2, 3],
+        runtime_context=_runtime_context(target_fa_window=2048),
     )
 
     assert flow.cache is None
     assert flow.key is None
     assert flow.hit_tokens == 0
     assert flow.snapshot is None
-
 
 def test_build_prefix_key_records_target_fa_window(monkeypatch):
     from dflash_mlx.server.prefix_cache_manager import build_prefix_key
@@ -189,12 +197,14 @@ def test_build_prefix_key_records_target_fa_window(monkeypatch):
     class FakeDraft:
         target_layer_ids = [3, 7]
 
-    monkeypatch.setenv("DFLASH_TARGET_FA_WINDOW", "4096")
-    key = build_prefix_key(FakeProvider(), FakeDraft())
+    key = build_prefix_key(
+        FakeProvider(),
+        FakeDraft(),
+        _runtime_context(target_fa_window=4096),
+    )
     assert key.target_fa_window == 4096
 
-
-def test_serve_cli_target_fa_window_sets_env(monkeypatch):
+def test_serve_cli_target_fa_window_sets_runtime_config(monkeypatch):
     from dflash_mlx.server.config import build_parser, normalize_cli_args
 
     monkeypatch.delenv("DFLASH_TARGET_FA_WINDOW", raising=False)
@@ -202,9 +212,8 @@ def test_serve_cli_target_fa_window_sets_env(monkeypatch):
         ["--model", "target", "--target-fa-window", "4096"]
     )
     normalize_cli_args(args)
-    assert os.environ["DFLASH_TARGET_FA_WINDOW"] == "4096"
-    os.environ.pop("DFLASH_TARGET_FA_WINDOW", None)
-
+    assert args.runtime_config.target_fa_window == 4096
+    assert "DFLASH_TARGET_FA_WINDOW" not in os.environ
 
 def test_serve_cli_target_fa_window_rejects_negative():
     from dflash_mlx.server.config import build_parser, normalize_cli_args
@@ -214,7 +223,6 @@ def test_serve_cli_target_fa_window_rejects_negative():
     )
     with pytest.raises(SystemExit, match="--target-fa-window"):
         normalize_cli_args(args)
-
 
 def test_fallback_ar_forces_target_fa_window_zero(monkeypatch):
     import dflash_mlx.engine.fallback as fallback
@@ -226,7 +234,6 @@ def test_fallback_ar_forces_target_fa_window_zero(monkeypatch):
         calls.append(kwargs)
         return ["cache"]
 
-    monkeypatch.setenv("DFLASH_TARGET_FA_WINDOW", "2048")
     monkeypatch.setattr(runtime, "make_target_cache", fake_make_target_cache)
 
     cache = fallback._make_fallback_target_cache(
@@ -242,7 +249,6 @@ def test_fallback_ar_forces_target_fa_window_zero(monkeypatch):
             "target_fa_window": 0,
         }
     ]
-
 
 def test_rotating_kv_trim_survives_logical_positions_past_cache_length():
     cache = RotatingKVCache(max_size=8)

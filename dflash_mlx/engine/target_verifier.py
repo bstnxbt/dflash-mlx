@@ -1,13 +1,13 @@
 # Copyright 2026 bstnxbt
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
+
 from __future__ import annotations
 
 from typing import Any, Optional
 
 import mlx.core as mx
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
-
 
 def _target_text_wrapper(target_model: Any) -> Any:
     if hasattr(target_model, "model"):
@@ -16,13 +16,11 @@ def _target_text_wrapper(target_model: Any) -> Any:
         return target_model.language_model
     raise AttributeError(f"Unsupported target model wrapper: {type(target_model)!r}")
 
-
 def _target_text_model(target_model: Any) -> Any:
     wrapper = _target_text_wrapper(target_model)
     if hasattr(wrapper, "model"):
         return wrapper.model
     raise AttributeError(f"Unsupported target text model: {type(wrapper)!r}")
-
 
 def _lm_head_logits(target_model: Any, hidden_states: mx.array) -> mx.array:
     wrapper = _target_text_wrapper(target_model)
@@ -30,14 +28,12 @@ def _lm_head_logits(target_model: Any, hidden_states: mx.array) -> mx.array:
         return wrapper.model.embed_tokens.as_linear(hidden_states)
     return wrapper.lm_head(hidden_states)
 
-
 def extract_context_feature_from_dict(
     captured_dict: dict[int, mx.array],
     target_layer_ids: list[int],
 ) -> mx.array:
     selected = [captured_dict[layer_id + 1] for layer_id in target_layer_ids]
     return mx.concatenate(selected, axis=-1)
-
 
 def target_forward_with_hidden_states(
     target_model: Any,
@@ -82,7 +78,6 @@ def target_forward_with_hidden_states(
     normalized = inner.norm(h)
     logits = _lm_head_logits(target_model, normalized)
     return logits, captured
-
 
 def verify_target_block(
     *,

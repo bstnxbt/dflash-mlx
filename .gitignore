@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 *.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+examples/__pycache__/
 dist/
 build/
 .eggs/
@@ -16,6 +20,7 @@ codedb.snapshot
 old_status/
 status_archive/
 .tmp/
+.artifacts/
 research/
 mlx/
 ACTIVE.md

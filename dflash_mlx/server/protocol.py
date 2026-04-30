@@ -8,9 +8,7 @@ from typing import Any, Optional
 
 import mlx_lm.server as mlx_server
 
-
 STATEFUL_SERVER_API = "state" in getattr(mlx_server.Response, "__annotations__", {})
-
 
 def build_generation_context(tokenizer, prompt, stop_words=None, sequences=None):
     if STATEFUL_SERVER_API:
@@ -38,7 +36,6 @@ def build_generation_context(tokenizer, prompt, stop_words=None, sequences=None)
         prompt=prompt,
     )
 
-
 def make_response(
     *,
     text: str,
@@ -64,7 +61,6 @@ def make_response(
         finish_reason,
         (),
     )
-
 
 def match_stream_token(
     sm: Optional[Any],

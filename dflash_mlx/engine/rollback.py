@@ -1,11 +1,11 @@
 # Copyright 2026 bstnxbt
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
+
 from __future__ import annotations
 
 import time
 from typing import Any
-
 
 def arm_target_rollback_with_prefix(
     cache_entries: list[Any],
@@ -15,7 +15,6 @@ def arm_target_rollback_with_prefix(
     for cache_entry in cache_entries:
         if hasattr(cache_entry, "arm_rollback"):
             cache_entry.arm_rollback(prefix_len=int(prefix_len))
-
 
 def clear_rollback_state(cache_entry: Any) -> None:
     if hasattr(cache_entry, "clear_transients"):
@@ -34,7 +33,6 @@ def clear_rollback_state(cache_entry: Any) -> None:
     if hasattr(cache_entry, "_snapshot"):
         cache_entry._snapshot = None
 
-
 def cleanup_generation_caches(
     target_cache: list[Any],
     draft_cache: list[Any],
@@ -44,7 +42,6 @@ def cleanup_generation_caches(
             cache_entry.clear_transients()
     draft_cache.clear()
     target_cache.clear()
-
 
 def restore_target_cache_after_acceptance(
     cache_entries: list[Any],

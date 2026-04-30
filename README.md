@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/a9be2b48-3264-4970-b836-c876b0b7fdda
 
 - **Tape-replay rollback**: instead of snapshotting and restoring the full GatedDeltaNet state, dflash-mlx records an innovation tape during verify and replays only the accepted steps through a custom Metal kernel. Keeps rollback cost low and preserves acceptance over long generations.
 - **JIT SDPA 2-pass**: long-context verify (`N >= 1024`) uses a custom Metal attention kernel that stays numerically aligned with stock MLX attention.
-- **Verify-specialized int4 qmm** (`verify_qmm`): custom Metal simdgroup-MMA kernel for the M=16 quantized matmul that dominates the target verify step. Two shape-adaptive variants (`mma2big`, `mma2big_pipe` with K-split + double-buffered staging). Auto-enabled on MoE targets and dense models with ≥40 layers where the M=16 specialization amortizes over enough layers to beat stock `mx.quantized_matmul` end-to-end. Opt-in override via `DFLASH_VERIFY_LINEAR={0,1}`.
+- **Verify-specialized int4 qmm** (`verify_qmm`): custom Metal simdgroup-MMA kernel for the M=16 quantized matmul that dominates the target verify step. Two shape-adaptive variants (`mma2big`, `mma2big_pipe` with K-split + double-buffered staging). Auto-enabled on MoE targets and dense models with ≥40 layers where the M=16 specialization amortizes over enough layers to beat stock `mx.quantized_matmul` end-to-end. Use `--verify-mode off` only for debug/parity runs.
 - **Numerical coherence**: bf16-sensitive paths, including recurrent state replay and small projections, are stabilized across speculative cycles so accepted tokens stay consistent.
 
 ## Benchmarks
@@ -64,8 +64,6 @@ Protocol: stock `mlx_lm.stream_generate` on a pristine target model vs stock MLX
 
 Generation: prompt `"The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}."` with chat templates enabled by default and post-prefill tok/s as the primary metric.
 
-Full per-run JSON reports are available in [`benchmark/results/`](benchmark/results/).
-
 ## Install
 
 ```bash
@@ -75,7 +73,7 @@ pip install dflash-mlx
 pipx install dflash-mlx
 ```
 
-`dflash-serve` wraps `mlx_lm.server` for full OpenAI-compatible serving semantics, including tools, reasoning, and streaming, while using the DFlash runtime as the generation engine.
+`dflash serve` wraps `mlx_lm.server` for full OpenAI-compatible serving semantics, including tools, reasoning, and streaming, while using the DFlash runtime as the generation engine.
 
 ## Quick start
 
@@ -83,25 +81,20 @@ pipx install dflash-mlx
 PROMPT='The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}.'
 
 # Generate — draft auto-resolved
-dflash --model Qwen/Qwen3.5-9B --prompt "$PROMPT"
+dflash generate --model Qwen/Qwen3.5-9B --prompt "$PROMPT"
 
 # Explicit draft model
-dflash --model Qwen/Qwen3.5-9B --draft z-lab/Qwen3.5-9B-DFlash --prompt "$PROMPT"
+dflash generate --model Qwen/Qwen3.5-9B --draft z-lab/Qwen3.5-9B-DFlash --prompt "$PROMPT"
 
 # Server
-dflash-serve --model Qwen/Qwen3.5-9B --port 8000
-
-# Disable visible thinking/reasoning on models that support it
-dflash-serve --model Qwen/Qwen3.5-9B --port 8000 \
-  --chat-template-args '{"enable_thinking": false}'
+dflash serve --model Qwen/Qwen3.5-9B --port 8000
 
 # Raise the DFlash fallback threshold for longer prompts
-dflash-serve --model mlx-community/Qwen3.5-35B-A3B-4bit --port 8000 \
-  --chat-template-args '{"enable_thinking": false}' \
+dflash serve --model mlx-community/Qwen3.5-35B-A3B-4bit --port 8000 \
   --dflash-max-ctx 16384
 
 # Benchmark
-dflash-benchmark --model Qwen/Qwen3.5-9B --draft z-lab/Qwen3.5-9B-DFlash \
+dflash benchmark --model Qwen/Qwen3.5-9B --draft z-lab/Qwen3.5-9B-DFlash \
   --prompt "$PROMPT" --max-tokens 1024 --repeat 3
 
 # Live demo — baseline vs DFlash side-by-side
@@ -112,7 +105,7 @@ PYTHONPATH=. python3 -m examples.demo --mode dflash \
 
 - Compatible with Open WebUI, Continue, OpenCode, aider, and other OpenAI-compatible clients
 - Streaming SSE support
-- `dflash-serve` requires a supported DFlash draft model (auto-detected from the registry or passed explicitly with `--draft`)
+- `dflash serve` requires a supported DFlash draft model (auto-detected from the registry or passed explicitly with `--draft`)
 
 ## Tested models
 

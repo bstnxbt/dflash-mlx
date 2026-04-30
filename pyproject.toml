@@ -19,11 +19,10 @@ dependencies = [
 Homepage = "https://github.com/bstnxbt/dflash-mlx"
 
 [project.scripts]
-dflash = "dflash_mlx.generate:main"
-dflash-serve = "dflash_mlx.serve:main"
-dflash-benchmark = "benchmark.benchmark:main"
-dflash-opencode-bench = "benchmark.bench_opencode_session:main"
-dflash-pi-bench = "benchmark.bench_pi_session:main"
+dflash = "dflash_mlx.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["dflash_mlx*", "benchmark*"]
+include = ["dflash_mlx*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

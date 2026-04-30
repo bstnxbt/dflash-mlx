@@ -8,7 +8,6 @@ from typing import Optional
 
 import mlx.core as mx
 
-
 def _make_gated_delta_kernel_with_tape(*, has_mask: bool = False, vectorized: bool = False):
     if not mx.metal.is_available():
         return None
@@ -121,12 +120,10 @@ def _make_gated_delta_kernel_with_tape(*, has_mask: bool = False, vectorized: bo
         source=source,
     )
 
-
 _gated_delta_tape_kernel = _make_gated_delta_kernel_with_tape(has_mask=False, vectorized=False)
 _gated_delta_tape_kernel_masked = _make_gated_delta_kernel_with_tape(has_mask=True, vectorized=False)
 _gated_delta_tape_kernel_vec = _make_gated_delta_kernel_with_tape(has_mask=False, vectorized=True)
 _gated_delta_tape_kernel_vec_masked = _make_gated_delta_kernel_with_tape(has_mask=True, vectorized=True)
-
 
 def _gated_delta_ops_with_tape(
     q: mx.array,
@@ -171,7 +168,6 @@ def _gated_delta_ops_with_tape(
         outputs.append(y)
         tape.append(delta.astype(mx.float32))
     return mx.stack(outputs, axis=1), state, mx.stack(tape, axis=1)
-
 
 def gated_delta_kernel_with_tape(
     q: mx.array,
@@ -222,7 +218,6 @@ def gated_delta_kernel_with_tape(
         output_shapes=[(B, T, Hv, Dv), state.shape, (B, T, Hv, Dv)],
         output_dtypes=[input_type, input_type, mx.float32],
     )
-
 
 def _make_tape_replay_kernel(*, has_mask: bool = False, vectorized: bool = False):
     if not mx.metal.is_available():
@@ -310,7 +305,6 @@ def _make_tape_replay_kernel(*, has_mask: bool = False, vectorized: bool = False
         source=source,
     )
 
-
 _tape_replay_kernel = _make_tape_replay_kernel(
     has_mask=False, vectorized=False
 )
@@ -323,7 +317,6 @@ _tape_replay_kernel_vec = _make_tape_replay_kernel(
 _tape_replay_kernel_vec_masked = _make_tape_replay_kernel(
     has_mask=True, vectorized=True
 )
-
 
 def _tape_replay_ops(
     tape: mx.array,
@@ -356,7 +349,6 @@ def _tape_replay_ops(
             step_mask = mask[:, t][:, None, None, None]
             state = mx.where(step_mask, state, prev_state)
     return state
-
 
 def tape_replay_kernel(
     tape: mx.array,
@@ -406,11 +398,10 @@ def tape_replay_kernel(
     )
     return state_out
 
-
 def _compute_sdpa_2pass_blocks(gqa_factor: int, n_kv: int, device_arch: Optional[str] = None) -> int:
     arch = device_arch or str(mx.device_info().get("architecture", ""))
     devc = arch[-1] if arch else ""
-    n_simds = int(gqa_factor)  # Match AR qL=1 dispatch heuristic.
+    n_simds = int(gqa_factor)
     N = int(n_kv)
 
     if devc == "d":
@@ -437,7 +428,6 @@ def _compute_sdpa_2pass_blocks(gqa_factor: int, n_kv: int, device_arch: Optional
         blocks = 64 if n_simds >= 4 else 32
 
     return int(blocks)
-
 
 def _make_batched_sdpa_2pass_partials_kernel(*, has_mask: bool = False):
     if not mx.metal.is_available():
@@ -571,7 +561,6 @@ def _make_batched_sdpa_2pass_partials_kernel(*, has_mask: bool = False):
         source=source,
     )
 
-
 def _make_batched_sdpa_2pass_reduce_kernel():
     if not mx.metal.is_available():
         return None
@@ -644,7 +633,6 @@ def _make_batched_sdpa_2pass_reduce_kernel():
         source=source,
     )
 
-
 _batched_sdpa_2pass_partials_kernel = _make_batched_sdpa_2pass_partials_kernel(
     has_mask=False
 )
@@ -652,8 +640,6 @@ _batched_sdpa_2pass_partials_kernel_masked = _make_batched_sdpa_2pass_partials_k
     has_mask=True
 )
 _batched_sdpa_2pass_reduce_kernel = _make_batched_sdpa_2pass_reduce_kernel()
-
-
 
 def batched_sdpa_2pass_exact(
     queries: mx.array,

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-
 def match_acceptance_length(
     drafted_tokens: mx.array,
     posterior_tokens: mx.array,

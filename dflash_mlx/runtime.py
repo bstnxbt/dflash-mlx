@@ -2,7 +2,6 @@
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
 
-import os
 import re
 import sys
 import time
@@ -18,18 +17,16 @@ from mlx_lm.models import gated_delta as gated_delta_mod
 from mlx_lm.models.base import scaled_dot_product_attention
 from mlx_lm.utils import load, load_model
 
-from dflash_mlx.adapter import detect_engine
 from dflash_mlx.draft_backend import make_draft_backend
+from dflash_mlx.internal_debug import (
+    verify_linear_override as _debug_verify_linear_override,
+    verify_qmm_enabled as _debug_verify_qmm_enabled,
+)
 from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
 from dflash_mlx.engine.config import (
-    _draft_window_override_enabled,
     _effective_draft_window_size,
     _is_unwindowed_full_attention_draft,
     _profile_dflash_cycles_enabled,
-    _resolve_dflash_max_ctx,
-    _resolve_draft_window,
-    _resolve_target_fa_window,
-    _resolve_verify_len_cap,
 )
 from dflash_mlx.engine.prefill import (
     compute_snapshot_boundary,
@@ -65,6 +62,13 @@ def resolve_model_ref(model_ref: str | Path | None, *, kind: str) -> str:
         candidate = Path(model_ref).expanduser()
         return str(candidate if candidate.exists() else model_ref)
     raise ValueError(f"{kind} model reference is required")
+
+def get_stop_token_ids(tokenizer: Any) -> list[int]:
+    eos_token_ids = list(getattr(tokenizer, "eos_token_ids", None) or [])
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None and eos_token_id not in eos_token_ids:
+        eos_token_ids.append(int(eos_token_id))
+    return eos_token_ids
 
 def default_split_sdpa_enabled(model_ref: str | Path | None) -> bool:
     resolved_ref = resolve_model_ref(model_ref, kind="target")
@@ -150,6 +154,18 @@ def _ns_to_us(ns: int | float) -> float:
     return float(ns) / 1_000.0
 
 @dataclass(frozen=True)
+class VerifyConfig:
+    mode: str = "auto"
+    enable_qmm: bool = True
+
+    @classmethod
+    def from_mode(cls, mode: str | None) -> "VerifyConfig":
+        resolved = (mode or "auto").strip().lower()
+        if resolved not in ("auto", "off"):
+            raise ValueError("verify mode must be auto or off")
+        return cls(mode=resolved)
+
+@dataclass(frozen=True)
 class DraftQuantSpec:
     weight_bits: int
     group_size: int
@@ -177,7 +193,7 @@ def parse_draft_quant_spec(spec: str) -> DraftQuantSpec:
     return DraftQuantSpec(weight_bits=wb, group_size=gs, act_bits=ab)
 
 def _resolve_draft_quant(draft_quant: str | None) -> DraftQuantSpec | None:
-    spec = draft_quant or os.environ.get("DFLASH_DRAFT_QUANT", "").strip()
+    spec = (draft_quant or "").strip()
     if not spec:
         return None
     return parse_draft_quant_spec(spec)
@@ -587,16 +603,12 @@ def make_target_cache(
     quantize_kv_cache: bool = False,
     target_fa_window: Optional[int] = None,
 ) -> list[Any]:
-    fa_window = (
-        _resolve_target_fa_window()
-        if target_fa_window is None
-        else int(target_fa_window)
-    )
+    fa_window = 0 if target_fa_window is None else int(target_fa_window)
     if fa_window < 0:
         raise ValueError("target_fa_window must be >= 0")
     if fa_window > 0 and quantize_kv_cache:
         raise ValueError(
-            "DFLASH_TARGET_FA_WINDOW does not support quantized target KV cache"
+            "target_fa_window does not support quantized target KV cache"
         )
     text_model = _target_text_model(target_model)
     caches: list[Any] = []
@@ -629,6 +641,7 @@ def load_target_bundle(
     split_full_attention_sdpa: Optional[bool] = None,
     split_full_attention_chunk_size: int = 8,
     quantize_kv_cache: bool = False,
+    verify_config: VerifyConfig | None = None,
 ):
     resolved_ref = resolve_model_ref(model_ref, kind="target")
     split_enabled = (
@@ -660,21 +673,30 @@ def load_target_bundle(
             pack_mlp=True,
             pack_attention=pack_attention_weights,
         )
-    verify_linear_enabled = _verify_enabled_for(config)
+    verify_linear_enabled = _verify_enabled_for(config, verify_config=verify_config)
     meta["verify_linear_enabled"] = bool(verify_linear_enabled)
+    meta["verify_mode"] = (verify_config.mode if verify_config is not None else "env")
     if verify_linear_enabled:
-        os.environ.setdefault("DFLASH_VERIFY_QMM", "1")
         from dflash_mlx.verify_linear import install_verify_linears
-        n_swapped = install_verify_linears(model)
+        n_swapped = install_verify_linears(
+            model,
+            enable_qmm=_verify_qmm_enabled(verify_config),
+        )
         meta["verify_linear_swapped"] = n_swapped
     return model, tokenizer, meta
 
-def _verify_enabled_for(config: Any) -> bool:
-    override = os.environ.get("DFLASH_VERIFY_LINEAR", "").strip()
-    if override == "1":
-        return True
-    if override == "0":
-        return False
+def _verify_enabled_for(
+    config: Any,
+    *,
+    verify_config: VerifyConfig | None = None,
+) -> bool:
+    if verify_config is not None:
+        if verify_config.mode == "off":
+            return False
+    else:
+        override = _debug_verify_linear_override()
+        if override is not None:
+            return override
     try:
         text_cfg = config.get("text_config", config) if isinstance(config, dict) else config
         num_experts = int(text_cfg.get("num_experts", 0) or 0)
@@ -694,6 +716,11 @@ def _verify_enabled_for(config: Any) -> bool:
             return False
         return True
     return num_layers >= 40
+
+def _verify_qmm_enabled(verify_config: VerifyConfig | None) -> bool:
+    if verify_config is not None:
+        return bool(verify_config.enable_qmm)
+    return _debug_verify_qmm_enabled()
 
 def load_draft_bundle(
     model_ref: str | Path | None = None,
@@ -715,9 +742,8 @@ def load_draft_bundle(
     if quant_spec is not None:
         nn.quantize(model, bits=quant_spec.weight_bits, group_size=quant_spec.group_size)
         if quant_spec.weight_bits in (4, 8):
-            os.environ.setdefault("DFLASH_VERIFY_QMM", "1")
             from dflash_mlx.verify_linear import install_verify_linears, prewarm_verify_kernels
-            install_verify_linears(model)
+            install_verify_linears(model, enable_qmm=True)
             prewarm_verify_kernels(model)
         if quant_spec.act_bits == 32:
             def _cast_to_f32(_, x: mx.array) -> mx.array:
@@ -741,12 +767,13 @@ def load_draft_bundle(
     }
 
 def stream_dflash_generate(**kwargs: Any) -> Iterator[dict[str, Any]]:
+    if kwargs.get("runtime_context") is None:
+        raise ValueError("runtime_context is required")
     gen_stream = mx.default_stream(mx.default_device())
     with mx.stream(gen_stream):
         yield from _stream_dflash_generate_impl(**kwargs)
 
-
-from dflash_mlx.engine.fallback import stream_baseline_generate  # noqa: E402
-from dflash_mlx.engine.spec_epoch import (  # noqa: E402
+from dflash_mlx.engine.fallback import stream_baseline_generate
+from dflash_mlx.engine.spec_epoch import (
     stream_dflash_generate_impl as _stream_dflash_generate_impl,
 )

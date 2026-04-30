@@ -10,7 +10,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 
-
 def _make_fallback_target_cache(
     target_model: Any,
     *,
@@ -24,7 +23,6 @@ def _make_fallback_target_cache(
         quantize_kv_cache=quantize_kv_cache,
         target_fa_window=0,
     )
-
 
 def stream_baseline_generate(
     *,

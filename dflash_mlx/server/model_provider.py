@@ -15,7 +15,6 @@ from dflash_mlx.generate import (
     resolve_optional_draft_ref,
 )
 
-
 class DFlashModelProvider(mlx_server.ModelProvider):
     def load(self, model_path, adapter_path=None, draft_model_path=None):
         default_map = getattr(self, "_model_map", None)
@@ -54,6 +53,7 @@ class DFlashModelProvider(mlx_server.ModelProvider):
             model_ref=model_ref,
             draft_ref=draft_ref,
             draft_quant=draft_quant or None,
+            verify_config=self.cli_args.runtime_context.verify,
         )
 
         if self.cli_args.chat_template:
@@ -79,7 +79,6 @@ class DFlashModelProvider(mlx_server.ModelProvider):
             sys.stderr.flush()
 
         return self.model, self.tokenizer
-
 
 def wait_for_initial_model_load(
     model_provider: DFlashModelProvider,

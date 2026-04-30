@@ -26,14 +26,11 @@ from dflash_mlx.runtime import (
     stream_dflash_generate,
 )
 
-
 DEFAULT_PROMPT = "Implement a REST API with auth"
 CONTENT_START_ROW = 4
 
-
 def _is_tty() -> bool:
     return sys.stdout.isatty()
-
 
 def _terminal_rows() -> int:
     try:
@@ -41,19 +38,16 @@ def _terminal_rows() -> int:
     except OSError:
         return 24
 
-
 def _terminal_cols() -> int:
     try:
         return os.get_terminal_size(sys.stdout.fileno()).columns
     except OSError:
         return 100
 
-
 def _colorize(text: str, sgr: str) -> str:
     if not _is_tty():
         return text
     return f"\x1b[{sgr}m{text}\x1b[0m"
-
 
 def _center_text(text: str) -> str:
     width = _terminal_cols()
@@ -61,10 +55,7 @@ def _center_text(text: str) -> str:
         return text
     return text.center(width)
 
-
 def _machine_label() -> str:
-    if label := os.environ.get("DFLASH_DEMO_MACHINE", "").strip():
-        return label
     try:
         chip = subprocess.check_output(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
@@ -77,14 +68,12 @@ def _machine_label() -> str:
     except Exception:
         return "local"
 
-
 def _get_stop_token_ids(tokenizer: Any) -> list[int]:
     eos_token_ids = list(getattr(tokenizer, "eos_token_ids", None) or [])
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     if eos_token_id is not None and eos_token_id not in eos_token_ids:
         eos_token_ids.append(int(eos_token_id))
     return eos_token_ids
-
 
 def _display_target_label(model_ref: str) -> str:
     ref = str(model_ref)
@@ -98,21 +87,17 @@ def _display_target_label(model_ref: str) -> str:
         return "Qwen 27B nvfp4"
     return Path(ref).name or ref
 
-
 @contextlib.contextmanager
 def _suppress_load_noise():
     with open(os.devnull, "w") as devnull:
         with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
             yield
 
-
 def _save_cursor() -> None:
     sys.stdout.write("\x1b7")
 
-
 def _restore_cursor() -> None:
     sys.stdout.write("\x1b8")
-
 
 def _write_status_line(text: str) -> None:
     if not _is_tty():
@@ -124,7 +109,6 @@ def _write_status_line(text: str) -> None:
     _restore_cursor()
     sys.stdout.flush()
 
-
 def _clear_status_line() -> None:
     if not _is_tty():
         return
@@ -133,7 +117,6 @@ def _clear_status_line() -> None:
     sys.stdout.write("\x1b[2K")
     _restore_cursor()
     sys.stdout.flush()
-
 
 def _finalize_output(
     *,
@@ -158,19 +141,16 @@ def _finalize_output(
         sys.stdout.write("\n")
     sys.stdout.flush()
 
-
 def _maybe_decode_token(tokenizer: Any, token_id: int) -> str:
     try:
         return str(tokenizer.decode([int(token_id)]))
     except Exception:
         return str(tokenizer.decode(int(token_id)))
 
-
 def _live_tps(first_token_at: Optional[float], token_count: int) -> float:
     if first_token_at is None or token_count <= 0:
         return 0.0
     return token_count / max(1e-9, time.monotonic() - first_token_at)
-
 
 def _avg_tps_since_prefill(
     *,
@@ -182,7 +162,6 @@ def _avg_tps_since_prefill(
         return 0.0
     generation_s = max(1e-9, time.monotonic() - started_at - (prefill_us / 1e6))
     return token_count / generation_s
-
 
 def _sample_tps(
     *,
@@ -201,7 +180,6 @@ def _sample_tps(
         return previous_current_tps if previous_current_tps > 0.0 else _live_tps(first_token_at, token_count)
     return (token_count - last_status_tokens) / max(1e-9, now - last_status_at)
 
-
 def _print_header(mode: str) -> None:
     title = "MLX stock" if mode == "baseline" else "DFlash"
     if _is_tty():
@@ -213,7 +191,6 @@ def _print_header(mode: str) -> None:
     else:
         sys.stdout.write(f"{title}\n\n")
     sys.stdout.flush()
-
 
 def _print_prompt_panel(
     prompt: str,
@@ -265,7 +242,6 @@ def _print_prompt_panel(
     sys.stdout.write(f"\x1b[{content_start_row};1H")
     sys.stdout.flush()
 
-
 def _update_baseline_status(
     *,
     started_at: float,
@@ -277,7 +253,6 @@ def _update_baseline_status(
     _write_status_line(
         f"cur {current_tps:.1f} tok/s | avg {_avg_tps_since_prefill(started_at=started_at, prefill_us=prefill_us, token_count=token_count):.1f} tok/s | {token_count} tokens"
     )
-
 
 def _update_dflash_status(
     *,
@@ -292,7 +267,6 @@ def _update_dflash_status(
     _write_status_line(
         f"cur {current_tps:.1f} tok/s | avg {_avg_tps_since_prefill(started_at=started_at, prefill_us=prefill_us, token_count=token_count):.1f} tok/s | {token_count} tokens{accept_text}"
     )
-
 
 def run_baseline(
     *,
@@ -382,7 +356,6 @@ def run_baseline(
         footer_sgr="1;34",
     )
     return 0
-
 
 def run_dflash(
     *,
@@ -488,7 +461,6 @@ def run_dflash(
     )
     return 0
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal capture-friendly DFlash demo without Rich.")
     parser.add_argument("--mode", choices=("baseline", "dflash"), required=True)
@@ -501,7 +473,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quantize-kv-cache", action="store_true")
     parser.add_argument("--no-eos", action="store_true")
     return parser.parse_args()
-
 
 def main() -> None:
     if mx.metal.is_available():
@@ -564,7 +535,6 @@ def main() -> None:
             no_eos=args.no_eos,
         )
     )
-
 
 if __name__ == "__main__":
     main()

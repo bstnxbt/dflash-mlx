@@ -5,15 +5,20 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
+from collections.abc import Sequence
 from typing import Any, Optional
 
-import mlx.core as mx
+from dflash_mlx.metal_limits import apply_metal_limits
 from dflash_mlx.runtime import (
+    VerifyConfig,
+    get_stop_token_ids,
     load_draft_bundle,
     load_target_bundle,
     stream_dflash_generate,
+)
+from dflash_mlx.runtime_context import (
+    build_offline_runtime_context,
 )
 
 DRAFT_REGISTRY = {
@@ -36,13 +41,6 @@ def _supported_base_models() -> str:
 
 def _strip_model_org(model_ref: str) -> str:
     return str(model_ref).rsplit("/", 1)[-1].strip()
-
-def get_stop_token_ids(tokenizer: Any) -> list[int]:
-    eos_token_ids = list(getattr(tokenizer, "eos_token_ids", None) or [])
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_token_id is not None and eos_token_id not in eos_token_ids:
-        eos_token_ids.append(int(eos_token_id))
-    return eos_token_ids
 
 def resolve_optional_draft_ref(model_ref: str, draft_ref: Optional[str]) -> Optional[str]:
     if draft_ref:
@@ -87,6 +85,7 @@ def load_runtime_components(
     model_ref: str,
     draft_ref: Optional[str],
     draft_quant: Optional[str] = None,
+    verify_config: Optional[VerifyConfig] = None,
 ):
     resolved_draft_ref = resolve_optional_draft_ref(model_ref, draft_ref)
     if not resolved_draft_ref:
@@ -95,7 +94,11 @@ def load_runtime_components(
             f"Use --draft to specify one, or check https://huggingface.co/z-lab for available drafts.\n"
             f"Supported base models: {_supported_base_models()}"
         )
-    target_model, tokenizer, _ = load_target_bundle(model_ref, lazy=True)
+    target_model, tokenizer, _ = load_target_bundle(
+        model_ref,
+        lazy=True,
+        verify_config=verify_config,
+    )
     try:
         draft_model, _ = load_draft_bundle(resolved_draft_ref, lazy=True, draft_quant=draft_quant)
     except Exception as exc:
@@ -112,11 +115,22 @@ def run_generate(
     use_chat_template: bool,
     draft_ref: Optional[str],
     target_fa_window: int = 0,
+    draft_sink_size: int = 64,
+    draft_window_size: int = 1024,
+    verify_len_cap: int = 0,
+    verify_mode: str = "auto",
 ) -> int:
-    os.environ["DFLASH_TARGET_FA_WINDOW"] = str(int(target_fa_window))
+    runtime_context = build_offline_runtime_context(
+        target_fa_window=target_fa_window,
+        draft_sink_size=draft_sink_size,
+        draft_window_size=draft_window_size,
+        verify_len_cap=verify_len_cap,
+        verify_mode=verify_mode,
+    )
     target_model, tokenizer, draft_model, _ = load_runtime_components(
         model_ref=model_ref,
         draft_ref=draft_ref,
+        verify_config=runtime_context.verify,
     )
     stop_token_ids = get_stop_token_ids(tokenizer)
     stream = stream_dflash_generate(
@@ -127,6 +141,7 @@ def run_generate(
         max_new_tokens=max_tokens,
         use_chat_template=use_chat_template,
         stop_token_ids=stop_token_ids,
+        runtime_context=runtime_context,
     )
 
     summary: Optional[dict[str, Any]] = None
@@ -149,16 +164,20 @@ def run_generate(
     sys.stderr.flush()
     return 0
 
-def main() -> None:
-    if mx.metal.is_available():
-        wired_limit = mx.device_info()["max_recommended_working_set_size"]
-        mx.set_cache_limit(wired_limit // 4)
-    parser = argparse.ArgumentParser(description="Generate text with DFlash on MLX.")
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
+    apply_metal_limits()
+    parser = argparse.ArgumentParser(prog=prog, description="Generate text with DFlash on MLX.")
     parser.add_argument("--model", required=True, help="Target model reference.")
     parser.add_argument("--prompt", required=True, help="Prompt to generate from.")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--no-chat-template", action="store_true")
     parser.add_argument("--draft", default=None, help="Optional draft model override.")
+    parser.add_argument(
+        "--verify-mode",
+        choices=("auto", "off"),
+        default="auto",
+        help="Verify path mode. Use off only for debug/parity.",
+    )
     parser.add_argument(
         "--target-fa-window",
         type=int,
@@ -168,9 +187,33 @@ def main() -> None:
             "0 keeps full KV cache; N>0 uses rotating KV cache for target FA layers only."
         ),
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--draft-sink-size",
+        type=int,
+        default=64,
+        help="Draft context cache sink tokens kept before the rolling window.",
+    )
+    parser.add_argument(
+        "--draft-window-size",
+        type=int,
+        default=1024,
+        help="Draft context cache rolling window tokens.",
+    )
+    parser.add_argument(
+        "--verify-len-cap",
+        type=int,
+        default=0,
+        help="Max tokens verified per target forward; 0 uses the block size.",
+    )
+    args = parser.parse_args(list(argv) if argv is not None else None)
     if args.target_fa_window < 0:
         raise SystemExit("--target-fa-window must be >= 0")
+    if args.draft_sink_size < 0:
+        raise SystemExit("--draft-sink-size must be >= 0")
+    if args.draft_window_size <= 0:
+        raise SystemExit("--draft-window-size must be > 0")
+    if args.verify_len_cap < 0:
+        raise SystemExit("--verify-len-cap must be >= 0")
     raise SystemExit(
         run_generate(
             model_ref=args.model,
@@ -179,6 +222,10 @@ def main() -> None:
             use_chat_template=not args.no_chat_template,
             draft_ref=args.draft,
             target_fa_window=args.target_fa_window,
+            draft_sink_size=args.draft_sink_size,
+            draft_window_size=args.draft_window_size,
+            verify_len_cap=args.verify_len_cap,
+            verify_mode=args.verify_mode,
         )
     )
 

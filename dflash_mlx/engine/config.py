@@ -1,55 +1,36 @@
+# Copyright 2026 bstnxbt
+# MIT License — see LICENSE file
+# Based on DFlash (arXiv:2602.06036)
+
 from __future__ import annotations
 
-import os
-import sys
 from typing import Any, Optional
 
+from dflash_mlx.diagnostics import DiagnosticsConfig
 
-def _resolve_verify_len_cap(target_model: Any, block_tokens: int) -> int:
-    override_raw = os.environ.get("DFLASH_VERIFY_LEN", "").strip()
-    if override_raw:
-        try:
-            override = int(override_raw)
-        except ValueError:
-            override = 0
-        if override > 0:
-            return max(1, min(int(block_tokens), override))
-    return int(block_tokens)
+def resolve_verify_len_cap(runtime_config: Any, block_tokens: int) -> int:
+    requested = int(getattr(runtime_config, "verify_len_cap", 0) or 0)
+    if requested <= 0:
+        return int(block_tokens)
+    return max(1, min(int(block_tokens), requested))
 
+def verify_token_count_for_block(block_len: int, verify_len_cap: int) -> int:
+    return max(1, min(int(block_len), int(verify_len_cap)))
 
-def _resolve_dflash_max_ctx() -> int:
-    raw = os.environ.get("DFLASH_MAX_CTX", "0").strip()
-    try:
-        max_ctx = int(raw)
-    except ValueError:
-        max_ctx = 0
-    if max_ctx <= 0:
-        return sys.maxsize
-    return max_ctx
-
-
-def _resolve_draft_window() -> tuple[int, int]:
-    sink = int(os.environ.get("DFLASH_DRAFT_SINK", "64").strip())
-    window = int(os.environ.get("DFLASH_DRAFT_WINDOW", "1024").strip())
-    return max(0, sink), max(1, window)
-
-
-def _resolve_target_fa_window() -> int:
-    raw = os.environ.get("DFLASH_TARGET_FA_WINDOW", "0").strip()
-    if raw == "":
-        return 0
-    try:
-        window = int(raw)
-    except ValueError as exc:
-        raise ValueError("DFLASH_TARGET_FA_WINDOW must be an integer >= 0") from exc
-    if window < 0:
-        raise ValueError("DFLASH_TARGET_FA_WINDOW must be an integer >= 0")
-    return window
-
-
-def _draft_window_override_enabled() -> bool:
-    return bool(os.environ.get("DFLASH_DRAFT_WINDOW", "").strip())
-
+def resolve_draft_window(
+    runtime_config: Any,
+    draft_model: Any,
+    *,
+    context_len: Optional[int] = None,
+) -> tuple[int, int]:
+    sink = int(getattr(runtime_config, "draft_sink_size", 64))
+    requested_window = int(getattr(runtime_config, "draft_window_size", 1024))
+    return sink, _effective_draft_window_size(
+        draft_model,
+        requested_window,
+        context_len=context_len,
+        allow_full_attention_context=True,
+    )
 
 def _is_unwindowed_full_attention_draft(draft_model: Any) -> bool:
     args = getattr(draft_model, "args", None)
@@ -61,7 +42,6 @@ def _is_unwindowed_full_attention_draft(draft_model: Any) -> bool:
     if not layer_types:
         return False
     return all(kind == "full_attention" for kind in layer_types)
-
 
 def _effective_draft_window_size(
     draft_model: Any,
@@ -80,9 +60,7 @@ def _effective_draft_window_size(
         window = max(window, int(context_len))
     return window
 
-
-def _profile_dflash_cycles_enabled() -> bool:
-    raw = os.environ.get("DFLASH_PROFILE", "").strip().lower()
-    if raw not in {"", "0", "false", "no"}:
-        return True
-    return bool(os.environ.get("DFLASH_BENCH_LOG_DIR", "").strip())
+def _profile_dflash_cycles_enabled(
+    diagnostics: Optional[DiagnosticsConfig] = None,
+) -> bool:
+    return bool(diagnostics is not None and diagnostics.trace.cycle_events)

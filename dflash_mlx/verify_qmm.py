@@ -1,17 +1,22 @@
 # Copyright 2026 bstnxbt
 # MIT License — see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
-from __future__ import annotations
 
-import os
+from __future__ import annotations
 
 import mlx.core as mx
 
+from dflash_mlx.internal_debug import (
+    verify_qmm_enabled as _debug_verify_qmm_enabled,
+    verify_qmm_kparts as _debug_verify_qmm_kparts,
+    verify_qmm_variant as _debug_verify_qmm_variant,
+)
+
 def is_enabled() -> bool:
-    return os.environ.get("DFLASH_VERIFY_QMM", "") == "1"
+    return _debug_verify_qmm_enabled()
 
 def _variant() -> str:
-    return os.environ.get("DFLASH_VERIFY_VARIANT", "auto")
+    return _debug_verify_qmm_variant()
 
 def _auto_variant(K: int, N: int) -> tuple[str, int]:
     if K >= 8192 or N <= 8192:
@@ -508,7 +513,7 @@ def verify_matmul(
     if variant == "auto":
         variant, auto_kp = _auto_variant(K, N)
 
-    K_PARTS = auto_kp if auto_kp is not None else int(os.environ.get("DFLASH_VERIFY_QMM_KPARTS", "4"))
+    K_PARTS = auto_kp if auto_kp is not None else _debug_verify_qmm_kparts(4)
 
     if variant == "mma2big_pipe":
         if N % 32 != 0 or K % (32 * K_PARTS) != 0:
