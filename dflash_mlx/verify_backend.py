@@ -43,6 +43,7 @@ class _BaseEngine:
         target_len: int,
         acceptance_len: int,
         drafted_tokens: int,
+        force_replay: bool = False,
     ) -> int:
         from dflash_mlx.engine.rollback import restore_target_cache_after_acceptance
 
@@ -51,6 +52,7 @@ class _BaseEngine:
             target_len=target_len,
             acceptance_length=acceptance_len,
             drafted_tokens=drafted_tokens,
+            force_replay=force_replay,
         )
 
 class FullAttentionEngine(_BaseEngine):

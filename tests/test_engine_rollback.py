@@ -90,6 +90,20 @@ def test_full_acceptance_skips_rollback_replay():
     assert replay_ns == 0
 
 
+def test_force_replay_overrides_full_acceptance_fast_path():
+    c = _ArmableCache()
+    replay_ns = restore_target_cache_after_acceptance(
+        [c],
+        target_len=100,
+        acceptance_length=0,
+        drafted_tokens=0,
+        force_replay=True,
+    )
+
+    assert c.rolled_back_to == [0]
+    assert replay_ns >= 0
+
+
 def test_partial_acceptance_calls_rollback_with_acceptance_length():
     c = _ArmableCache()
     replay_ns = restore_target_cache_after_acceptance(

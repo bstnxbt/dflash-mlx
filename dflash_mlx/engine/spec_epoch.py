@@ -17,6 +17,10 @@ from dflash_mlx.cache.snapshot import (
     validate_prefix_snapshot as _validate_prefix_snapshot,
 )
 from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
+from dflash_mlx.engine.adaptive_fallback import (
+    AdaptiveFallbackState,
+    resolve_adaptive_fallback_config,
+)
 from dflash_mlx.engine.fallback import stream_baseline_generate
 from dflash_mlx.engine.prefill import (
     compute_snapshot_boundary,
@@ -313,6 +317,10 @@ def stream_dflash_generate_impl(
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
         effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+        adaptive_fallback = AdaptiveFallbackState(
+            config=resolve_adaptive_fallback_config(os.environ),
+            initial_block_tokens=effective_block_tokens,
+        )
         block_token_buffer = mx.full(
             (effective_block_tokens,),
             int(draft_model.mask_token_id),
@@ -358,7 +366,8 @@ def stream_dflash_generate_impl(
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
             remaining = max_new_tokens - len(generated_token_ids)
-            block_len = max(1, min(effective_block_tokens, remaining))
+            block_len = adaptive_fallback.block_tokens_for_cycle(remaining)
+            adaptive_ar_cycle = adaptive_fallback.in_cooldown
             block_token_buffer[:block_len] = int(draft_model.mask_token_id)
             block_token_buffer[:1] = staged_first
             block_token_ids = block_token_buffer[:block_len]
@@ -459,7 +468,14 @@ def stream_dflash_generate_impl(
             committed_segment = verify_token_ids[:commit_count]
             commit_start_ns = time.perf_counter_ns()
             start += commit_count
-            target_hidden = committed_hidden
+            if adaptive_ar_cycle and target_hidden is not None:
+                target_hidden = mx.concatenate([target_hidden, committed_hidden], axis=1)
+                if profile_cycles:
+                    mx.eval(target_hidden)
+                else:
+                    mx.async_eval(target_hidden)
+            else:
+                target_hidden = committed_hidden
             gen_hidden_chunks.append(committed_hidden)
             last_cycle_logits = verify_logits[:, acceptance_len, :]
             replay_cycle_ns = engine.rollback(
@@ -467,6 +483,7 @@ def stream_dflash_generate_impl(
                 target_len=start,
                 acceptance_len=acceptance_len,
                 drafted_tokens=max(0, verify_token_count - 1),
+                force_replay=verify_token_count <= 1,
             )
             replay_ns_total += replay_cycle_ns
             cycles_completed += 1
@@ -476,17 +493,40 @@ def stream_dflash_generate_impl(
 
             accepted_from_draft += acceptance_len
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+
+            stop_hit = False
+            if stop_token_array is not None:
+                stop_hit = bool(
+                    mx.any(
+                        mx.equal(
+                            committed_segment[:, None],
+                            stop_token_array[None, :],
+                        )
+                    ).item()
+                )
+            remaining_after_commit = max_new_tokens - len(generated_token_ids) - commit_count
+            observed_cycle_us = (time.perf_counter_ns() - cycle_start_ns) / 1_000.0
+            adaptive_decision = adaptive_fallback.record_cycle(
+                block_len=block_len,
+                commit_count=commit_count,
+                cycle_us=observed_cycle_us,
+                can_continue=not stop_hit and remaining_after_commit > 0,
+            )
+            if adaptive_decision is not None:
+                prefetched_draft = None
+                _pre_yield = time.perf_counter_ns()
+                yield adaptive_decision.as_event()
+                _yield_pause_ns += time.perf_counter_ns() - _pre_yield
             if not profile_cycles:
-                next_remaining = max_new_tokens - len(generated_token_ids) - commit_count
-                next_block_len = max(1, min(effective_block_tokens, next_remaining))
-                if next_remaining > 0 and next_block_len > 1:
+                next_block_len = adaptive_fallback.block_tokens_for_cycle(remaining_after_commit)
+                if not stop_hit and remaining_after_commit > 0 and next_block_len > 1:
                     draft_start_ns = time.perf_counter_ns()
                     next_drafted = draft_backend.draft_greedy(
                         target_model=target_model,
                         draft_model=draft_model,
                         draft_cache=draft_cache,
                         staged_first=staged_first_next,
-                        target_hidden=committed_hidden,
+                        target_hidden=target_hidden,
                         block_len=next_block_len,
                         mask_token_tail=mask_token_tail,
                         suppress_token_mask=suppress_token_mask,
@@ -522,16 +562,6 @@ def stream_dflash_generate_impl(
                 }
                 _yield_pause_ns += time.perf_counter_ns() - _pre_yield
 
-            stop_hit = False
-            if stop_token_array is not None:
-                stop_hit = bool(
-                    mx.any(
-                        mx.equal(
-                            committed_segment[:, None],
-                            stop_token_array[None, :],
-                        )
-                    ).item()
-                )
             if stop_hit:
                 break
 
@@ -642,6 +672,7 @@ def stream_dflash_generate_impl(
             "acceptance_last_20_avg": (sum(last_20) / len(last_20)) if last_20 else 0.0,
             "peak_memory_gb": float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else None,
         }
+        summary.update(adaptive_fallback.summary_fields())
         if profile_cycles:
             summary["cycle_profile_us"] = cycle_profiles
             summary["cycle_profile_totals_us"] = {

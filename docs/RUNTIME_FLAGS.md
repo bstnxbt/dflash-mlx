@@ -116,6 +116,27 @@ readers see a single source of truth.
 | `DFLASH_DRAFT_SINK` | `64` | Number of leading tokens kept as a permanent attention sink in the draft KV window. Set to `0` to disable. Example: `DFLASH_DRAFT_SINK=128`. |
 | `DFLASH_DRAFT_WINDOW` | `1024` | Sliding window length the draft uses for non-sink tokens. Setting any non-empty value also flips an internal "user override" bit, so explicit assignment is honoured even if it matches the default. Example: `DFLASH_DRAFT_WINDOW=2048`. |
 
+### Adaptive fallback
+
+Adaptive fallback is disabled by default. When enabled, the engine watches
+speculative decode progress over probe windows; if sustained low committed
+tokens per cycle indicates harmful speculation, it falls back to target
+autoregressive decoding for a cooldown window. The default cooldown is
+conservative, so most single requests remain in target-AR after fallback instead
+of automatically reprobeing with a smaller verifier block. Smaller-block
+reprobe is available for experiments, but changing verifier chunk shape can
+alter greedy output in near-tie cases.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `DFLASH_ADAPTIVE_FALLBACK` | unset (off) | Master switch. Truthy values enable adaptive fallback; `0`, `false`, `no`, `off`, or empty disable it. Example: `DFLASH_ADAPTIVE_FALLBACK=1`. |
+| `DFLASH_ADAPTIVE_MIN_TOKENS_PER_CYCLE` | `2.0` | Minimum average committed tokens per probe cycle. Probe windows below this threshold count as bad speculation. Example: `DFLASH_ADAPTIVE_MIN_TOKENS_PER_CYCLE=2.5`. |
+| `DFLASH_ADAPTIVE_PROBE_CYCLES` | `8` | Number of speculative cycles in each probe window. Clamped to `>= 1`. Example: `DFLASH_ADAPTIVE_PROBE_CYCLES=12`. |
+| `DFLASH_ADAPTIVE_BAD_PROBE_WINDOWS` | `2` | Consecutive bad probe windows required before entering fallback. Clamped to `>= 1`. Example: `DFLASH_ADAPTIVE_BAD_PROBE_WINDOWS=3`. |
+| `DFLASH_ADAPTIVE_TARGET_AR_COOLDOWN` | `4096` | Number of generated tokens to hold target-AR mode after fallback before considering reprobe. Clamped to `>= 1`. Example: `DFLASH_ADAPTIVE_TARGET_AR_COOLDOWN=512`. |
+| `DFLASH_ADAPTIVE_LATENCY_MARGIN` | `1.0` | Latency guard for cooldown/reprobe paths. A new path must be no slower than the reference path multiplied by this margin. Example: `DFLASH_ADAPTIVE_LATENCY_MARGIN=1.1`. |
+| `DFLASH_ADAPTIVE_REPROBE_BLOCK_TOKENS` | unset | Explicit block size for the post-cooldown reprobe. When unset and the cooldown completes, the runtime probes a smaller block derived from the current block. Example: `DFLASH_ADAPTIVE_REPROBE_BLOCK_TOKENS=2`. |
+
 ### Prefix cache
 
 These variables are overridden by the corresponding CLI flags on
@@ -160,6 +181,13 @@ benchmark protocol.
 | `DFLASH_DRAFT_SINK` | Env-only draft cache tuning. No CLI yet. |
 | `DFLASH_DRAFT_WINDOW` | Env-only draft cache tuning. No CLI yet. |
 | `DFLASH_PREFILL_STEP_SIZE` | Env-only in the runtime path. `dflash-serve` has an old hidden parser argument, but it is not a public wired flag. |
+| `DFLASH_ADAPTIVE_FALLBACK` | Env-only adaptive fallback switch. No CLI yet. |
+| `DFLASH_ADAPTIVE_MIN_TOKENS_PER_CYCLE` | Env-only adaptive fallback threshold. No CLI yet. |
+| `DFLASH_ADAPTIVE_PROBE_CYCLES` | Env-only adaptive fallback probe window size. No CLI yet. |
+| `DFLASH_ADAPTIVE_BAD_PROBE_WINDOWS` | Env-only adaptive fallback confirmation count. No CLI yet. |
+| `DFLASH_ADAPTIVE_TARGET_AR_COOLDOWN` | Env-only adaptive fallback target-AR hold length. No CLI yet. |
+| `DFLASH_ADAPTIVE_LATENCY_MARGIN` | Env-only adaptive fallback latency guard. No CLI yet. |
+| `DFLASH_ADAPTIVE_REPROBE_BLOCK_TOKENS` | Env-only experimental adaptive fallback reprobe block override. No CLI yet. |
 | `DFLASH_VERIFY_LINEAR` | Env-only verify kernel override. No CLI yet. |
 | `DFLASH_VERIFY_QMM` | Env-only verify-QMM switch, also auto-set by runtime in some load paths. No CLI yet. |
 | `DFLASH_VERIFY_VARIANT` | Env-only verify-QMM kernel variant selector. No CLI yet. |

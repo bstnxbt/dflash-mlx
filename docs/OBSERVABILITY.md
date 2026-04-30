@@ -215,6 +215,20 @@ On the fast-path AR branch, a smaller row is emitted directly from
 | `cache_insert_ms` | float | Cumulative time spent inserting snapshots for this request. |
 | `acceptance_ratio` | float | Final speculative-decoding acceptance ratio (0.0 – 1.0). |
 | `cycles_completed` | int | Number of speculative cycles run for this request. |
+| `adaptive_fallback_enabled` | bool | Whether `DFLASH_ADAPTIVE_FALLBACK` was enabled for this request. |
+| `adaptive_fallback_triggered` | bool | Whether adaptive fallback entered target-AR mode at least once. |
+| `adaptive_fallback_count` | int | Number of adaptive fallback transitions to target-AR mode. |
+| `adaptive_reprobe_count` | int | Number of post-cooldown reprobe transitions. Defaults to `0` with the conservative cooldown unless generation continues past the cooldown. |
+| `adaptive_fallback_tokens` | int | Tokens emitted while adaptive fallback was in target-AR cooldown. |
+| `adaptive_final_block_tokens` | int | Active speculative block size at request end. |
+| `adaptive_last_probe_tokens_per_cycle` | float | Average committed tokens per cycle in the most recent completed adaptive probe window. |
+| `adaptive_bad_probe_windows` | int | Configured number of consecutive bad probe windows required before fallback. |
+| `adaptive_pending_bad_probe_windows` | int | Consecutive bad probe windows observed but not yet acted on at request end. |
+| `adaptive_last_probe_ms_per_token` | float \| null | Milliseconds per committed token in the most recent completed adaptive probe window, when cycle timing was available. |
+| `adaptive_ar_ms_per_token` | float \| null | Milliseconds per token observed during the most recent target-AR cooldown, when available. |
+| `adaptive_latency_reject_count` | int | Number of cooldown or reprobe paths rejected by the latency guard. |
+| `adaptive_latency_locked` | bool | Whether adaptive fallback locked back to the reference block after a latency rejection. |
+| `adaptive_fallback_reason` | string \| null | Reason string for the latest adaptive fallback transition. |
 | `finish_reason` | string \| null | `stop` or `length`. |
 | `max_tokens` | int | Upper bound from the request body. |
 

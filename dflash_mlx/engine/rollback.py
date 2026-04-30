@@ -52,9 +52,10 @@ def restore_target_cache_after_acceptance(
     target_len: int,
     acceptance_length: int,
     drafted_tokens: int = 0,
+    force_replay: bool = False,
 ) -> int:
     replay_ns_total = 0
-    fully_accepted = acceptance_length == drafted_tokens
+    fully_accepted = acceptance_length == drafted_tokens and not force_replay
     for cache_entry in cache_entries:
         if hasattr(cache_entry, "rollback"):
             if fully_accepted:
