@@ -154,11 +154,16 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
         request_tuple = request
         rqueue, request, args = request_tuple
 
-        if args.max_tokens <= 256:
-            sys.stderr.write(
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] fast-path AR | max_tokens={args.max_tokens}\n"
+        fastpath_threshold = getattr(
+            self.model_provider.cli_args, "fastpath_max_tokens", 256
+        )
+        if fastpath_threshold > 0 and args.max_tokens <= fastpath_threshold:
+            logging.info(
+                "[dflash] fast-path AR (skipping speculative decoding) | "
+                "max_tokens=%d <= fastpath_max_tokens=%d",
+                args.max_tokens,
+                fastpath_threshold,
             )
-            sys.stderr.flush()
             saved_draft_model = self.model_provider.draft_model
             try:
                 self.model_provider.draft_model = None
@@ -512,6 +517,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Maximum prompt token count for DFlash speculative decoding.",
+    )
+    parser.add_argument(
+        "--fastpath-max-tokens",
+        type=int,
+        default=256,
+        help=(
+            "Requests with max_tokens at or below this threshold skip "
+            "speculative decoding and fall back to vanilla mlx-lm AR "
+            "(default: 256). Set to 0 to disable the fast-path entirely."
+        ),
     )
     parser.add_argument(
         "--num-draft-tokens",
