@@ -293,7 +293,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                     current_state = "normal"
                     match_sequence: Optional[tuple[int, ...]] = None
                     token_finish_reason: Optional[str] = None
-                    if sm is not None:
+                    if sm is not None and sm_state is not None and sm_state[0] is not None:
                         sm_state, match_sequence, current_state = sm.match(sm_state, token)
                         if match_sequence is not None and current_state is None:
                             token_finish_reason = "stop"
