@@ -211,6 +211,15 @@ def _resolve_dflash_max_ctx() -> int:
     return max_ctx
 
 
+def _resolve_prefill_step_size() -> int:
+    raw = os.environ.get("DFLASH_PREFILL_STEP_SIZE", "2048").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 2048
+    return value if value > 0 else 2048
+
+
 def _resolve_draft_window() -> tuple[int, int]:
     sink = int(os.environ.get("DFLASH_DRAFT_SINK", "64").strip())
     window = int(os.environ.get("DFLASH_DRAFT_WINDOW", "1024").strip())
@@ -1218,7 +1227,7 @@ def generate_dflash_once(
     try:
         start_ns = time.perf_counter_ns()
         prefill_start_ns = time.perf_counter_ns()
-        prefill_step_size = 2048
+        prefill_step_size = _resolve_prefill_step_size()
         prefill_logits = None
         target_hidden: Optional[mx.array] = None
         for chunk_start in range(0, prompt_len, prefill_step_size):
@@ -1613,7 +1622,7 @@ def stream_dflash_generate(
         start_ns = time.perf_counter_ns()
         _yield_pause_ns = 0
         prefill_start_ns = time.perf_counter_ns()
-        prefill_step_size = 2048
+        prefill_step_size = _resolve_prefill_step_size()
         prefill_logits = None
         target_hidden: Optional[mx.array] = None
         for chunk_start in range(0, prompt_len, prefill_step_size):

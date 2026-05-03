@@ -628,6 +628,29 @@ def main() -> None:
             raise SystemExit("--dflash-max-ctx must be > 0")
         os.environ["DFLASH_MAX_CTX"] = str(args.dflash_max_ctx)
 
+    # Wire --prefill-step-size through to the runtime via env var,
+    # following the same pattern as DFLASH_MAX_CTX above.
+    prefill_step_size = getattr(args, "prefill_step_size", None)
+    if prefill_step_size is not None and prefill_step_size > 0:
+        os.environ["DFLASH_PREFILL_STEP_SIZE"] = str(prefill_step_size)
+
+    # Warn about CLI flags that are accepted but currently have no effect
+    # in the single-stream MLX backend, so users tuning them know to stop.
+    _no_op_flags = (
+        ("num_draft_tokens", 3),
+        ("decode_concurrency", 32),
+        ("prompt_concurrency", 8),
+    )
+    for _attr, _default in _no_op_flags:
+        _value = getattr(args, _attr, _default)
+        if _value != _default:
+            sys.stderr.write(
+                f"[dflash] warning: --{_attr.replace('_', '-')}={_value} "
+                f"is currently a no-op in the single-stream MLX backend; "
+                f"see https://github.com/bstnxbt/dflash-mlx/issues/18\n"
+            )
+            sys.stderr.flush()
+
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
