@@ -144,6 +144,12 @@ def _slugify_model_ref(model_ref: str | None) -> str:
     label = re.sub(r"-+", "-", label).strip("-")
     return label or "model"
 
+def _slugify_prompt_id(prompt: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", prompt[:60].lower())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug or "prompt"
+
+
 def _benchmark_mode(args: argparse.Namespace) -> str:
     suite = getattr(args, "suite", None)
     if suite:
