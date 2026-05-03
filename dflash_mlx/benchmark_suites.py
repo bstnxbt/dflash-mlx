@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import re
@@ -87,7 +88,7 @@ def resolve_benchmark_prompts(args: argparse.Namespace) -> list[BenchmarkPrompt]
         if suite == "longctx":
             prompt = build_long_context_prompt(prompt, ctx_tokens(args) or DEFAULT_CTX_TOKENS)
         source = "synthetic" if suite == "longctx" else "smoke"
-        prompts = (BenchmarkPrompt(f"{suite}-custom-{_slugify_prompt_id(prompt)}", suite, prompt, source),)
+        prompts = (BenchmarkPrompt(f"{suite}-custom-{slugify_prompt_id(prompt)}", suite, prompt, source),)
     elif suite == "longctx":
         ctx_token_count = ctx_tokens(args) or DEFAULT_CTX_TOKENS
         prompts = (
@@ -198,7 +199,9 @@ def _format_hf_prompt(suite: str, row_index: int, row: dict[str, Any]) -> Benchm
         hf_dataset_split=str(meta["split"]),
     )
 
-def _slugify_prompt_id(prompt: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", prompt.lower()).strip("_")
-    slug = re.sub(r"_+", "_", slug)
-    return slug[:48] or "prompt"
+def slugify_prompt_id(prompt: str) -> str:
+    prompt_text = str(prompt)
+    head = re.sub(r"[^a-z0-9]+", "-", prompt_text[:48].lower())
+    head = re.sub(r"-+", "-", head).strip("-")
+    digest = hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()[:8]
+    return f"{head}-{digest}" if head else digest

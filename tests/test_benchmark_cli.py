@@ -14,6 +14,15 @@ from dflash_mlx import benchmark_report
 from dflash_mlx import benchmark_suites
 from dflash_mlx.runtime_context import build_offline_runtime_context
 
+def test_prompt_slug_distinguishes_long_prompts_with_same_prefix():
+    prefix = "same prefix " * 8
+    first = benchmark_suites.slugify_prompt_id(prefix + "alpha")
+    second = benchmark_suites.slugify_prompt_id(prefix + "beta")
+
+    assert first != second
+    assert first.startswith("same-prefix")
+    assert second.startswith("same-prefix")
+
 def test_benchmark_help_documents_public_flags(capsys):
     parser = benchmark.build_parser()
     with pytest.raises(SystemExit) as exc:

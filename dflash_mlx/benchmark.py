@@ -35,6 +35,7 @@ from dflash_mlx.benchmark_suites import (
     ctx_tokens as _ctx_tokens,
     default_limit_for_suite as _default_limit_for_suite,
     resolve_benchmark_prompts,
+    slugify_prompt_id,
 )
 from dflash_mlx.metal_limits import apply_metal_limits
 from dflash_mlx.runtime import (
@@ -143,12 +144,6 @@ def _slugify_model_ref(model_ref: str | None) -> str:
     label = re.sub(r"[^a-z0-9]+", "-", label.lower())
     label = re.sub(r"-+", "-", label).strip("-")
     return label or "model"
-
-def _slugify_prompt_id(prompt: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", prompt[:60].lower())
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    return slug or "prompt"
-
 
 def _benchmark_mode(args: argparse.Namespace) -> str:
     suite = getattr(args, "suite", None)
@@ -270,7 +265,7 @@ def _build_config(
         "verify_len_cap": int(verify_len_cap),
         "prompt": prompt,
         "prompt_tokens": int(prompt_tokens),
-        "prompt_id": _slugify_prompt_id(prompt),
+        "prompt_id": slugify_prompt_id(prompt),
         "git_hash": _git_hash_short(),
     }
 
