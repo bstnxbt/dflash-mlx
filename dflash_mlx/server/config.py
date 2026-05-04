@@ -255,6 +255,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Byte budget for prefix-cache L2.",
     )
+    # -- Bet-Optimal Drafting (BOD) --
+    parser.add_argument(
+        "--bod-enabled",
+        action="store_true",
+        default=False,
+        help="Enable Bet-Optimal Drafting for dynamic block size selection.",
+    )
+    parser.add_argument(
+        "--bod-mode",
+        choices=("chain", "tree"),
+        default="chain",
+        help="BOD betting mode (chain=vanilla DFlash, tree=DDTree).",
+    )
+    parser.add_argument(
+        "--bod-min-bet",
+        type=int,
+        default=2,
+        help="Minimum bet size for BOD (γ for chain, B for tree).",
+    )
+    parser.add_argument(
+        "--bod-max-bet",
+        type=int,
+        default=16,
+        help="Maximum bet size for BOD (γ for chain, B for tree).",
+    )
+    parser.add_argument(
+        "--bod-default-scale-cost",
+        type=float,
+        default=8.0,
+        help="Default per-token draft cost (chain) or per-node verify cost (tree).",
+    )
+    parser.add_argument(
+        "--bod-default-fixed-cost",
+        type=float,
+        default=47.0,
+        help="Default fixed verify cost (chain) or draft cost (tree).",
+    )
     parser.add_argument(
         "--prompt-cache-size",
         type=int,

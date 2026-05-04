@@ -54,6 +54,12 @@ def test_generate_cli_passes_verify_mode(monkeypatch):
             "verify_len_cap": 8,
             "verify_mode": "off",
             "draft_quant": "w4",
+            "bod_enabled": False,
+            "bod_mode": "chain",
+            "bod_min_bet": 2,
+            "bod_max_bet": 16,
+            "bod_default_scale_cost": 8.0,
+            "bod_default_fixed_cost": 47.0,
         }
     ]
 

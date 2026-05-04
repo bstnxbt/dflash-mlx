@@ -53,6 +53,12 @@ _CONFIG_FIELDS: dict[str, tuple[str | None, str | None]] = {
     "memory_waterfall": (None, "0"),
     "bench_log_dir": (None, ""),
     "verify_mode": ("DFLASH_VERIFY_MODE", None),
+    "bod_enabled": (None, "False"),
+    "bod_mode": (None, "chain"),
+    "bod_min_bet": (None, "2"),
+    "bod_max_bet": (None, "16"),
+    "bod_default_scale_cost": (None, "8.0"),
+    "bod_default_fixed_cost": (None, "47.0"),
 }
 
 _CLI_FIELDS = {
@@ -74,6 +80,12 @@ _CLI_FIELDS = {
     "memory_waterfall": "memory_waterfall",
     "bench_log_dir": "bench_log_dir",
     "verify_mode": "verify_mode",
+    "bod_enabled": "bod_enabled",
+    "bod_mode": "bod_mode",
+    "bod_min_bet": "bod_min_bet",
+    "bod_max_bet": "bod_max_bet",
+    "bod_default_scale_cost": "bod_default_scale_cost",
+    "bod_default_fixed_cost": "bod_default_fixed_cost",
 }
 
 @dataclass(frozen=True)
