@@ -245,6 +245,20 @@ class DFlashDraftModelArgs:
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> "DFlashDraftModelArgs":
         data = dict(params)
+        rope_parameters = data.pop("rope_parameters", None) or {}
+        if "rope_theta" not in data and "rope_theta" in rope_parameters:
+            data["rope_theta"] = rope_parameters["rope_theta"]
+        if "rope_scaling" not in data:
+            scaling = {
+                key: value
+                for key, value in rope_parameters.items()
+                if key not in ("rope_theta", "rope_type")
+            }
+            rope_type = rope_parameters.get("rope_type")
+            if rope_type and rope_type != "default":
+                scaling["type"] = rope_type
+            if scaling:
+                data["rope_scaling"] = scaling
         layer_types = tuple(data.get("layer_types") or ())
         if not layer_types and "num_hidden_layers" in data:
             layer_types = _default_draft_layer_types(
