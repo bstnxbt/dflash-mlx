@@ -58,6 +58,10 @@ Apple M5 Max, 64 GB unified memory, MLX 0.31.1. Protocol: stock `mlx_lm.stream_g
 | Qwen3.6-35B-A3B-4bit | 2048 | 139.03 tok/s | 252.93 tok/s | 1.82x | 89.60% |
 | Qwen3.6-35B-A3B-4bit | 4096 | 134.50 tok/s | 208.40 tok/s | 1.56x | 88.43% |
 | Qwen3.6-35B-A3B-4bit | 8192 | 133.20 tok/s | 177.45 tok/s | 1.33x | 87.01% |
+| LFM2.5-1.2B-Instruct\* | 1024 | 141.94 tok/s | 338.98 tok/s | 2.39x | 86.82% |
+| LFM2.5-1.2B-Instruct\* | 2048 | 141.03 tok/s | 209.59 tok/s | 1.49x | 78.76% |
+
+\* Measured on Apple M4 Max, 36 GB unified memory, MLX 0.31.2. The bundled `nathanrchn/LFM2.5-1.2B-Instruct-DFlash` draft was trained on 2k-token sequences, so acceptance and speedup degrade past that horizon; 4k/8k rows are omitted.
 
 Per-run JSON: [`benchmark/results/`](benchmark/results/). Reproduce on your hardware with `dflash benchmark`.
 
