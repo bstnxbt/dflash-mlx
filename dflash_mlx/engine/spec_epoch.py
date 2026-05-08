@@ -54,6 +54,7 @@ def stream_dflash_generate_impl(
     stable_prefix_len: Optional[int] = None,
     prefix_cache: Optional[Any] = None,
     runtime_context: Any,
+    bod_controller: Optional[Any] = None,
 ) -> Iterator[dict[str, Any]]:
     from dflash_mlx.runtime import (
         _eval_logits_and_captured,
@@ -449,6 +450,11 @@ def stream_dflash_generate_impl(
         draft_block_size = int(draft_model.block_size)
         requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
         effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+
+        # Bet-Optimal Drafting: override initial block size
+        if bod_controller is not None:
+            bod_bet = bod_controller.optimal_bet()
+            effective_block_tokens = max(1, min(bod_bet, draft_block_size))
         block_token_buffer = mx.full(
             (effective_block_tokens,),
             int(draft_model.mask_token_id),
@@ -494,7 +500,12 @@ def stream_dflash_generate_impl(
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
             remaining = max_new_tokens - len(generated_token_ids)
-            block_len = max(1, min(effective_block_tokens, remaining))
+            if bod_controller is not None:
+                bet = bod_controller.optimal_bet()
+                current_bet = max(1, min(bet, remaining, draft_block_size))
+            else:
+                current_bet = min(effective_block_tokens, remaining)
+            block_len = max(1, current_bet)
             block_token_buffer[:block_len] = int(draft_model.mask_token_id)
             block_token_buffer[:1] = staged_first
             block_token_ids = block_token_buffer[:block_len]
@@ -655,9 +666,27 @@ def stream_dflash_generate_impl(
 
             accepted_from_draft += acceptance_len
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+
+            # BOD: observe this cycle's outcome
+            if bod_controller is not None:
+                cycle_time_ms = (
+                    (time.perf_counter_ns() - cycle_start_ns) / 1_000_000.0
+                )
+                bod_controller.observe(
+                    bet=block_len,
+                    accepted=acceptance_len,
+                    cycle_time_ms=cycle_time_ms,
+                    draft_time_ms=draft_cycle_ns / 1_000_000.0,
+                    verify_time_ms=verify_cycle_ns / 1_000_000.0,
+                )
+
             if not profile_cycles:
                 next_remaining = max_new_tokens - len(generated_token_ids) - commit_count
-                next_block_len = max(1, min(effective_block_tokens, next_remaining))
+                if bod_controller is not None:
+                    bet = bod_controller.optimal_bet()
+                    next_block_len = max(1, min(bet, next_remaining, draft_block_size))
+                else:
+                    next_block_len = max(1, min(effective_block_tokens, next_remaining))
                 if next_remaining > 0 and next_block_len > 1:
                     draft_start_ns = time.perf_counter_ns()
                     next_drafted = draft_backend.draft_greedy(

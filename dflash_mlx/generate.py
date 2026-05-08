@@ -18,6 +18,7 @@ from dflash_mlx.runtime import (
     load_target_bundle,
     stream_dflash_generate,
 )
+from dflash_mlx.bet_optimal_drafting import BODConfig, BODController
 from dflash_mlx.runtime_context import (
     build_offline_runtime_context,
 )
@@ -128,6 +129,12 @@ def run_generate(
     verify_len_cap: int = 0,
     verify_mode: str = "auto",
     draft_quant: Optional[str] = None,
+    bod_enabled: bool = False,
+    bod_mode: str = "chain",
+    bod_min_bet: int = 2,
+    bod_max_bet: int = 16,
+    bod_default_scale_cost: float = 8.0,
+    bod_default_fixed_cost: float = 47.0,
 ) -> int:
     runtime_context = build_offline_runtime_context(
         target_fa_window=target_fa_window,
@@ -136,6 +143,12 @@ def run_generate(
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        bod_enabled=bod_enabled,
+        bod_mode=bod_mode,
+        bod_min_bet=bod_min_bet,
+        bod_max_bet=bod_max_bet,
+        bod_default_scale_cost=bod_default_scale_cost,
+        bod_default_fixed_cost=bod_default_fixed_cost,
     )
     target_model, tokenizer, draft_model, _ = load_runtime_components(
         model_ref=model_ref,
@@ -228,6 +241,43 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         default=0,
         help="Max tokens verified per target forward; 0 uses the block size.",
     )
+    # -- Bet-Optimal Drafting --
+    parser.add_argument(
+        "--bod-enabled",
+        action="store_true",
+        default=False,
+        help="Enable Bet-Optimal Drafting for dynamic block size selection.",
+    )
+    parser.add_argument(
+        "--bod-mode",
+        choices=("chain", "tree"),
+        default="chain",
+        help="BOD betting mode.",
+    )
+    parser.add_argument(
+        "--bod-min-bet",
+        type=int,
+        default=2,
+        help="Minimum bet size for BOD.",
+    )
+    parser.add_argument(
+        "--bod-max-bet",
+        type=int,
+        default=16,
+        help="Maximum bet size for BOD.",
+    )
+    parser.add_argument(
+        "--bod-default-scale-cost",
+        type=float,
+        default=8.0,
+        help="Default per-token draft cost (chain) or per-node verify cost (tree).",
+    )
+    parser.add_argument(
+        "--bod-default-fixed-cost",
+        type=float,
+        default=47.0,
+        help="Default fixed verify cost (chain) or draft cost (tree).",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.prefill_step_size is not None and args.prefill_step_size <= 0:
         raise SystemExit("--prefill-step-size must be > 0")
@@ -253,6 +303,12 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
             verify_len_cap=args.verify_len_cap,
             verify_mode=args.verify_mode,
             draft_quant=args.draft_quant,
+            bod_enabled=args.bod_enabled,
+            bod_mode=args.bod_mode,
+            bod_min_bet=args.bod_min_bet,
+            bod_max_bet=args.bod_max_bet,
+            bod_default_scale_cost=args.bod_default_scale_cost,
+            bod_default_fixed_cost=args.bod_default_fixed_cost,
         )
     )
 

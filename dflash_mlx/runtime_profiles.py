@@ -26,6 +26,12 @@ class RuntimeProfile:
     prefix_cache_l2: bool
     prefix_cache_l2_max_bytes: int
     verify_mode: str
+    bod_enabled: bool = False
+    bod_mode: str = "chain"
+    bod_min_bet: int = 2
+    bod_max_bet: int = 16
+    bod_default_scale_cost: float = 8.0
+    bod_default_fixed_cost: float = 47.0
 
 @dataclass(frozen=True)
 class EffectiveRuntimeConfig:
@@ -47,6 +53,12 @@ class EffectiveRuntimeConfig:
     memory_waterfall: bool
     bench_log_dir: str
     verify_mode: str
+    bod_enabled: bool = False
+    bod_mode: str = "chain"
+    bod_min_bet: int = 2
+    bod_max_bet: int = 16
+    bod_default_scale_cost: float = 8.0
+    bod_default_fixed_cost: float = 47.0
 
 PROFILES: dict[str, RuntimeProfile] = {
     "balanced": RuntimeProfile(
@@ -244,6 +256,12 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
         memory_waterfall=bool(getattr(args, "memory_waterfall", None) or False),
         bench_log_dir=str(getattr(args, "bench_log_dir", None) or ""),
         verify_mode=_resolve_verify_mode(getattr(args, "verify_mode", None), profile.verify_mode),
+        bod_enabled=bool(getattr(args, "bod_enabled", False)),
+        bod_mode=str(getattr(args, "bod_mode", "chain")),
+        bod_min_bet=int(getattr(args, "bod_min_bet", 2)),
+        bod_max_bet=int(getattr(args, "bod_max_bet", 16)),
+        bod_default_scale_cost=float(getattr(args, "bod_default_scale_cost", 8.0)),
+        bod_default_fixed_cost=float(getattr(args, "bod_default_fixed_cost", 47.0)),
     )
     return validate_runtime_config(cfg)
 

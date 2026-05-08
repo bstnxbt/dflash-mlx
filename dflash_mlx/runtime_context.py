@@ -45,6 +45,12 @@ def runtime_config_from_profile(
     memory_waterfall: bool = False,
     bench_log_dir: str = "",
     verify_mode: str | None = None,
+    bod_enabled: bool = False,
+    bod_mode: str = "chain",
+    bod_min_bet: int = 2,
+    bod_max_bet: int = 16,
+    bod_default_scale_cost: float = 8.0,
+    bod_default_fixed_cost: float = 47.0,
 ) -> EffectiveRuntimeConfig:
     runtime_profile = PROFILES[profile]
     return validate_runtime_config(
@@ -105,6 +111,12 @@ def runtime_config_from_profile(
             memory_waterfall=bool(memory_waterfall),
             bench_log_dir=str(bench_log_dir),
             verify_mode=runtime_profile.verify_mode if verify_mode is None else str(verify_mode),
+            bod_enabled=bool(bod_enabled),
+            bod_mode=str(bod_mode),
+            bod_min_bet=int(bod_min_bet),
+            bod_max_bet=int(bod_max_bet),
+            bod_default_scale_cost=float(bod_default_scale_cost),
+            bod_default_fixed_cost=float(bod_default_fixed_cost),
         )
     )
 
@@ -131,6 +143,12 @@ def build_offline_runtime_context(
     draft_window_size: int = 1024,
     verify_len_cap: int = 0,
     verify_mode: str = "auto",
+    bod_enabled: bool = False,
+    bod_mode: str = "chain",
+    bod_min_bet: int = 2,
+    bod_max_bet: int = 16,
+    bod_default_scale_cost: float = 8.0,
+    bod_default_fixed_cost: float = 47.0,
 ) -> RuntimeContext:
     runtime_config = runtime_config_from_profile(
         profile="balanced",
@@ -142,6 +160,12 @@ def build_offline_runtime_context(
         draft_window_size=int(draft_window_size),
         verify_len_cap=int(verify_len_cap),
         verify_mode=verify_mode,
+        bod_enabled=bool(bod_enabled),
+        bod_mode=str(bod_mode),
+        bod_min_bet=int(bod_min_bet),
+        bod_max_bet=int(bod_max_bet),
+        bod_default_scale_cost=float(bod_default_scale_cost),
+        bod_default_fixed_cost=float(bod_default_fixed_cost),
     )
     return build_runtime_context(runtime_config)
 

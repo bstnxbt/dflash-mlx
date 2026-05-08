@@ -373,6 +373,22 @@ def load_draft_bundle(
 def stream_dflash_generate(**kwargs: Any) -> Iterator[dict[str, Any]]:
     if kwargs.get("runtime_context") is None:
         raise ValueError("runtime_context is required")
+    runtime_ctx = kwargs["runtime_context"]
+    runtime_cfg = runtime_ctx.runtime
+
+    # Create BOD controller if enabled
+    if getattr(runtime_cfg, "bod_enabled", False) and kwargs.get("bod_controller") is None:
+        from dflash_mlx.bet_optimal_drafting import BODConfig, BODController
+
+        bod_cfg = BODConfig(
+            mode=runtime_cfg.bod_mode,
+            min_bet=runtime_cfg.bod_min_bet,
+            max_bet=runtime_cfg.bod_max_bet,
+            default_scale_cost=runtime_cfg.bod_default_scale_cost,
+            default_fixed_cost=runtime_cfg.bod_default_fixed_cost,
+        )
+        kwargs["bod_controller"] = BODController(bod_cfg)
+
     gen_stream = mx.default_stream(mx.default_device())
     with mx.stream(gen_stream):
         yield from _stream_dflash_generate_impl(**kwargs)
