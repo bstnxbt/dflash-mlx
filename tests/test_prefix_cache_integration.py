@@ -1259,6 +1259,53 @@ class TestContextConfigExposedCorrectly:
         assert flow.hit_tokens == len(prompt)
         assert flow.snapshot is snap
         assert flow.stable_prefix_len == len(prompt)
+        assert flow.lookup_stats.prompt_tokens == len(prompt)
+        assert flow.lookup_stats.stable_prefix_tokens == len(prompt)
+        assert flow.lookup_stats.lookup_tokens == len(prompt)
+        assert flow.lookup_stats.hit_tokens == len(prompt)
+        assert flow.lookup_stats.hit_kind == "exact"
+        assert flow.lookup_stats.snapshot_tokens == len(prompt)
+        assert flow.lookup_stats.snapshot_kind == "prefill"
+        assert flow.lookup_stats.snapshot_nbytes == snap.nbytes
+        assert flow.lookup_stats.snapshot_has_last_logits is True
+
+    def test_prefix_flow_lookup_records_miss(self, monkeypatch):
+        import dflash_mlx.server.prefix_cache_flow as flow_mod
+
+        cache = DFlashPrefixCache(max_entries=4)
+        key = _make_key(
+            target_model_id="target/x",
+            draft_model_id="draft/y",
+            capture_layer_ids=(3, 7),
+        )
+        prompt = [11, 12, 13, 14]
+
+        monkeypatch.setattr(
+            flow_mod,
+            "get_runtime_cache_manager",
+            lambda _runtime_context, *, cache_identity=None: _manager(cache),
+        )
+        monkeypatch.setattr(flow_mod, "build_prefix_key", lambda *_args: key)
+
+        flow = flow_mod.PrefixCacheFlow.for_request(
+            model_provider=_FakeLoadedProvider(),
+            draft_model=_FakeDraft(),
+            tokenizer=_FakeTokenizer(),
+            prompt=prompt,
+            runtime_context=_runtime_context(prefix_cache=True),
+        )
+
+        assert flow.cache_active
+        assert flow.hit_tokens == 0
+        assert flow.snapshot is None
+        assert flow.lookup_stats.prompt_tokens == len(prompt)
+        assert flow.lookup_stats.lookup_tokens == len(prompt)
+        assert flow.lookup_stats.hit_tokens == 0
+        assert flow.lookup_stats.hit_kind == "miss"
+        assert flow.lookup_stats.snapshot_tokens == 0
+        assert flow.lookup_stats.snapshot_kind is None
+        assert flow.lookup_stats.snapshot_nbytes == 0
+        assert flow.lookup_stats.snapshot_has_last_logits is False
 
     def test_prefix_flow_keeps_generation_snapshots_for_tool_chat(self, monkeypatch):
         import dflash_mlx.server.prefix_cache_flow as flow_mod
@@ -1334,6 +1381,12 @@ class TestContextConfigExposedCorrectly:
         assert flow.hit_tokens == len(prompt)
         assert flow.snapshot is not None
         assert flow.lookup_ms == 0.25
+        assert flow.lookup_stats.lookup_ms == 0.25
+        assert flow.lookup_stats.hit_tokens == len(prompt)
+        assert flow.lookup_stats.hit_kind == "exact"
+        assert flow.lookup_stats.snapshot_tokens == len(prompt)
+        assert flow.lookup_stats.snapshot_nbytes == flow.snapshot.nbytes
+        assert flow.lookup_stats.snapshot_has_last_logits is True
         assert flow.snapshot_service is None
 
     def test_prefix_flow_treats_retired_lookup_manager_as_inactive(self, monkeypatch):

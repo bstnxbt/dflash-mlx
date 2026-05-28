@@ -385,6 +385,7 @@ def test_finalize_request_observability_records_all_outputs(tmp_path, monkeypatc
         cache_lookup_ms=0.25,
         cache_hit_tokens=0,
         cache_insert_ms=0.5,
+        cache_lookup_stats={"hit_kind": "miss", "lookup_tokens": 8},
         finish_reason="stop",
         max_tokens=16,
         prompt_regime={"request_type": "chat"},
@@ -411,6 +412,7 @@ def test_finalize_request_observability_records_all_outputs(tmp_path, monkeypatc
     assert post["prefill_tok_s_restored"] == 0.0
     assert post["decode_tok_s"] == 2.0
     assert post["cache_status"] == "COLD"
+    assert post["cache_lookup"] == {"hit_kind": "miss", "lookup_tokens": 8}
     assert post["prefill_event"]["physical_prefill_tokens"] == 8
     assert post["memory_waterfall_peak"]["mlx_active_gb"] == 6.0
     summary = (tmp_path / "summary.md").read_text()
@@ -418,6 +420,7 @@ def test_finalize_request_observability_records_all_outputs(tmp_path, monkeypatc
     payload = get_live_metrics_payload()
     assert payload["last_request"]["request_id"] == 10
     assert payload["last_request"]["generated_tokens"] == 4
+    assert payload["last_request"]["cache_lookup"] == {"hit_kind": "miss", "lookup_tokens": 8}
     err = capsys.readouterr().err
     assert (
         "decode 2.0 tok/s | prefill logical 8.0 tok/s | "

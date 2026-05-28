@@ -43,6 +43,7 @@ class RequestLoopResult:
     cache_lookup_ms: float
     cache_hit_tokens: int
     cache_insert_ms: float
+    cache_lookup_stats: Optional[dict[str, Any]] = None
     memory_waterfall_peak: Optional[dict[str, Any]] = None
     memory_waterfall_start: Optional[dict[str, Any]] = None
     memory_waterfall_end: Optional[dict[str, Any]] = None
@@ -370,10 +371,27 @@ def consume_dflash_events(
         cache_lookup_ms=prefix_flow.lookup_ms if prefix_flow is not None else 0.0,
         cache_hit_tokens=prefix_flow.hit_tokens if prefix_flow is not None else 0,
         cache_insert_ms=prefix_flow.insert_ms if prefix_flow is not None else 0.0,
+        cache_lookup_stats=_prefix_lookup_stats_payload(prefix_flow),
         memory_waterfall_peak=memory_peak,
         memory_waterfall_start=memory_start,
         memory_waterfall_end=memory_end,
     )
+
+def _prefix_lookup_stats_payload(
+    prefix_flow: Optional[PrefixCacheFlow],
+) -> dict[str, Any]:
+    if prefix_flow is None:
+        return {}
+    stats = getattr(prefix_flow, "lookup_stats", None)
+    if stats is None:
+        return {}
+    to_payload = getattr(stats, "to_payload", None)
+    if callable(to_payload):
+        return dict(to_payload())
+    if isinstance(stats, dict):
+        return dict(stats)
+    return {}
+
 
 def _with_prefix_cache_memory(
     event: dict[str, Any],

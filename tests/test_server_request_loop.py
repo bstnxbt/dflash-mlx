@@ -284,7 +284,12 @@ def test_consume_dflash_events_updates_live_cycle_metrics_before_summary(monkeyp
 
 
 def test_consume_dflash_events_ignores_snapshot_publication_metadata():
-    prefix_flow = SimpleNamespace(lookup_ms=0.1, hit_tokens=2, insert_ms=0.5)
+    prefix_flow = SimpleNamespace(
+        lookup_ms=0.1,
+        hit_tokens=2,
+        insert_ms=0.5,
+        lookup_stats={"hit_kind": "exact", "snapshot_tokens": 3},
+    )
     rqueue = SimpleQueue()
     events = ClosableEvents(
         [
@@ -333,6 +338,7 @@ def test_consume_dflash_events_ignores_snapshot_publication_metadata():
     assert result.cache_lookup_ms == 0.1
     assert result.cache_hit_tokens == 2
     assert result.cache_insert_ms == 0.5
+    assert result.cache_lookup_stats == {"hit_kind": "exact", "snapshot_tokens": 3}
 
 
 def test_consume_dflash_events_rejects_stale_dict_events():
