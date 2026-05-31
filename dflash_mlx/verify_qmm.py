@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import platform
+
 import mlx.core as mx
 
 from dflash_mlx.internal_debug import (
@@ -36,6 +38,8 @@ def _m16_ktmpl_variant(K: int, N: int, bits: int) -> str | None:
         return None
     if int(K) % 256 != 0 or int(N) % 16 != 0:
         return None
+    if int(N) % 32 == 0 and _nax_verify_available():
+        return "nax_ktmpl"
     if int(K) >= 8192 or int(N) <= 5120:
         return "combo_ktmpl"
     return "super_tree_fp16_ktmpl"
@@ -46,9 +50,145 @@ def _resolve_m16_ktmpl_variant(K: int, N: int, bits: int, variant: str | None = 
     selected = _variant() if variant is None else str(variant)
     if selected == "auto":
         return _m16_ktmpl_variant(K, N, bits)
+    if selected == "nax_ktmpl" and int(N) % 32 == 0 and _nax_verify_available():
+        return selected
     if selected in ("combo_ktmpl", "super_tree_fp16_ktmpl"):
         return selected
     return None
+
+def _nax_verify_available() -> bool:
+    arch = str(mx.device_info().get("architecture", "")).lower()
+    if not arch.startswith("applegpu_g17"):
+        return False
+    parts = platform.mac_ver()[0].split(".")
+    try:
+        major = int(parts[0]) if parts and parts[0] else 0
+    except ValueError:
+        major = 0
+    try:
+        minor = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+    except ValueError:
+        minor = 0
+    return major > 26 or (major == 26 and minor >= 2)
+
+def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
+    key = ("m16_nax_ktmpl", int(k_val), group_size, dtype)
+    if key in _VERIFY_KERNEL_CACHE:
+        return _VERIFY_KERNEL_CACHE[key]
+
+    source = f"""
+        using namespace metal;
+        using namespace mpp::tensor_ops;
+
+        constexpr int BM = 16;
+        constexpr int BN = 32;
+        constexpr int BK = 16;
+        constexpr int NSG = 8;
+        constexpr int GS = {group_size};
+        constexpr int K = KCONST;
+        constexpr int K_by_8 = K / 8;
+        constexpr int K_by_gs = K / GS;
+        constexpr int K_chunk = K / NSG;
+
+        uint tid = thread_position_in_threadgroup.x;
+        uint sg_id = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint tg_n = threadgroup_position_in_grid.y;
+        int N = int(N_size);
+        int n0 = int(tg_n) * BN;
+        int k_begin = int(sg_id) * K_chunk;
+        int k_end = k_begin + K_chunk;
+
+        threadgroup T B_tile[NSG][BK * BN];
+        threadgroup float partial[NSG][BM * BN];
+
+        constexpr auto desc = matmul2d_descriptor(
+            16,
+            32,
+            16,
+            false,
+            false,
+            false,
+            matmul2d_descriptor::mode::multiply_accumulate);
+        matmul2d<desc, metal::execution_simdgroup> op;
+
+        tensor<device T, dextents<int, 2>, tensor_inline> A(
+            (device T*)x,
+            dextents<int, 2>{{K, BM}},
+            array<int, 2>{{1, K}});
+        tensor<threadgroup T, dextents<int, 2>, tensor_inline> B(
+            B_tile[sg_id],
+            dextents<int, 2>{{BN, BK}},
+            array<int, 2>{{1, BN}});
+        tensor<threadgroup float, dextents<int, 2>, tensor_inline> C(
+            partial[sg_id],
+            dextents<int, 2>{{BN, BM}},
+            array<int, 2>{{1, BN}});
+
+        auto ct_c = op.template get_destination_cooperative_tensor<
+            tensor<device T, extents<int, 16, 16>, tensor_inline>,
+            tensor<threadgroup T, extents<int, 32, 16>, tensor_inline>,
+            float>();
+        _Pragma("unroll")
+        for (uint16_t i = 0; i < ct_c.get_capacity(); ++i) {{
+            ct_c[i] = 0.0f;
+        }}
+
+        int n_global = n0 + int(lane);
+        for (int k0 = k_begin; k0 < k_end; k0 += BK) {{
+            uint32_t p0 = w_q[n_global * K_by_8 + ((k0 + 0) >> 3)];
+            uint32_t p1 = w_q[n_global * K_by_8 + ((k0 + 8) >> 3)];
+            float s0 = float(scales[n_global * K_by_gs + ((k0 + 0) / GS)]);
+            float s1 = float(scales[n_global * K_by_gs + ((k0 + 8) / GS)]);
+            float b0 = float(biases[n_global * K_by_gs + ((k0 + 0) / GS)]);
+            float b1 = float(biases[n_global * K_by_gs + ((k0 + 8) / GS)]);
+
+            _Pragma("unroll")
+            for (int ki = 0; ki < 8; ++ki) {{
+                uint32_t nib = (p0 >> (ki * 4)) & 0xFu;
+                B_tile[sg_id][ki * BN + int(lane)] = T(float(nib) * s0 + b0);
+            }}
+            _Pragma("unroll")
+            for (int ki = 0; ki < 8; ++ki) {{
+                uint32_t nib = (p1 >> (ki * 4)) & 0xFu;
+                B_tile[sg_id][(8 + ki) * BN + int(lane)] = T(float(nib) * s1 + b1);
+            }}
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            auto tA = A.template slice<16, 16>(k0, 0);
+            auto tB = B.template slice<32, 16>(0, 0);
+            op.run(tA, tB, ct_c);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        auto tC = C.template slice<32, 16>(0, 0);
+        ct_c.store(tC);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int off = int(tid); off < BM * BN; off += NSG * 32) {{
+            float acc = 0.0f;
+            _Pragma("unroll")
+            for (int g = 0; g < NSG; ++g) {{
+                acc += partial[g][off];
+            }}
+            int row = off / BN;
+            int col = off - row * BN;
+            y[row * N + n0 + col] = T(acc);
+        }}
+    """
+
+    dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    kernel = mx.fast.metal_kernel(
+        name=f"verify_m16_nax_ktmpl_k{int(k_val)}_gs{group_size}_{dtype_tag}",
+        input_names=["x", "w_q", "scales", "biases", "N_size"],
+        output_names=["y"],
+        header="""
+            #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        """,
+        source=source,
+    )
+    _VERIFY_KERNEL_CACHE[key] = kernel
+    return kernel
 
 def _build_kernel_m4_ksplit_np(
     group_size: int,
@@ -958,15 +1098,20 @@ def verify_matmul(
                 x, w, scales=scales, biases=biases,
                 transpose=transpose, group_size=group_size, bits=bits,
             )
-        kernel = (
-            _build_kernel_m16_combo_ktmpl(K, group_size, x.dtype)
-            if ktmpl_variant == "combo_ktmpl" else
-            _build_kernel_m16_super_tree_fp16_ktmpl(K, group_size, x.dtype)
-        )
+        if ktmpl_variant == "nax_ktmpl":
+            kernel = _build_kernel_m16_nax_ktmpl(K, group_size, x.dtype)
+            grid = (256, N // 32, 1)
+        else:
+            kernel = (
+                _build_kernel_m16_combo_ktmpl(K, group_size, x.dtype)
+                if ktmpl_variant == "combo_ktmpl" else
+                _build_kernel_m16_super_tree_fp16_ktmpl(K, group_size, x.dtype)
+            )
+            grid = (256, N // 16, 1)
         (y,) = kernel(
             inputs=[x2, w_q, scales, biases, N],
             template=[("T", x.dtype), ("KCONST", K)],
-            grid=(256, N // 16, 1),
+            grid=grid,
             threadgroup=(256, 1, 1),
             output_shapes=[(M, N)],
             output_dtypes=[x.dtype],

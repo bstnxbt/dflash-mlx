@@ -279,7 +279,9 @@ These are not product flags. They are kept for kernel and verifier experiments:
 
 - `DFLASH_VERIFY_LINEAR`
 - `DFLASH_VERIFY_QMM`
-- `DFLASH_VERIFY_VARIANT`
+- `DFLASH_VERIFY_VARIANT` (`auto` selects the M16 NAX verify kernel on
+  `applegpu_g17*` when the shape and macOS runtime support it; forced values
+  are for experiments only)
 - `DFLASH_VERIFY_MAX_N`
 - `DFLASH_VERIFY_QMM_KPARTS`
 - `DFLASH_VERIFY_INCLUDE`

@@ -8,6 +8,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+import dflash_mlx.verify_qmm as verify_qmm
 from dflash_mlx.verify_qmm import is_enabled, verify_matmul
 
 GROUP_SIZE = 64
@@ -79,6 +80,52 @@ def test_mlp_real_shapes(name, M, K, N, dtype):
     max_abs, max_rel, shape = _run_case(name, M, K, N, dtype, GROUP_SIZE)
     assert max_abs <= abs_tol, f"{name}[{dtype}] max_abs={max_abs:.4g} > {abs_tol}"
     assert max_rel <= rel_tol, f"{name}[{dtype}] max_rel={max_rel:.4g} > {rel_tol}"
+
+def test_m16_auto_prefers_nax_on_apple_g17(monkeypatch):
+    monkeypatch.setattr(
+        verify_qmm.mx,
+        "device_info",
+        lambda: {"architecture": "applegpu_g17s"},
+    )
+    monkeypatch.setattr(
+        verify_qmm.platform,
+        "mac_ver",
+        lambda: ("26.4.0", ("", "", ""), ""),
+    )
+
+    assert verify_qmm._resolve_m16_ktmpl_variant(5120, 17408, 4) == "nax_ktmpl"
+
+def test_m16_auto_keeps_steel_before_apple_g17(monkeypatch):
+    monkeypatch.setattr(
+        verify_qmm.mx,
+        "device_info",
+        lambda: {"architecture": "applegpu_g16s"},
+    )
+    monkeypatch.setattr(
+        verify_qmm.platform,
+        "mac_ver",
+        lambda: ("26.4.0", ("", "", ""), ""),
+    )
+
+    assert (
+        verify_qmm._resolve_m16_ktmpl_variant(5120, 17408, 4)
+        == "super_tree_fp16_ktmpl"
+    )
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_m16_nax_variant_matches_stock_when_forced(dtype, monkeypatch):
+    if not str(mx.device_info().get("architecture", "")).startswith("applegpu_g17"):
+        pytest.skip("Metal 4 NAX verify path is only enabled on applegpu_g17")
+    monkeypatch.setenv("DFLASH_VERIFY_QMM", "1")
+    monkeypatch.setenv("DFLASH_VERIFY_VARIANT", "nax_ktmpl")
+    abs_tol = 8e-3 if dtype == mx.bfloat16 else 4e-3
+    rel_tol = 2e-2
+    max_abs, max_rel, shape = _run_case(
+        "forced_nax_ktmpl", 16, 512, 1024, dtype, GROUP_SIZE
+    )
+    assert shape == (16, 1024)
+    assert max_abs <= abs_tol, f"nax[{dtype}] max_abs={max_abs:.4g} > {abs_tol}"
+    assert max_rel <= rel_tol, f"nax[{dtype}] max_rel={max_rel:.4g} > {rel_tol}"
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("name,M,K,N", REAL_MLP_M4_SHAPES)

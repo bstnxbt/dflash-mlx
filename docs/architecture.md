@@ -285,7 +285,7 @@ Draft/model/kernels:
 - `dflash_mlx/draft_backend.py` - masked-block draft call;
 - `dflash_mlx/kernels.py` - local kernel helpers;
 - `dflash_mlx/verify_linear.py` and `dflash_mlx/verify_qmm.py` - verify
-  implementation paths;
+  implementation paths, including Apple G17 NAX and steel fallback kernels;
 - `dflash_mlx/recurrent_rollback_cache.py` - GDN rollback cache.
 
 Prefix cache:

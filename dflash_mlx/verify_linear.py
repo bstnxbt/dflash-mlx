@@ -19,6 +19,7 @@ from dflash_mlx.verify_qmm import (
     verify_matmul,
     _auto_variant,
     _build_kernel_m16_combo_ktmpl,
+    _build_kernel_m16_nax_ktmpl,
     _build_kernel_m16_super_tree_fp16_ktmpl,
     _build_kernel_mma2big,
     _build_kernel_mma2big_8bit,
@@ -155,11 +156,16 @@ def _build_dispatch(
 
         if m16_qmm:
             if ktmpl_variant is not None:
-                _kern_fn = (
-                    _build_kernel_m16_combo_ktmpl
-                    if ktmpl_variant == "combo_ktmpl" else
-                    _build_kernel_m16_super_tree_fp16_ktmpl
-                )
+                if ktmpl_variant == "nax_ktmpl":
+                    _kern_fn = _build_kernel_m16_nax_ktmpl
+                    _grid = (256, N // 32, 1)
+                else:
+                    _kern_fn = (
+                        _build_kernel_m16_combo_ktmpl
+                        if ktmpl_variant == "combo_ktmpl" else
+                        _build_kernel_m16_super_tree_fp16_ktmpl
+                    )
+                    _grid = (256, N // 16, 1)
                 kern_bf16 = _kern_fn(K, gs, mx.bfloat16)
                 kern_fp16 = _kern_fn(K, gs, mx.float16)
 
@@ -167,7 +173,7 @@ def _build_dispatch(
                     (y,) = kern(
                         inputs=[x2, w_c, s_c, b_c, N],
                         template=[("T", x2.dtype), ("KCONST", K)],
-                        grid=(256, N // 16, 1),
+                        grid=_grid,
                         threadgroup=(256, 1, 1),
                         output_shapes=[(16, N)],
                         output_dtypes=[x2.dtype],
