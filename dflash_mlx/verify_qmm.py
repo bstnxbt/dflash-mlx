@@ -166,11 +166,11 @@ def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (int off = int(tid); off < BM * BN; off += NSG * 32) {{
-            float acc = 0.0f;
-            _Pragma("unroll")
-            for (int g = 0; g < NSG; ++g) {{
-                acc += partial[g][off];
-            }}
+            float acc01 = partial[0][off] + partial[1][off];
+            float acc23 = partial[2][off] + partial[3][off];
+            float acc45 = partial[4][off] + partial[5][off];
+            float acc67 = partial[6][off] + partial[7][off];
+            float acc = (acc01 + acc23) + (acc45 + acc67);
             int row = off / BN;
             int col = off - row * BN;
             y[row * N + n0 + col] = T(acc);
