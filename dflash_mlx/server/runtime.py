@@ -163,6 +163,7 @@ class ServerRuntime:
             prompt="",
             max_new_tokens=args.max_tokens,
             use_chat_template=False,
+            quantize_kv_cache=bool(runtime_context.runtime.quantize_kv_cache),
             stop_token_ids=stop_token_ids,
             prompt_tokens_override=prepared.prompt,
             prefix_snapshot=prefix_flow.snapshot,

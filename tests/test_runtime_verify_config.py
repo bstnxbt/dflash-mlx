@@ -291,6 +291,7 @@ def test_offline_runtime_arguments_project_from_shared_runtime_schema():
     assert offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS) == {
         "prefill_step_size": 2048,
         "target_fa_window": 2048,
+        "quantize_kv_cache": False,
         "draft_sink_size": 64,
         "draft_window_size": 512,
         "verify_len_cap": 0,
