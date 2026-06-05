@@ -71,6 +71,7 @@ class EffectiveRuntimeConfig:
     target_fa_window: int
     dflash_max_ctx: int
     verify_mode: str
+    quantize_kv_cache: bool
 
 DEFAULT_RUNTIME_CONFIG = EffectiveRuntimeConfig(
     prefill_step_size=2048,
@@ -88,6 +89,7 @@ DEFAULT_RUNTIME_CONFIG = EffectiveRuntimeConfig(
     target_fa_window=0,
     dflash_max_ctx=0,
     verify_mode="adaptive",
+    quantize_kv_cache=False,
 )
 
 @dataclass(frozen=True)
@@ -283,6 +285,22 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
     RuntimeConfigFieldSpec(
+        field="quantize_kv_cache",
+        flags=("--quantize-kv-cache",),
+        env="DFLASH_QUANTIZE_KV_CACHE",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Quantize the target full-attention KV cache to 8-bit "
+            "(group size 64). Halves KV memory growth at long context; "
+            "linear (gated-delta) layer state is unaffected. Trade-off: "
+            "decode slows as context grows (no fused quantized-KV "
+            "attention kernel in MLX yet) — use when memory is the "
+            "binding constraint. Default: disabled. Incompatible with "
+            "--target-fa-window."
+        ),
+        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
+    ),
+    RuntimeConfigFieldSpec(
         field="dflash_max_ctx",
         flags=("--dflash-max-ctx",),
         env="DFLASH_MAX_CTX",
@@ -353,6 +371,7 @@ _GENERATE_RUNTIME_FIELD_ORDER = (
     "verify_mode",
     "prefill_step_size",
     "target_fa_window",
+    "quantize_kv_cache",
     "draft_sink_size",
     "draft_window_size",
     "verify_len_cap",
@@ -362,6 +381,7 @@ _BENCHMARK_RUNTIME_FIELD_ORDER = (
     "verify_mode",
     "prefill_step_size",
     "target_fa_window",
+    "quantize_kv_cache",
     "draft_sink_size",
     "draft_window_size",
     "verify_len_cap",
@@ -394,6 +414,7 @@ def runtime_config_from_defaults(
     target_fa_window: int = 0,
     dflash_max_ctx: int = 0,
     verify_mode: str | None = None,
+    quantize_kv_cache: bool | None = None,
 ) -> EffectiveRuntimeConfig:
     defaults = DEFAULT_RUNTIME_CONFIG
     return validate_runtime_config(
@@ -455,6 +476,11 @@ def runtime_config_from_defaults(
             target_fa_window=int(target_fa_window),
             dflash_max_ctx=int(dflash_max_ctx),
             verify_mode=defaults.verify_mode if verify_mode is None else str(verify_mode),
+            quantize_kv_cache=(
+                defaults.quantize_kv_cache
+                if quantize_kv_cache is None
+                else bool(quantize_kv_cache)
+            ),
         )
     )
 
@@ -480,6 +506,11 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             getattr(args, "verify_len_cap", None),
             _runtime_env("verify_len_cap"),
             defaults.verify_len_cap,
+        ),
+        quantize_kv_cache=_resolve_bool(
+            getattr(args, "quantize_kv_cache", None),
+            _runtime_env("quantize_kv_cache"),
+            defaults.quantize_kv_cache,
         ),
         prefix_cache=_resolve_bool(
             getattr(args, "prefix_cache", None),
@@ -549,6 +580,12 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--draft-window-size / draft_window_size must be > 0")
     if cfg.verify_len_cap < 0:
         raise ValueError("--verify-len-cap / verify_len_cap must be >= 0")
+    if cfg.quantize_kv_cache and cfg.target_fa_window > 0:
+        raise ValueError(
+            "--quantize-kv-cache / quantize_kv_cache cannot be combined with "
+            "--target-fa-window / target_fa_window (rotating window caches "
+            "do not support quantized KV)"
+        )
     if cfg.prefix_cache_max_entries <= 0:
         raise ValueError(
             "--prefix-cache-max-entries / prefix_cache_max_entries must be > 0"

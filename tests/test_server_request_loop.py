@@ -360,7 +360,7 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
     captured = {}
     runtime_context = SimpleNamespace(
-        runtime=SimpleNamespace(),
+        runtime=SimpleNamespace(quantize_kv_cache=False),
         diagnostics=SimpleNamespace(
             trace=SimpleNamespace(log_dir=None),
             memory_waterfall=False,

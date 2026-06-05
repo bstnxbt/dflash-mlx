@@ -50,6 +50,7 @@ def run_generate(
     use_chat_template: bool,
     draft_ref: Optional[str],
     target_fa_window: int | None = None,
+    quantize_kv_cache: bool | None = None,
     prefill_step_size: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
@@ -59,6 +60,7 @@ def run_generate(
 ) -> int:
     runtime_context = build_offline_runtime_context(
         target_fa_window=target_fa_window,
+        quantize_kv_cache=quantize_kv_cache,
         prefill_step_size=prefill_step_size,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
@@ -86,6 +88,7 @@ def run_generate(
         prompt=prompt,
         max_new_tokens=max_tokens,
         use_chat_template=use_chat_template,
+        quantize_kv_cache=bool(runtime_context.runtime.quantize_kv_cache),
         stop_token_ids=stop_token_ids,
         runtime_context=runtime_context,
     )
