@@ -67,6 +67,29 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
     def __init__(self, model_provider, prompt_cache, server_runtime: ServerRuntime):
         super().__init__(model_provider, prompt_cache)
         self.server_runtime = server_runtime
+        self.last_finish_reason = None
+
+    def generate(self, request, generation_args, progress_callback=None):
+        # Track the finish_reason of the most recent generation so the
+        # handler can close a stream cleanly if tool-call parsing fails
+        # after generation completed (e.g. a tool call truncated by
+        # max_tokens). Generation is serialized through the runtime, so a
+        # plain instance attribute is sufficient.
+        self.last_finish_reason = None
+        ctx, response = super().generate(
+            request,
+            generation_args,
+            progress_callback=progress_callback,
+        )
+
+        def _track(inner):
+            for gen in inner:
+                reason = getattr(gen, "finish_reason", None)
+                if reason is not None:
+                    self.last_finish_reason = reason
+                yield gen
+
+        return ctx, _track(response)
 
     def _restore_thinking_enabled(self, had_previous: bool, previous: object) -> None:
         if had_previous:
@@ -363,6 +386,16 @@ class DFlashAPIHandler(mlx_server.APIHandler):
             },
         )
 
+    def _set_stream_headers(self, status_code: int = 200):
+        super()._set_stream_headers(status_code)
+        if status_code == 200:
+            self._completion_response_started = True
+
+    def _set_completion_headers(self, status_code: int = 200):
+        super()._set_completion_headers(status_code)
+        if status_code == 200:
+            self._completion_response_started = True
+
     def handle_completion(self, request, stop_words):
         try:
             apply_tool_choice(request, getattr(self, "tool_choice", None))
@@ -372,6 +405,7 @@ class DFlashAPIHandler(mlx_server.APIHandler):
             logging.warning("Rejected tool-call request: %s", e)
             self._write_completion_error_response(400, str(e))
             return
+        self._completion_response_started = False
         try:
             return super().handle_completion(request, stop_words)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -379,8 +413,35 @@ class DFlashAPIHandler(mlx_server.APIHandler):
             return
         except ToolCallParseError as e:
             logging.error("Tool parser error: %s", e)
-            self._write_completion_error_response(400, str(e))
+            if getattr(self, "_completion_response_started", False):
+                # Headers (and possibly stream chunks) are already on the
+                # wire; a late 400 would just drop the stream without a
+                # finish_reason. Close the response cleanly instead.
+                self._finalize_completion_after_tool_parse_error()
+            else:
+                self._write_completion_error_response(400, str(e))
             return
+
+    def _finalize_completion_after_tool_parse_error(self) -> None:
+        finish_reason = (
+            getattr(self.response_generator, "last_finish_reason", None) or "length"
+        )
+        logging.error(
+            "Closing in-flight completion with finish_reason=%s after tool parse "
+            "failure (tool call likely truncated by max_tokens)",
+            finish_reason,
+        )
+        response = self.generate_response("", finish_reason)
+        payload = json.dumps(response)
+        try:
+            if self.stream:
+                self.wfile.write(f"data: {payload}\n\n".encode())
+                self.wfile.write("data: [DONE]\n\n".encode())
+            else:
+                self.wfile.write(payload.encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
 
     def generate_response(self, *args, **kwargs):
         response = super().generate_response(*args, **kwargs)
