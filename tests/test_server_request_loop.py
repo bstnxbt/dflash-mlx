@@ -376,6 +376,7 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
     )
     prefix_flow = SimpleNamespace(
         hit_tokens=4,
+        hit_kind="l1_exact",
         lookup_ms=0.25,
         snapshot=object(),
         snapshot_service=object(),

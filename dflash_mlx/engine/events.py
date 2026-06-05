@@ -180,6 +180,7 @@ class SummaryEvent:
     copyspec_hits: int = 0
     copyspec_tokens: int = 0
     adaptive_metrics: dict[str, Any] | None = None
+    hit_kind: str = "miss"
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -225,6 +226,7 @@ class SummaryEvent:
             ),
         }
         payload.update({key: value for key, value in optional.items() if value is not None})
+        payload["hit_kind"] = self.hit_kind
         if self.fallback_ar:
             payload["fallback_ar"] = True
             payload["fallback_reason"] = self.fallback_reason

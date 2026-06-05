@@ -83,6 +83,7 @@ class PrefixCacheFlow:
     snapshot: Optional[DFlashPrefixSnapshot] = None
     lookup_ms: float = 0.0
     hit_tokens: int = 0
+    hit_kind: str = "miss"
     snapshot_service: Optional[SnapshotService] = None
 
     @property
@@ -149,7 +150,8 @@ class PrefixCacheFlow:
         if lookup.matched_tokens > 0:
             sys.stderr.write(
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix cache hit "
-                f"{hit_tokens}/{len(prompt)} tokens (stable prefix {stable_prefix_len})\n"
+                f"{hit_tokens}/{len(prompt)} tokens "
+                f"({lookup.hit_kind}, stable prefix {stable_prefix_len})\n"
             )
             sys.stderr.flush()
         try:
@@ -164,6 +166,7 @@ class PrefixCacheFlow:
             snapshot=lookup.snapshot,
             lookup_ms=lookup.elapsed_ms,
             hit_tokens=hit_tokens,
+            hit_kind=lookup.hit_kind,
             snapshot_service=(
                 SnapshotService.from_request(
                     cache_manager=cache_manager,

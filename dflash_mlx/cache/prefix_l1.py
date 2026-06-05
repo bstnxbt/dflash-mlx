@@ -57,10 +57,18 @@ class DFlashPrefixCache:
             "prefill_tokens_saved": 0,
             "fingerprint_rejects": 0,
         }
+        # Updated on every record=True lookup; "miss" / "l1_exact" / "l1_prefix".
+        # Guarded by _lock; readable via last_hit_kind property.
+        self._last_hit_kind: str = "miss"
 
     @property
     def frontier_stride(self) -> int:
         return int(self._frontier_stride)
+
+    @property
+    def last_hit_kind(self) -> str:
+        with self._lock:
+            return self._last_hit_kind
 
     def lookup(
         self,
@@ -118,8 +126,10 @@ class DFlashPrefixCache:
                         self._lru_order.append(best_id)
                         if exact:
                             self._stats["exact_hits"] += 1
+                            self._last_hit_kind = "l1_exact"
                         else:
                             self._stats["prefix_hits"] += 1
+                            self._last_hit_kind = "l1_prefix"
                         self._stats["prefill_tokens_saved"] += best_len
                         entries_count_log = len(self._entries)
                         self._log_cache(
@@ -137,6 +147,7 @@ class DFlashPrefixCache:
                 return (0, None)
 
             self._stats["misses"] += 1
+            self._last_hit_kind = "miss"
             miss_reason = "empty_cache"
             if self._entries:
                 if saw_fingerprint_reject == len(self._entries):

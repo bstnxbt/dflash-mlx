@@ -60,6 +60,7 @@ def stream_dflash_generate(
     stable_prefix_len: int | None = None,
     prefix_cache_active: bool = False,
     publish_generation_snapshot: bool = True,
+    prefix_hit_kind: str = "miss",
     runtime_context: Any = None,
 ) -> Iterator[EngineEvent]:
     if runtime_context is None:
@@ -95,5 +96,6 @@ def stream_dflash_generate(
             stable_prefix_len=stable_prefix_len,
             prefix_cache_active=prefix_cache_active,
             publish_generation_snapshot=publish_generation_snapshot,
+            prefix_hit_kind=prefix_hit_kind,
             runtime_context=runtime_context,
         )
