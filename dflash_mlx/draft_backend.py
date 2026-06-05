@@ -241,6 +241,12 @@ def _draft_compute_dtype(draft_model: DFlashDraftModel) -> Any | None:
 
 
 def _astype_if_needed(value: mx.array, dtype: Any | None) -> mx.array:
-    if dtype is None or value.dtype == dtype:
+    if dtype is None:
+        return value
+    from dflash_mlx.cache.snapshot import TargetHiddenChunks
+
+    if isinstance(value, TargetHiddenChunks):
+        return value.astype(dtype)
+    if value.dtype == dtype:
         return value
     return value.astype(dtype)

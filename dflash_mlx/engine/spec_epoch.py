@@ -17,6 +17,7 @@ from dflash_mlx.cache.codecs import hydrate_target_cache
 from dflash_mlx.cache.snapshot_service import SnapshotPublication, SnapshotService
 from dflash_mlx.cache.snapshot import (
     DFlashPrefixSnapshot,
+    TargetHiddenChunks,
     validate_prefix_snapshot as _validate_prefix_snapshot,
 )
 from dflash_mlx.draft_backend import DraftBackend
@@ -2474,7 +2475,7 @@ def _publish_snapshot_event(
     *,
     token_ids: list[int],
     target_cache: Any,
-    target_hidden: Optional[mx.array],
+    target_hidden: Optional[mx.array | TargetHiddenChunks],
     last_logits: Optional[mx.array],
     snapshot_service: Optional[SnapshotService],
     kind: Literal["prefill", "generation"],
