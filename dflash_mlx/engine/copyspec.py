@@ -7,10 +7,64 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 COPYSPEC_WINDOW_SIZE = 6
+COPYSPEC_MISS_LIMIT = 3
+COPYSPEC_COOLDOWN_BLOCKS = 64
 
 _FNV_OFFSET_BASIS = 14695981039346656037
 _FNV_PRIME = 1099511628211
 _U64_MASK = (1 << 64) - 1
+
+
+class CopySpecGate:
+    """Tolerance gate deciding whether copyspec drafting may run.
+
+    Replaces the previous one-strike permanent disable. Copyspec pauses
+    only after ``miss_limit`` consecutive zero-acceptance copy blocks,
+    and then only for ``cooldown_blocks`` draft cycles before probing
+    again. An accepted copy block fully restores the miss tolerance, so
+    a few coincidental window matches early in a generation (e.g. during
+    a reasoning phase) no longer forfeit copy drafting for the rest of
+    the request when the output later turns copy-heavy.
+    """
+
+    def __init__(
+        self,
+        *,
+        miss_limit: int = COPYSPEC_MISS_LIMIT,
+        cooldown_blocks: int = COPYSPEC_COOLDOWN_BLOCKS,
+    ) -> None:
+        if miss_limit <= 0:
+            raise ValueError("copyspec miss_limit must be positive")
+        if cooldown_blocks <= 0:
+            raise ValueError("copyspec cooldown_blocks must be positive")
+        self.miss_limit = int(miss_limit)
+        self.cooldown_blocks = int(cooldown_blocks)
+        self._consecutive_misses = 0
+        self._cooldown_remaining = 0
+
+    @property
+    def enabled(self) -> bool:
+        """Non-consuming view of the gate state (for tests/diagnostics)."""
+        return self._cooldown_remaining == 0
+
+    def should_attempt(self) -> bool:
+        """Whether copyspec may draft this cycle. Ticks the cooldown."""
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
+            return False
+        return True
+
+    def record_block(self, accepted_tokens: int) -> None:
+        if int(accepted_tokens) > 0:
+            self._consecutive_misses = 0
+            return
+        self._consecutive_misses += 1
+        if self._consecutive_misses >= self.miss_limit:
+            self._cooldown_remaining = self.cooldown_blocks
+            # Leave one remaining strike so a failed post-cooldown probe
+            # re-enters cooldown immediately instead of burning the full
+            # miss budget again.
+            self._consecutive_misses = self.miss_limit - 1
 
 
 class CopySpecIndex:
