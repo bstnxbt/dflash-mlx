@@ -71,6 +71,7 @@ class EffectiveRuntimeConfig:
     target_fa_window: int
     dflash_max_ctx: int
     verify_mode: str
+    prefix_cache_l2_frontier_stride: int
 
 DEFAULT_RUNTIME_CONFIG = EffectiveRuntimeConfig(
     prefill_step_size=2048,
@@ -88,6 +89,7 @@ DEFAULT_RUNTIME_CONFIG = EffectiveRuntimeConfig(
     target_fa_window=0,
     dflash_max_ctx=0,
     verify_mode="adaptive",
+    prefix_cache_l2_frontier_stride=0,
 )
 
 @dataclass(frozen=True)
@@ -239,6 +241,18 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
             "Accepts raw bytes or suffixes like 50GB."
         ),
         metavar="BYTES",
+    ),
+    RuntimeConfigFieldSpec(
+        field="prefix_cache_l2_frontier_stride",
+        flags=("--prefix-cache-l2-frontier-stride",),
+        env="DFLASH_PREFIX_CACHE_L2_FRONTIER_STRIDE",
+        value_type=int,
+        help=(
+            "Token stride at which L2 frontier snapshots are written during cold "
+            "prefill. 0 = auto (default: 8192, rounded up to a prefill-step "
+            "multiple). Values below 8192 are raised to the disk-pressure floor."
+        ),
+        metavar="INT",
     ),
     RuntimeConfigFieldSpec(
         field="prefix_cache",
@@ -394,6 +408,7 @@ def runtime_config_from_defaults(
     target_fa_window: int = 0,
     dflash_max_ctx: int = 0,
     verify_mode: str | None = None,
+    prefix_cache_l2_frontier_stride: int | None = None,
 ) -> EffectiveRuntimeConfig:
     defaults = DEFAULT_RUNTIME_CONFIG
     return validate_runtime_config(
@@ -455,6 +470,11 @@ def runtime_config_from_defaults(
             target_fa_window=int(target_fa_window),
             dflash_max_ctx=int(dflash_max_ctx),
             verify_mode=defaults.verify_mode if verify_mode is None else str(verify_mode),
+            prefix_cache_l2_frontier_stride=(
+                defaults.prefix_cache_l2_frontier_stride
+                if prefix_cache_l2_frontier_stride is None
+                else int(prefix_cache_l2_frontier_stride)
+            ),
         )
     )
 
@@ -532,6 +552,11 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             0,
         ),
         verify_mode=_resolve_verify_mode(getattr(args, "verify_mode", None), defaults.verify_mode),
+        prefix_cache_l2_frontier_stride=_resolve_int(
+            getattr(args, "prefix_cache_l2_frontier_stride", None),
+            _runtime_env("prefix_cache_l2_frontier_stride"),
+            defaults.prefix_cache_l2_frontier_stride,
+        ),
     )
 
 def runtime_config_sources(args: Any, cfg: EffectiveRuntimeConfig) -> dict[str, str]:
@@ -571,6 +596,11 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--target-fa-window / target_fa_window must be >= 0")
     if cfg.dflash_max_ctx < 0:
         raise ValueError("--dflash-max-ctx / dflash_max_ctx must be >= 0")
+    if cfg.prefix_cache_l2_frontier_stride < 0:
+        raise ValueError(
+            "--prefix-cache-l2-frontier-stride / "
+            "prefix_cache_l2_frontier_stride must be >= 0"
+        )
     if cfg.verify_mode not in ("dflash", "adaptive", "ddtree", "off"):
         raise ValueError(
             "--verify-mode / verify_mode must be dflash, adaptive, ddtree, or off"

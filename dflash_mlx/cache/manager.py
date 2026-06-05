@@ -310,7 +310,12 @@ def _prefix_cache_frontier_stride(runtime_config: Any) -> int:
     prefill_step_size = max(0, int(getattr(runtime_config, "prefill_step_size", 0) or 0))
     if prefill_step_size <= 0:
         return 0
-    steps = max(1, (_MIN_L2_FRONTIER_STRIDE + prefill_step_size - 1) // prefill_step_size)
+    configured_stride = max(
+        0,
+        int(getattr(runtime_config, "prefix_cache_l2_frontier_stride", 0) or 0),
+    )
+    requested_stride = max(_MIN_L2_FRONTIER_STRIDE, configured_stride)
+    steps = max(1, (requested_stride + prefill_step_size - 1) // prefill_step_size)
     return int(steps * prefill_step_size)
 
 
