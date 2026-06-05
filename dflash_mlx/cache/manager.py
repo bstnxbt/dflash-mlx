@@ -8,7 +8,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+HitKind = Literal["miss", "l1_exact", "l1_prefix", "l2_exact", "l2_prefix"]
 
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
@@ -27,6 +29,7 @@ class PrefixCacheLookupResult:
     matched_tokens: int
     snapshot: Optional[DFlashPrefixSnapshot]
     elapsed_ms: float
+    hit_kind: HitKind = "miss"
 
 
 @dataclass(frozen=True)
@@ -94,10 +97,12 @@ class RuntimeCacheManager:
                 key,
                 request_id=request_id,
             )
+            hit_kind: HitKind = self._store._last_hit_kind  # type: ignore[assignment]
         return PrefixCacheLookupResult(
             matched_tokens=int(matched_len),
             snapshot=snapshot,
             elapsed_ms=(time.perf_counter_ns() - lookup_t0) / 1e6,
+            hit_kind=hit_kind,
         )
 
     def maybe_insert_snapshot(
@@ -305,7 +310,12 @@ def _prefix_cache_frontier_stride(runtime_config: Any) -> int:
     prefill_step_size = max(0, int(getattr(runtime_config, "prefill_step_size", 0) or 0))
     if prefill_step_size <= 0:
         return 0
-    steps = max(1, (_MIN_L2_FRONTIER_STRIDE + prefill_step_size - 1) // prefill_step_size)
+    configured_stride = max(
+        0,
+        int(getattr(runtime_config, "prefix_cache_l2_frontier_stride", 0) or 0),
+    )
+    requested_stride = max(_MIN_L2_FRONTIER_STRIDE, configured_stride)
+    steps = max(1, (requested_stride + prefill_step_size - 1) // prefill_step_size)
     return int(steps * prefill_step_size)
 
 

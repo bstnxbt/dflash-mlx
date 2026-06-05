@@ -17,6 +17,7 @@ from dflash_mlx.cache.codecs import hydrate_target_cache
 from dflash_mlx.cache.snapshot_service import SnapshotPublication, SnapshotService
 from dflash_mlx.cache.snapshot import (
     DFlashPrefixSnapshot,
+    TargetHiddenChunks,
     validate_prefix_snapshot as _validate_prefix_snapshot,
 )
 from dflash_mlx.draft_backend import DraftBackend
@@ -96,6 +97,7 @@ class _SessionRequest:
     stable_prefix_len: Optional[int] = None
     prefix_cache_active: bool = False
     publish_generation_snapshot: bool = True
+    prefix_hit_kind: str = "miss"
     prompt_array: mx.array = field(init=False, repr=False)
     prompt_len: int = field(init=False)
     stop_token_array: Optional[mx.array] = field(init=False, repr=False)
@@ -114,6 +116,7 @@ class _SessionRequest:
         stable_prefix_len: Optional[int],
         prefix_cache_active: bool,
         publish_generation_snapshot: bool = True,
+        prefix_hit_kind: str = "miss",
     ) -> "_SessionRequest":
         return cls(
             prompt_tokens=tuple(int(token) for token in prompt_tokens),
@@ -130,6 +133,7 @@ class _SessionRequest:
             stable_prefix_len=stable_prefix_len,
             prefix_cache_active=bool(prefix_cache_active),
             publish_generation_snapshot=bool(publish_generation_snapshot),
+            prefix_hit_kind=str(prefix_hit_kind),
         )
 
     def __post_init__(self) -> None:
@@ -2427,6 +2431,7 @@ class SpeculativeSession:
                 copyspec_hits=int(decode.copyspec_hits),
                 copyspec_tokens=int(decode.copyspec_tokens),
                 adaptive_metrics=decode.adaptive_totals or None,
+                hit_kind=request.prefix_hit_kind,
             )
             yield summary
         finally:
@@ -2470,7 +2475,7 @@ def _publish_snapshot_event(
     *,
     token_ids: list[int],
     target_cache: Any,
-    target_hidden: Optional[mx.array],
+    target_hidden: Optional[mx.array | TargetHiddenChunks],
     last_logits: Optional[mx.array],
     snapshot_service: Optional[SnapshotService],
     kind: Literal["prefill", "generation"],
@@ -2533,6 +2538,7 @@ def stream_dflash_generate_impl(
     stable_prefix_len: Optional[int] = None,
     prefix_cache_active: bool = False,
     publish_generation_snapshot: bool = True,
+    prefix_hit_kind: str = "miss",
     runtime_context: Any,
 ) -> Iterator[EngineEvent]:
     target_capabilities = target_ops.capabilities_for(target_model)
@@ -2588,6 +2594,7 @@ def stream_dflash_generate_impl(
         stable_prefix_len=stable_prefix_len,
         prefix_cache_active=prefix_cache_active,
         publish_generation_snapshot=publish_generation_snapshot,
+        prefix_hit_kind=prefix_hit_kind,
     )
 
     session = SpeculativeSession.open(

@@ -248,7 +248,10 @@ class TestL2Lifecycle:
         assert "l2" not in stats
 
     def test_evict_promotes_to_l2_disk(self, tmp_path):
-        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        # max_in_flight=2: lazy publishing means the writer thread holds the slot
+        # for the disk-write duration; allow 2 concurrent writes so both inserts
+        # can pipeline without the second dropping on semaphore contention.
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9, max_in_flight=2)
         try:
             cache = _store(max_entries=1, max_bytes=10**9, l2=l2)
             key = _make_key()
@@ -968,7 +971,9 @@ class TestEpochInvalidation:
 
             l2.clear()
 
-            payload = l2._write_queue.get_nowait()
+            job = l2._write_queue.get_nowait()
+            # _write_payload checks epoch; simulate what the writer thread does
+            payload = l2._write_job_to_disk(job)
             l2._write_payload(payload)
 
             assert _all_snapshot_files(tmp_path) == []
@@ -1173,7 +1178,9 @@ class TestStatsHotPath:
             l2.shutdown()
 
 class TestAsyncWriterSafety:
-    def test_async_writer_does_not_call_mx_save_safetensors(self, tmp_path, monkeypatch):
+    def test_insert_async_does_not_call_mx_save_safetensors(self, tmp_path, monkeypatch):
+        """insert_async must not call mx.save_safetensors on the caller thread.
+        The disk write is deferred to the writer thread via _WriteJob."""
         import mlx.core as _mx
 
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
@@ -1195,10 +1202,15 @@ class TestAsyncWriterSafety:
             key = _make_key()
             l2.insert_async(_make_synthetic_snapshot([1, 2, 3], key))
             assert l2._write_queue.qsize() == 1
-            assert calls["n"] == 1
-            assert "dflash-l2-writer" not in threads
+            # save_safetensors must NOT have been called on the request thread
+            assert calls["n"] == 0, (
+                f"insert_async called mx.save_safetensors {calls['n']} times — "
+                "disk write should be deferred to the writer thread"
+            )
 
-            payload = l2._write_queue.get_nowait()
+            # Now simulate the writer thread processing the job
+            job = l2._write_queue.get_nowait()
+            payload = l2._write_job_to_disk(job)
             l2._write_payload(payload)
             assert calls["n"] == 1
             assert len(_all_snapshot_files(tmp_path)) == 1

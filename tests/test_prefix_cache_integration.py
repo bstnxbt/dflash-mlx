@@ -1116,6 +1116,28 @@ class TestContextConfigExposedCorrectly:
         assert manager is not None
         assert manager.frontier_stride() == 10000
 
+    def test_l2_frontier_stride_honors_larger_configured_value(
+        self, monkeypatch, tmp_path
+    ):
+        import dflash_mlx.cache.manager as cache_manager_mod
+
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        context = _runtime_context(
+            prefix_cache=True,
+            prefix_cache_l2=True,
+            prefix_cache_l2_dir=str(tmp_path),
+            prefill_step_size=2048,
+            prefix_cache_l2_frontier_stride=32000,
+        )
+        manager = cache_manager_mod.get_runtime_cache_manager(
+            context,
+            cache_identity=("configured-frontier",),
+        )
+
+        assert manager is not None
+        assert manager.frontier_stride() == 32768
+
     def test_frontier_stride_disabled_without_l2(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 

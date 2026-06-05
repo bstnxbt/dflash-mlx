@@ -11,7 +11,11 @@ import mlx.core as mx
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
-from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot, FAState
+from dflash_mlx.cache.snapshot import (
+    DFlashPrefixSnapshot,
+    FAState,
+    TargetHiddenChunks,
+)
 from dflash_mlx.engine.config import _effective_draft_window_size
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
@@ -58,8 +62,17 @@ def _requires_full_target_hidden(
     layer_types = tuple(str(kind) for kind in (getattr(args, "layer_types", ()) or ()))
     return any(kind == "full_attention" for kind in layer_types)
 
+def _target_hidden_slice(
+    target_hidden: mx.array | TargetHiddenChunks,
+    start: int,
+    end: int,
+) -> mx.array:
+    if isinstance(target_hidden, TargetHiddenChunks):
+        return target_hidden.slice(start, end)
+    return target_hidden[:, start:end, :]
+
 def _build_target_hidden_chunks(
-    target_hidden: mx.array,
+    target_hidden: mx.array | TargetHiddenChunks,
     *,
     draft_model: Optional[Any] = None,
     trim_target_hidden: bool = True,
@@ -69,7 +82,7 @@ def _build_target_hidden_chunks(
 ) -> tuple[tuple[mx.array, ...], tuple[tuple[int, int], ...], int]:
     total_len = int(target_hidden.shape[1])
     if not trim_target_hidden:
-        full = _clone_array(target_hidden)
+        full = _clone_array(_target_hidden_slice(target_hidden, 0, total_len))
         assert full is not None
         return (full,), ((0, total_len),), total_len
     sink, window = _resolve_effective_trim_window(
@@ -80,11 +93,13 @@ def _build_target_hidden_chunks(
         allow_full_attention_context=allow_full_attention_context,
     )
     if total_len <= sink + window or sink + window == 0:
-        full = _clone_array(target_hidden)
+        full = _clone_array(_target_hidden_slice(target_hidden, 0, total_len))
         assert full is not None
         return (full,), ((0, total_len),), total_len
-    sink_chunk = _clone_array(target_hidden[:, :sink, :])
-    tail_chunk = _clone_array(target_hidden[:, total_len - window :, :])
+    sink_chunk = _clone_array(_target_hidden_slice(target_hidden, 0, sink))
+    tail_chunk = _clone_array(
+        _target_hidden_slice(target_hidden, total_len - window, total_len)
+    )
     assert sink_chunk is not None and tail_chunk is not None
     return (
         (sink_chunk, tail_chunk),
@@ -215,7 +230,7 @@ def build_snapshot(
     *,
     token_ids: list[int],
     target_cache: list[Any],
-    target_hidden: mx.array,
+    target_hidden: mx.array | TargetHiddenChunks,
     last_logits: Optional[mx.array],
     key: DFlashPrefixKey,
     kind: str = "prefill",
@@ -234,7 +249,25 @@ def build_snapshot(
             f"< token prefix length {prefix_len}"
         )
     if hidden_len > prefix_len:
-        target_hidden = target_hidden[:, :prefix_len, :]
+        if isinstance(target_hidden, TargetHiddenChunks):
+            target_hidden = TargetHiddenChunks(
+                total_len=prefix_len,
+                chunks=tuple(
+                    chunk[:, : max(0, min(end, prefix_len) - start), :]
+                    for chunk, (start, end) in zip(
+                        target_hidden.chunks,
+                        target_hidden.spans,
+                    )
+                    if start < prefix_len
+                ),
+                spans=tuple(
+                    (start, min(end, prefix_len))
+                    for start, end in target_hidden.spans
+                    if start < prefix_len
+                ),
+            )
+        else:
+            target_hidden = target_hidden[:, :prefix_len, :]
 
     fa, gdn = serialize_target_cache(target_cache)
     _validate_snapshot_cache_prefix_len(fa, prefix_len=prefix_len)
@@ -272,7 +305,7 @@ class PrefixSnapshotBuilder:
         *,
         token_ids: list[int],
         target_cache: list[Any],
-        target_hidden: mx.array,
+        target_hidden: mx.array | TargetHiddenChunks,
         last_logits: Optional[mx.array],
         kind: str,
         allow_full_attention_context: bool = False,

@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from dflash_mlx.cache.snapshot import TargetHiddenChunks
 from dflash_mlx.engine.prefill import init_target_hidden_from_snapshot
 
 
@@ -16,15 +17,15 @@ from dflash_mlx.engine.prefill import init_target_hidden_from_snapshot
 class TargetFeatureStore:
     prompt_len: int
     project_context: Callable[[mx.array], mx.array] | None = None
-    _current_hidden: mx.array | None = None
-    _prefill_hidden_for_snapshot: mx.array | None = None
+    _current_hidden: mx.array | TargetHiddenChunks | None = None
+    _prefill_hidden_for_snapshot: mx.array | TargetHiddenChunks | None = None
     _generation_chunks: list[mx.array] = field(default_factory=list)
 
     @property
-    def current_hidden(self) -> mx.array | None:
+    def current_hidden(self) -> mx.array | TargetHiddenChunks | None:
         return self._current_hidden
 
-    def require_current_hidden(self) -> mx.array:
+    def require_current_hidden(self) -> mx.array | TargetHiddenChunks:
         if self._current_hidden is None:
             raise RuntimeError("target hidden features are unavailable")
         return self._current_hidden
@@ -38,12 +39,19 @@ class TargetFeatureStore:
         prefix_snapshot: Any,
         *,
         snap_prefix_len: int,
-    ) -> mx.array:
-        self._current_hidden = init_target_hidden_from_snapshot(
-            prefix_snapshot,
-            snap_prefix_len=int(snap_prefix_len),
-            prompt_len=int(self.prompt_len),
-        )
+    ) -> mx.array | TargetHiddenChunks:
+        if int(snap_prefix_len) == int(self.prompt_len):
+            self._current_hidden = TargetHiddenChunks(
+                total_len=int(snap_prefix_len),
+                chunks=tuple(prefix_snapshot.target_hidden_chunks),
+                spans=tuple(prefix_snapshot.target_hidden_chunk_spans),
+            )
+        else:
+            self._current_hidden = init_target_hidden_from_snapshot(
+                prefix_snapshot,
+                snap_prefix_len=int(snap_prefix_len),
+                prompt_len=int(self.prompt_len),
+            )
         return self._current_hidden
 
     def write_prompt_slice(
@@ -59,6 +67,8 @@ class TargetFeatureStore:
                 (features.shape[0], int(self.prompt_len), features.shape[-1]),
                 dtype=features.dtype,
             )
+        elif isinstance(self._current_hidden, TargetHiddenChunks):
+            self._current_hidden = self._current_hidden.materialize()
         self._current_hidden[:, int(start):int(end), :] = features
         mx.eval(self._current_hidden)
         return self._current_hidden
@@ -66,6 +76,8 @@ class TargetFeatureStore:
     def prefix_view(self, boundary: int) -> mx.array | None:
         if self._current_hidden is None:
             return None
+        if isinstance(self._current_hidden, TargetHiddenChunks):
+            return self._current_hidden.slice(0, int(boundary))
         return self._current_hidden[:, :int(boundary), :]
 
     def freeze_prefill_for_snapshot(self, *, enabled: bool) -> None:
@@ -82,7 +94,7 @@ class TargetFeatureStore:
         if collect_snapshot:
             self._generation_chunks.append(committed_hidden)
 
-    def generation_snapshot_hidden(self) -> mx.array | None:
+    def generation_snapshot_hidden(self) -> mx.array | TargetHiddenChunks | None:
         if self._prefill_hidden_for_snapshot is None or not self._generation_chunks:
             return None
         gen_hidden = (
@@ -90,6 +102,20 @@ class TargetFeatureStore:
             if len(self._generation_chunks) == 1
             else mx.concatenate(self._generation_chunks, axis=1)
         )
+        if isinstance(self._prefill_hidden_for_snapshot, TargetHiddenChunks):
+            prefill = self._prefill_hidden_for_snapshot
+            generated_len = int(gen_hidden.shape[1])
+            return TargetHiddenChunks(
+                total_len=int(prefill.total_len) + generated_len,
+                chunks=(*prefill.chunks, gen_hidden),
+                spans=(
+                    *prefill.spans,
+                    (
+                        int(prefill.total_len),
+                        int(prefill.total_len) + generated_len,
+                    ),
+                ),
+            )
         hidden = mx.concatenate([self._prefill_hidden_for_snapshot, gen_hidden], axis=1)
         mx.eval(hidden)
         return hidden

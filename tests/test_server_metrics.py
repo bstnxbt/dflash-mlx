@@ -177,6 +177,7 @@ def _summary_event(
     phase_timings_us: dict[str, float] | None = None,
     cycle_profile_totals_us: dict[str, float] | None = None,
     elapsed_us: float = 0.0,
+    hit_kind: str = "miss",
 ) -> SummaryEvent:
     return SummaryEvent(
         elapsed_us=elapsed_us,
@@ -195,6 +196,7 @@ def _summary_event(
         copyspec_tokens=copyspec_tokens,
         adaptive_metrics=adaptive_metrics,
         cycle_profile_totals_us=cycle_profile_totals_us,
+        hit_kind=hit_kind,
     )
 
 
@@ -235,6 +237,7 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
             cycles_completed=0,
             tokens_per_cycle=0.0,
             phase_timings_us={"prefill": 2_000_000.0},
+            hit_kind="l2_prefix",
         ),
         request_start_ns=1_000_000_000,
         request_done_ns=3_500_000_000,
@@ -290,6 +293,7 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
     assert row["physical_prefill_tokens"] == 1024
     assert row["prefill_tokens_restored"] == 3072
     assert row["prefill_tokens_computed"] == 1024
+    assert row["hit_kind"] == "l2_prefix"
     assert row["runtime_config"]["prefill_step_size"] == 8192
     assert "memory_waterfall" not in row["runtime_config"]
     assert row["memory_boundary_start"]["phys_footprint_bytes"] == 10_000_000_000
@@ -325,11 +329,13 @@ def test_target_only_request_records_live_metrics_and_post_event(tmp_path, monke
     assert row["max_tokens"] == 32
     assert row["cache_hit_tokens"] == 0
     assert row["cache_status"] == "COLD"
+    assert row["hit_kind"] == "miss"
     payload = get_live_metrics_payload()
     assert payload["last_request"]["request_id"] == 8
     assert payload["last_request"]["mode_used"] == "ar_fastpath"
     assert payload["last_request"]["max_tokens"] == 32
     assert payload["last_request"]["cache_status"] == "COLD"
+    assert payload["last_request"]["hit_kind"] == "miss"
     assert payload["totals"]["requests"] == 1
 
 
@@ -757,6 +763,7 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
         max_tokens=64,
         cache_hit_tokens=3072,
         cache_lookup_ms=1.5,
+        hit_kind="l1_exact",
     )
     update_live_request(
         request_id=9,
@@ -774,6 +781,7 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
     assert current["max_tokens"] == 64
     assert current["cache_hit_tokens"] == 3072
     assert current["cache_status"] == "WARM"
+    assert current["hit_kind"] == "l1_exact"
     assert current["cache_lookup_ms"] == 1.5
     assert current["prefill_tokens_processed"] == 1024
     assert current["prefill_tokens_total"] == 4096
@@ -862,6 +870,7 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
                 "cycle_wall": 910_000.0,
                 "yield_pause": 10_000.0,
             },
+            hit_kind="l1_prefix",
         ),
         request_start_ns=0,
         request_done_ns=4_000_000_000,
@@ -894,6 +903,7 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert last["generated_tokens"] == 100
     assert last["cache_hit_tokens"] == 750
     assert last["cache_status"] == "WARM"
+    assert last["hit_kind"] == "l1_prefix"
     assert last["ttft_s"] == 1.0
     assert last["prefill_tok_s_physical"] == 250.0
     assert last["prefill_tok_s_apparent"] == 1000.0

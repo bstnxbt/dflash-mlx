@@ -353,14 +353,28 @@ class DFlashAttention(nn.Module):
 
     def _context_segments_for_cache(
         self,
-        target_hidden: mx.array,
+        target_hidden: Any,
         cache: Any,
     ) -> tuple[mx.array, list[tuple[int, int]]]:
+        from dflash_mlx.cache.snapshot import TargetHiddenChunks
+
+        is_chunks = isinstance(target_hidden, TargetHiddenChunks)
+        total_len = int(target_hidden.shape[1])
         if not isinstance(cache, ContextOnlyDraftKVCache):
-            return target_hidden, [(0, int(target_hidden.shape[1]))]
-        spans = cache.context_spans_to_append(int(target_hidden.shape[1]))
+            if is_chunks:
+                return target_hidden.slice(0, total_len), [(0, total_len)]
+            return target_hidden, [(0, total_len)]
+        spans = cache.context_spans_to_append(total_len)
         if not spans:
+            if is_chunks:
+                return target_hidden.slice(0, 0), []
             return target_hidden[:, :0, :], []
+        if is_chunks:
+            pieces = [target_hidden.slice(start, end) for start, end in spans]
+            return (
+                pieces[0] if len(pieces) == 1 else mx.concatenate(pieces, axis=1),
+                spans,
+            )
         if len(spans) == 1:
             start, end = spans[0]
             return target_hidden[:, start:end, :], spans

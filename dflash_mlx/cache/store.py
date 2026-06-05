@@ -34,6 +34,11 @@ class PrefixSnapshotStore:
             "l2_prefill_tokens_saved": 0,
         }
         self._trace_config: TraceConfig | None = None
+        # Updated on every lookup to reflect the source of the last hit.
+        # L1 path: propagated from self._l1.last_hit_kind.
+        # L2 path: set directly in _record_l2_hit().
+        # Readable by RuntimeCacheManager while holding _state_lock.
+        self._last_hit_kind: str = "miss"
 
     def set_trace_config(self, trace_config: TraceConfig | None) -> None:
         self._trace_config = trace_config
@@ -114,10 +119,12 @@ class PrefixSnapshotStore:
             else:
                 self._stats["l2_prefix_hits"] += 1
             self._stats["l2_prefill_tokens_saved"] += int(l2_len)
+        self._last_hit_kind = "l2_exact" if exact else "l2_prefix"
         record_cache_event(
             self._trace_config,
             op="lookup",
             result="l2_hit",
+            hit_kind=self._last_hit_kind,
             request_id=request_id,
             req_tokens=len(req_tuple),
             matched_len=int(l2_len),
@@ -135,10 +142,14 @@ class PrefixSnapshotStore:
         request_id: int | None = None,
     ) -> tuple[int, DFlashPrefixSnapshot | None]:
         if request_id is None and record:
-            return self._l1.lookup(req_tuple, key)
-        if request_id is None:
-            return self._l1.lookup(req_tuple, key, record=record)
-        return self._l1.lookup(req_tuple, key, record=record, request_id=request_id)
+            result = self._l1.lookup(req_tuple, key)
+        elif request_id is None:
+            result = self._l1.lookup(req_tuple, key, record=record)
+        else:
+            result = self._l1.lookup(req_tuple, key, record=record, request_id=request_id)
+        if record:
+            self._last_hit_kind = self._l1.last_hit_kind
+        return result
 
     def insert(self, snapshot: DFlashPrefixSnapshot) -> bool:
         inserted_l2_admitted = False

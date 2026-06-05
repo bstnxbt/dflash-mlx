@@ -334,6 +334,15 @@ class _WritePayload:
     nbytes: int
     epoch: int
 
+@dataclass(frozen=True)
+class _WriteJob:
+    """Holds pre-eval'd arrays ready for disk write. Created on the request thread."""
+    arrays_mlx: dict
+    meta: dict
+    final_path: Path
+    nbytes: int
+    epoch: int
+
 class DFlashPrefixL2Cache:
 
     def __init__(
@@ -350,7 +359,7 @@ class DFlashPrefixL2Cache:
         self._lock = threading.Lock()
 
         self._writer_slots = threading.Semaphore(self._max_in_flight)
-        self._write_queue: Queue[Optional[_WritePayload]] = Queue()
+        self._write_queue: Queue[Optional[_WriteJob]] = Queue()
         self._epoch = 0
 
         self._tracked_disk_bytes = 0
@@ -501,23 +510,20 @@ class DFlashPrefixL2Cache:
                 self._stats["write_drops_queue_full"] += 1
             return False
         try:
-            payload = self._prepare_payload(snapshot)
-        except OSError as e:
-            if e.errno in (errno.ENOSPC, errno.EDQUOT):
-                _LOG.warning("L2 write skipped (disk full): %s", e)
-                with self._lock:
-                    self._stats["write_errors"] += 1
-            else:
-                _LOG.warning("L2 materialize failed: %s", e)
-                with self._lock:
-                    self._stats["materialize_errors"] += 1
-            self._writer_slots.release()
-            return False
+            arrays_mlx, meta = _serialize(snapshot)
+            _eval_arrays(arrays_mlx)
         except Exception:
             self._writer_slots.release()
             raise
-
-        self._write_queue.put(payload)
+        with self._lock:
+            epoch = self._epoch
+        self._write_queue.put(_WriteJob(
+            arrays_mlx=arrays_mlx,
+            meta=meta,
+            final_path=final_path,
+            nbytes=int(snapshot.nbytes),
+            epoch=epoch,
+        ))
         return True
 
     def stats(self) -> dict[str, Any]:
@@ -553,48 +559,59 @@ class DFlashPrefixL2Cache:
     def _writer_loop(self) -> None:
         while True:
             try:
-                payload = self._write_queue.get(timeout=0.5)
+                job = self._write_queue.get(timeout=0.5)
             except Empty:
                 if self._stop.is_set():
                     break
                 continue
-            if payload is None:
+            if job is None:
                 break
             try:
-                self._write_payload(payload)
-            except Exception as e:
-                _LOG.warning("L2 write failed: %s", e)
                 with self._lock:
-                    self._stats["write_errors"] += 1
+                    if job.epoch != self._epoch:
+                        self._stats["write_drops_epoch_invalidated"] += 1
+                        continue
+                try:
+                    payload = self._write_job_to_disk(job)
+                except OSError as e:
+                    if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                        _LOG.warning("L2 write skipped (disk full): %s", e)
+                        with self._lock:
+                            self._stats["write_errors"] += 1
+                    else:
+                        _LOG.warning("L2 materialize failed: %s", e)
+                        with self._lock:
+                            self._stats["materialize_errors"] += 1
+                    continue
+                try:
+                    self._write_payload(payload)
+                except Exception as e:
+                    _LOG.warning("L2 write failed: %s", e)
+                    with self._lock:
+                        self._stats["write_errors"] += 1
             finally:
-
-                payload = None
+                job = None
                 self._writer_slots.release()
 
-    def _prepare_payload(self, snapshot: DFlashPrefixSnapshot) -> _WritePayload:
-        arrays_mlx, meta = _serialize(snapshot)
-        _eval_arrays(arrays_mlx)
-        final_path = self._final_path_for(snapshot)
-        with self._lock:
-            epoch = self._epoch
-        if final_path.exists():
+    def _write_job_to_disk(self, job: _WriteJob) -> _WritePayload:
+        """Write pre-eval'd arrays to a temp file. Called from the writer thread."""
+        if job.final_path.exists():
             return _WritePayload(
                 tmp_path=None,
-                final_path=final_path,
-                nbytes=int(snapshot.nbytes),
-                epoch=int(epoch),
+                final_path=job.final_path,
+                nbytes=job.nbytes,
+                epoch=job.epoch,
             )
-
-        final_path.parent.mkdir(parents=True, exist_ok=True)
+        job.final_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{final_path.stem}.",
+            prefix=f".{job.final_path.stem}.",
             suffix=L2_TMP_SUFFIX,
-            dir=str(final_path.parent),
+            dir=str(job.final_path.parent),
         )
         os.close(tmp_fd)
         tmp_path = Path(tmp_name)
         try:
-            mx.save_safetensors(str(tmp_path), arrays_mlx, metadata=meta)
+            mx.save_safetensors(str(tmp_path), job.arrays_mlx, metadata=job.meta)
         except Exception:
             try:
                 tmp_path.unlink()
@@ -603,9 +620,9 @@ class DFlashPrefixL2Cache:
             raise
         return _WritePayload(
             tmp_path=tmp_path,
-            final_path=final_path,
-            nbytes=int(snapshot.nbytes),
-            epoch=int(epoch),
+            final_path=job.final_path,
+            nbytes=job.nbytes,
+            epoch=job.epoch,
         )
 
     def _write_payload(self, payload: _WritePayload) -> None:

@@ -102,6 +102,7 @@ class _RequestAccounting:
     finish_reason: Optional[str] = None
     cache_lookup_ms: Optional[float] = None
     cache_hit_tokens: int = 0
+    hit_kind: str = "miss"
     cache_insert_ms: Optional[float] = None
     prompt_regime: Optional[dict[str, Any]] = None
     prefill_event_payload: Optional[dict[str, Any]] = None
@@ -238,6 +239,7 @@ class _RequestAccounting:
             else None
         )
         fallback_used = bool(summary_event.fallback_ar if summary_event else False)
+        hit_kind = str(summary_event.hit_kind if summary_event is not None else "miss")
         return cls(
             request_id=int(request_id),
             mode_used="dflash_fallback" if fallback_used else "dflash",
@@ -265,6 +267,7 @@ class _RequestAccounting:
             max_tokens=int(max_tokens),
             cache_lookup_ms=float(cache_lookup_ms),
             cache_hit_tokens=int(cache_hit_tokens),
+            hit_kind=hit_kind,
             cache_insert_ms=float(cache_insert_ms),
             prompt_regime=dict(prompt_regime or {}),
             prefill_event_payload=(
@@ -326,6 +329,7 @@ class _RequestAccounting:
             copyspec_tokens=self.copyspec_tokens,
             finish_reason=self.finish_reason,
             cache_hit_tokens=self.cache_hit_tokens,
+            hit_kind=self.hit_kind,
             prefill_phase_timings_us=self.prefill_phase_timings_us,
             phase_timings_us=self.phase_timings_us,
         )
@@ -345,6 +349,7 @@ class _RequestAccounting:
             "wall_ms": float(self.wall_ms),
             "cache_hit_tokens": int(self.cache_hit_tokens),
             "cache_status": _cache_status(self.cache_hit_tokens),
+            "hit_kind": self.hit_kind,
         }
         if self.prompt_tokens is None:
             return payload
@@ -511,6 +516,7 @@ def start_live_request(
     max_tokens: int,
     cache_hit_tokens: int = 0,
     cache_lookup_ms: float = 0.0,
+    hit_kind: str = "miss",
 ) -> None:
     current = {
         "request_id": int(request_id),
@@ -521,6 +527,7 @@ def start_live_request(
         "generated_tokens": 0,
         "cache_hit_tokens": int(cache_hit_tokens),
         "cache_status": _cache_status(cache_hit_tokens),
+        "hit_kind": str(hit_kind),
         "cache_lookup_ms": float(cache_lookup_ms),
         "prefill_tokens_processed": None,
         "prefill_tokens_total": _int_or_none(prompt_tokens),
@@ -1030,6 +1037,7 @@ def _last_request_payload(
     copyspec_tokens: int,
     finish_reason: Optional[str],
     cache_hit_tokens: int = 0,
+    hit_kind: str = "miss",
     prefill_phase_timings_us: Optional[dict[str, float]] = None,
     phase_timings_us: Optional[dict[str, float]] = None,
 ) -> dict[str, Any]:
@@ -1059,6 +1067,7 @@ def _last_request_payload(
         "finish_reason": finish_reason,
         "cache_hit_tokens": int(cache_hit_tokens),
         "cache_status": _cache_status(cache_hit_tokens),
+        "hit_kind": str(hit_kind),
         "prefill_phase_timings_us": dict(prefill_phase_timings_us or {}),
         "phase_timings_us": dict(phase_timings_us or {}),
     }
