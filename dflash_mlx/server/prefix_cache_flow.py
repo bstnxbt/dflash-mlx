@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from dflash_mlx.cache.manager import (
@@ -74,6 +74,63 @@ def _last_chat_role(request: Any) -> str | None:
         return None
     return str(role)
 
+@dataclass(frozen=True)
+class PrefixCacheLookupStats:
+    prompt_tokens: int = 0
+    stable_prefix_tokens: int = 0
+    lookup_tokens: int = 0
+    hit_tokens: int = 0
+    lookup_ms: float = 0.0
+    hit_kind: str = "inactive"
+    snapshot_tokens: int = 0
+    snapshot_kind: Optional[str] = None
+    snapshot_nbytes: int = 0
+    snapshot_has_last_logits: bool = False
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "prompt_tokens": int(self.prompt_tokens),
+            "stable_prefix_tokens": int(self.stable_prefix_tokens),
+            "lookup_tokens": int(self.lookup_tokens),
+            "hit_tokens": int(self.hit_tokens),
+            "lookup_ms": float(self.lookup_ms),
+            "hit_kind": self.hit_kind,
+            "snapshot_tokens": int(self.snapshot_tokens),
+            "snapshot_kind": self.snapshot_kind,
+            "snapshot_nbytes": int(self.snapshot_nbytes),
+            "snapshot_has_last_logits": bool(self.snapshot_has_last_logits),
+        }
+
+
+def _lookup_stats(
+    *,
+    prompt: list[int],
+    stable_prefix_len: int,
+    lookup_ms: float,
+    hit_tokens: int,
+    snapshot: Optional[DFlashPrefixSnapshot],
+) -> PrefixCacheLookupStats:
+    lookup_tokens = min(len(prompt), stable_prefix_len)
+    if hit_tokens <= 0:
+        hit_kind = "miss"
+    elif hit_tokens == lookup_tokens:
+        hit_kind = "exact"
+    else:
+        hit_kind = "prefix"
+    return PrefixCacheLookupStats(
+        prompt_tokens=len(prompt),
+        stable_prefix_tokens=stable_prefix_len,
+        lookup_tokens=lookup_tokens,
+        hit_tokens=hit_tokens,
+        lookup_ms=lookup_ms,
+        hit_kind=hit_kind,
+        snapshot_tokens=0 if snapshot is None else snapshot.prefix_len,
+        snapshot_kind=None if snapshot is None else snapshot.kind,
+        snapshot_nbytes=0 if snapshot is None else snapshot.nbytes,
+        snapshot_has_last_logits=snapshot is not None and snapshot.last_logits is not None,
+    )
+
+
 @dataclass
 class PrefixCacheFlow:
     cache_manager: Optional[RuntimeCacheManager]
@@ -83,6 +140,7 @@ class PrefixCacheFlow:
     snapshot: Optional[DFlashPrefixSnapshot] = None
     lookup_ms: float = 0.0
     hit_tokens: int = 0
+    lookup_stats: PrefixCacheLookupStats = field(default_factory=PrefixCacheLookupStats)
     snapshot_service: Optional[SnapshotService] = None
 
     @property
@@ -146,6 +204,13 @@ class PrefixCacheFlow:
         except RuntimeCacheManagerClosed:
             return cls(cache_manager=None)
         hit_tokens = int(lookup.matched_tokens)
+        lookup_stats = _lookup_stats(
+            prompt=prompt,
+            stable_prefix_len=stable_prefix_len,
+            lookup_ms=lookup.elapsed_ms,
+            hit_tokens=hit_tokens,
+            snapshot=lookup.snapshot,
+        )
         if lookup.matched_tokens > 0:
             sys.stderr.write(
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix cache hit "
@@ -164,6 +229,7 @@ class PrefixCacheFlow:
             snapshot=lookup.snapshot,
             lookup_ms=lookup.elapsed_ms,
             hit_tokens=hit_tokens,
+            lookup_stats=lookup_stats,
             snapshot_service=(
                 SnapshotService.from_request(
                     cache_manager=cache_manager,

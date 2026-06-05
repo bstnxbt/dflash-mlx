@@ -201,6 +201,7 @@ class ServerRuntime:
             cache_lookup_ms=loop_result.cache_lookup_ms,
             cache_hit_tokens=loop_result.cache_hit_tokens,
             cache_insert_ms=loop_result.cache_insert_ms,
+            cache_lookup_stats=loop_result.cache_lookup_stats,
             finish_reason=loop_result.finish_reason,
             max_tokens=args.max_tokens,
             prompt_regime=build_prompt_regime(args, tokenizer, request),

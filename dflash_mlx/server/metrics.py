@@ -103,6 +103,7 @@ class _RequestAccounting:
     cache_lookup_ms: Optional[float] = None
     cache_hit_tokens: int = 0
     cache_insert_ms: Optional[float] = None
+    cache_lookup_stats: Optional[dict[str, Any]] = None
     prompt_regime: Optional[dict[str, Any]] = None
     prefill_event_payload: Optional[dict[str, Any]] = None
     prefill_accounting: Optional[dict[str, int]] = None
@@ -147,6 +148,7 @@ class _RequestAccounting:
         cache_insert_ms: float,
         finish_reason: Optional[str],
         max_tokens: int,
+        cache_lookup_stats: Optional[dict[str, Any]] = None,
         prompt_regime: Optional[dict[str, Any]],
         memory_waterfall_peak: Optional[dict[str, Any]],
         memory_waterfall_start: Optional[dict[str, Any]] = None,
@@ -266,6 +268,7 @@ class _RequestAccounting:
             cache_lookup_ms=float(cache_lookup_ms),
             cache_hit_tokens=int(cache_hit_tokens),
             cache_insert_ms=float(cache_insert_ms),
+            cache_lookup_stats=dict(cache_lookup_stats or {}),
             prompt_regime=dict(prompt_regime or {}),
             prefill_event_payload=(
                 prefill_event.to_payload() if prefill_event is not None else {}
@@ -331,6 +334,8 @@ class _RequestAccounting:
         )
         if self.cycle_profile_totals_us:
             payload["cycle_profile_totals_us"] = dict(self.cycle_profile_totals_us)
+        if self.cache_lookup_stats:
+            payload["cache_lookup"] = dict(self.cache_lookup_stats)
         if self.adaptive_metrics:
             payload["adaptive_metrics"] = dict(self.adaptive_metrics)
         payload["mode_used"] = self.mode_used
@@ -362,6 +367,7 @@ class _RequestAccounting:
                 "decode_ms": self.decode_ms,
                 "cache_lookup_ms": self.cache_lookup_ms,
                 "cache_insert_ms": self.cache_insert_ms,
+                "cache_lookup": dict(self.cache_lookup_stats or {}),
                 "acceptance_ratio": self.acceptance_ratio,
                 "tokens_per_cycle": self.tokens_per_cycle,
                 "cycles_completed": self.cycles_completed,
@@ -668,6 +674,7 @@ def finalize_request_observability(
     cache_insert_ms: float,
     finish_reason: Optional[str],
     max_tokens: int,
+    cache_lookup_stats: Optional[dict[str, Any]] = None,
     prompt_regime: Optional[dict[str, Any]] = None,
     memory_waterfall_peak: Optional[dict[str, Any]] = None,
     memory_waterfall_start: Optional[dict[str, Any]] = None,
@@ -689,6 +696,7 @@ def finalize_request_observability(
         cache_hit_tokens=cache_hit_tokens,
         cache_insert_ms=cache_insert_ms,
         finish_reason=finish_reason,
+        cache_lookup_stats=cache_lookup_stats,
         max_tokens=max_tokens,
         prompt_regime=prompt_regime,
         memory_waterfall_peak=memory_waterfall_peak,
