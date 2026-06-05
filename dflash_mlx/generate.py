@@ -108,14 +108,22 @@ def run_generate(
     if summary is None:
         return 1
 
+    sys.stderr.write(f"\n{format_generation_summary(summary)}\n")
+    sys.stderr.flush()
+    return 0
+
+def format_generation_summary(summary: SummaryEvent) -> str:
     tps = generation_tps_from_summary(summary)
     acceptance_pct = float(summary.acceptance_ratio) * 100.0
     token_count = int(summary.generation_tokens)
-    sys.stderr.write(
-        f"\n{token_count} tokens | {tps:.1f} tok/s | {acceptance_pct:.1f}% acceptance\n"
-    )
-    sys.stderr.flush()
-    return 0
+    line = f"{token_count} tokens | {tps:.1f} tok/s | {acceptance_pct:.1f}% acceptance"
+    copyspec_hits = int(summary.copyspec_hits)
+    if copyspec_hits > 0:
+        line += (
+            f" | copyspec {copyspec_hits} blocks"
+            f" / {int(summary.copyspec_tokens)} tokens"
+        )
+    return line
 
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     apply_metal_limits()

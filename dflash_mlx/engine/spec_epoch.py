@@ -21,7 +21,7 @@ from dflash_mlx.cache.snapshot import (
 )
 from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
-from dflash_mlx.engine.copyspec import CopySpecIndex
+from dflash_mlx.engine.copyspec import CopySpecGate, CopySpecIndex
 from dflash_mlx.engine.ddtree import (
     build_flat_ddtree,
     build_flat_tree_inputs,
@@ -1089,7 +1089,7 @@ class SpeculativeSession:
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
-            if state.copyspec_disabled:
+            if not state.copyspec_gate.should_attempt():
                 return None
             candidate = self.copyspec_index.draft_after(
                 int(staged_first.item()),
@@ -1597,8 +1597,7 @@ class SpeculativeSession:
             if best.source == "copyspec":
                 copyspec_hits_total += 1
                 copyspec_tokens_total += copyspec_tokens_cycle or max(0, int(block_len) - 1)
-                if acceptance_len == 0:
-                    state.copyspec_disabled = True
+                state.copyspec_gate.record_block(acceptance_len)
             if profile_cycles:
                 acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
 
@@ -1864,7 +1863,7 @@ class SpeculativeSession:
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
-            if state.copyspec_disabled:
+            if not state.copyspec_gate.should_attempt():
                 return None
             candidate = self.copyspec_index.draft_after(
                 int(staged_first.item()),
@@ -2124,8 +2123,7 @@ class SpeculativeSession:
             if draft_source == "copyspec":
                 state.copyspec_hits += 1
                 state.copyspec_tokens += copyspec_tokens or max(0, int(block_len) - 1)
-                if acceptance_len == 0:
-                    state.copyspec_disabled = True
+                state.copyspec_gate.record_block(acceptance_len)
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
             if adaptive_block_policy is not None:
                 cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
@@ -2450,7 +2448,7 @@ class _RequestState:
     prefetched_draft: dict[str, Any] | None = None
     copyspec_hits: int = 0
     copyspec_tokens: int = 0
-    copyspec_disabled: bool = False
+    copyspec_gate: CopySpecGate = field(default_factory=CopySpecGate)
 
 
 @dataclass
