@@ -43,15 +43,20 @@ token targets produced by the same benchmark harness for every model.
 
 The strongest controlled decode comparisons were:
 
-| Target | Control | DFlash | Relative throughput |
+| Target artifact | Control | DFlash | Relative throughput |
 |---|---:|---:|---:|
-| Qwen 3.6 27B | 17.1 tok/s native MTP | 52.5 tok/s | 3.07x |
-| Gemma 4 31B | 9.4 tok/s target-only | 29.2 tok/s at 93.8% acceptance | 3.11x |
+| Qwen 3.6 27B FP16-oQ6 | 17.1 tok/s native MTP | 52.5 tok/s | 3.07x |
+| Gemma 4 31B BF16-oQ6 (earlier run) | 9.4 tok/s target-only | 29.2 tok/s at 93.8% acceptance | 3.11x |
 
 The Qwen comparison used the same FP16-oQ6 target weights for both rows. The
 control used native MTP heads; the DFlash row used the BF16
-`z-lab/Qwen3.6-27B-DFlash` drafter. The Gemma control and DFlash result came
-from the same target artifact.
+`z-lab/Qwen3.6-27B-DFlash` drafter.
+
+The Gemma control was a separate, earlier matched run using the original
+BF16-oQ6 target for both legs. It should not be compared directly with the
+42.9 tok/s result above: that later result uses the converted FP16-oQ6 target.
+No matched target-only measurement was collected for the FP16 Gemma bundle, so
+the report does not claim a speedup ratio for its 42.9 tok/s result.
 
 ## Prefix Cache Restoration
 
@@ -92,8 +97,9 @@ restores from the SSD snapshot.
 | 65,536 | 130,694 | 638 | 5,017 | 65,532 / 4 |
 
 For every 8K, 32K, and 64K probe, the restored response SHA-256 matched its
-deterministic cold control. The 64K Gemma 31B run measured 46.54 GB peak DFlash
-memory.
+deterministic cold control. The FP16 Gemma 31B 64K runs measured approximately
+45.1-52.3 GB peak DFlash memory depending on cache phase; exact L1 and L2
+restores were approximately 45.6 GB.
 
 Cache settings:
 
@@ -123,8 +129,8 @@ Sample counts were 300 MMLU-Pro, 817 TruthfulQA, 300 ARC Challenge, 100 GSM8K,
 
 ## Interpretation
 
-- DFlash provided roughly 3.1x decode throughput in the two matched control
-  comparisons.
+- DFlash provided roughly 3.1x decode throughput in two matched controls: the
+  current Qwen FP16 artifact and an earlier Gemma BF16 artifact.
 - Cold TTFT remains dominated by target prefill and scales with model
   architecture and context length.
 - Exact L1 restoration reduced 64K TTFT to less than one second on all four
