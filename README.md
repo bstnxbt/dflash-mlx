@@ -66,6 +66,13 @@ Apple M5 Max, 64 GB unified memory, MLX 0.31.1. Protocol: stock `mlx_lm.stream_g
 
 Per-run JSON: [`benchmark/results/`](benchmark/results/). Reproduce on your hardware with `dflash benchmark`.
 
+Additional integration evidence:
+
+- [oMLX DFlash benchmarks on an M1 Max 64 GB](docs/omlx-m1-max-benchmarks.md)
+  cover Qwen 3.6 and Gemma 4 FP16-oQ6 bundles, including exact L1/L2 prefix
+  restoration through 64K context. These use the oMLX request path and are
+  reported separately from the canonical standalone benchmark above.
+
 ## Install
 
 ```bash
