@@ -540,6 +540,7 @@ class SpeculativeSession:
     clear_cache_boundaries: bool
     target_fa_window: int
     copyspec_index: CopySpecIndex
+    copyspec_mode: str
 
     @classmethod
     def open(
@@ -625,6 +626,7 @@ class SpeculativeSession:
             clear_cache_boundaries=bool(runtime_config.clear_cache_boundaries),
             target_fa_window=target_fa_window,
             copyspec_index=CopySpecIndex(prompt_tokens),
+            copyspec_mode=str(getattr(runtime_config, "copyspec_mode", "conservative")),
         )
 
     def clear_cache_boundary(self) -> None:
@@ -1093,7 +1095,7 @@ class SpeculativeSession:
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
-            if state.copyspec_disabled:
+            if self.copyspec_mode == "off" or state.copyspec_disabled:
                 return None
             candidate = self.copyspec_index.draft_after(
                 int(staged_first.item()),
@@ -1601,7 +1603,7 @@ class SpeculativeSession:
             if best.source == "copyspec":
                 copyspec_hits_total += 1
                 copyspec_tokens_total += copyspec_tokens_cycle or max(0, int(block_len) - 1)
-                if acceptance_len == 0:
+                if self.copyspec_mode == "conservative" and acceptance_len == 0:
                     state.copyspec_disabled = True
             if profile_cycles:
                 acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
@@ -1868,7 +1870,7 @@ class SpeculativeSession:
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
-            if state.copyspec_disabled:
+            if self.copyspec_mode == "off" or state.copyspec_disabled:
                 return None
             candidate = self.copyspec_index.draft_after(
                 int(staged_first.item()),
@@ -2128,7 +2130,7 @@ class SpeculativeSession:
             if draft_source == "copyspec":
                 state.copyspec_hits += 1
                 state.copyspec_tokens += copyspec_tokens or max(0, int(block_len) - 1)
-                if acceptance_len == 0:
+                if self.copyspec_mode == "conservative" and acceptance_len == 0:
                     state.copyspec_disabled = True
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
             if adaptive_block_policy is not None:

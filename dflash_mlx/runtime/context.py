@@ -49,6 +49,7 @@ def build_offline_runtime_config(
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
 ) -> EffectiveRuntimeConfig:
     runtime_config = _runtime_config_from_defaults(
         prefix_cache=False,
@@ -60,6 +61,7 @@ def build_offline_runtime_config(
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     return validate_runtime_config(runtime_config)
 
@@ -72,6 +74,7 @@ def build_offline_runtime_context(
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
 ) -> RuntimeContext:
     runtime_config = build_offline_runtime_config(
         target_fa_window=target_fa_window,
@@ -81,6 +84,7 @@ def build_offline_runtime_context(
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     return build_runtime_context(runtime_config)
 

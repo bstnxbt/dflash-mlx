@@ -296,6 +296,7 @@ def test_offline_runtime_arguments_project_from_shared_runtime_schema():
         "draft_window_size": 512,
         "verify_len_cap": 0,
         "verify_mode": "ddtree",
+        "copyspec_mode": "conservative",
     }
 
 
@@ -410,3 +411,37 @@ def test_speculative_cycle_config_threads_verify_cap_after_block_clamp():
 
     assert cycle.effective_block_tokens == 12
     assert cycle.verify_len_cap == 4
+
+
+def test_copyspec_mode_default_is_conservative():
+    cfg = runtime_config_from_defaults()
+
+    assert cfg.copyspec_mode == "conservative"
+
+
+def test_copyspec_mode_accepts_valid_choices():
+    for mode in ("conservative", "aggressive", "off"):
+        cfg = runtime_config_from_defaults(copyspec_mode=mode)
+        assert cfg.copyspec_mode == mode
+
+
+def test_copyspec_mode_rejects_invalid_value():
+    with pytest.raises(ValueError, match="copyspec_mode must be conservative"):
+        runtime_config_from_defaults(copyspec_mode="always")
+
+
+def test_offline_runtime_arguments_accept_copyspec_mode():
+    parser = argparse.ArgumentParser()
+    add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
+
+    args = parser.parse_args(["--copyspec-mode", "aggressive"])
+
+    assert offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS)["copyspec_mode"] == "aggressive"
+
+
+def test_offline_runtime_arguments_reject_invalid_copyspec_mode():
+    parser = argparse.ArgumentParser()
+    add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--copyspec-mode", "always"])

@@ -100,6 +100,7 @@ def test_generate_cli_passes_verify_mode(monkeypatch):
             "draft_window_size": 512,
             "verify_len_cap": 8,
             "verify_mode": "off",
+            "copyspec_mode": "conservative",
             "draft_quant": "w4",
         }
     ]
