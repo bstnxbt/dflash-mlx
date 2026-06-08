@@ -71,6 +71,7 @@ class EffectiveRuntimeConfig:
     target_fa_window: int
     dflash_max_ctx: int
     verify_mode: str
+    copyspec_mode: str
     quantize_kv_cache: bool
     prefix_cache_l2_frontier_stride: int
 
@@ -90,6 +91,7 @@ DEFAULT_RUNTIME_CONFIG = EffectiveRuntimeConfig(
     target_fa_window=0,
     dflash_max_ctx=0,
     verify_mode="adaptive",
+    copyspec_mode="conservative",
     quantize_kv_cache=False,
     prefix_cache_l2_frontier_stride=0,
 )
@@ -208,6 +210,19 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         env="DFLASH_VERIFY_MODE",
         choices=("dflash", "adaptive", "ddtree", "off"),
         help="Verify path mode. Default adaptive shortens low-acceptance blocks; use off only for debug/parity.",
+        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
+    ),
+    RuntimeConfigFieldSpec(
+        field="copyspec_mode",
+        flags=("--copyspec-mode",),
+        env="DFLASH_COPYSPEC_MODE",
+        choices=("conservative", "off", "auto"),
+        help=(
+            "Prompt-lookup (copyspec) drafting. Default 'conservative' disables copyspec after one missed "
+            "copy block. 'auto' self-gates: periodically A/B-probes copyspec on vs off and latches to whichever "
+            "is faster, resetting adaptive state on disengage (a clear win on strong-copyspec targets like large "
+            "MoE; self-disables where copyspec doesn't pay off). 'off' disables copyspec entirely."
+        ),
         surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
     RuntimeConfigFieldSpec(
@@ -383,6 +398,7 @@ def runtime_config_field_defaults(
 
 _GENERATE_RUNTIME_FIELD_ORDER = (
     "verify_mode",
+    "copyspec_mode",
     "prefill_step_size",
     "target_fa_window",
     "quantize_kv_cache",
@@ -393,6 +409,7 @@ _GENERATE_RUNTIME_FIELD_ORDER = (
 
 _BENCHMARK_RUNTIME_FIELD_ORDER = (
     "verify_mode",
+    "copyspec_mode",
     "prefill_step_size",
     "target_fa_window",
     "quantize_kv_cache",
@@ -428,6 +445,7 @@ def runtime_config_from_defaults(
     target_fa_window: int = 0,
     dflash_max_ctx: int = 0,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
     quantize_kv_cache: bool | None = None,
     prefix_cache_l2_frontier_stride: int | None = None,
 ) -> EffectiveRuntimeConfig:
@@ -491,6 +509,7 @@ def runtime_config_from_defaults(
             target_fa_window=int(target_fa_window),
             dflash_max_ctx=int(dflash_max_ctx),
             verify_mode=defaults.verify_mode if verify_mode is None else str(verify_mode),
+            copyspec_mode=defaults.copyspec_mode if copyspec_mode is None else str(copyspec_mode),
             quantize_kv_cache=(
                 defaults.quantize_kv_cache
                 if quantize_kv_cache is None
@@ -583,6 +602,7 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             0,
         ),
         verify_mode=_resolve_verify_mode(getattr(args, "verify_mode", None), defaults.verify_mode),
+        copyspec_mode=_resolve_copyspec_mode(getattr(args, "copyspec_mode", None), defaults.copyspec_mode),
         prefix_cache_l2_frontier_stride=_resolve_int(
             getattr(args, "prefix_cache_l2_frontier_stride", None),
             _runtime_env("prefix_cache_l2_frontier_stride"),
@@ -641,6 +661,10 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
     if cfg.verify_mode not in ("dflash", "adaptive", "ddtree", "off"):
         raise ValueError(
             "--verify-mode / verify_mode must be dflash, adaptive, ddtree, or off"
+        )
+    if cfg.copyspec_mode not in ("conservative", "off", "auto"):
+        raise ValueError(
+            "--copyspec-mode / copyspec_mode must be conservative, off, or auto"
         )
     if not cfg.prefix_cache and cfg.prefix_cache_l2:
         return replace(cfg, prefix_cache_l2=False)
@@ -702,6 +726,14 @@ def _resolve_verify_mode(cli_value: str | None, default: str) -> str:
     if cli_value is not None:
         return str(cli_value)
     raw = os.environ.get(_runtime_env("verify_mode"), "").strip()
+    if raw:
+        return raw
+    return default
+
+def _resolve_copyspec_mode(cli_value: str | None, default: str) -> str:
+    if cli_value is not None:
+        return str(cli_value)
+    raw = os.environ.get(_runtime_env("copyspec_mode"), "").strip()
     if raw:
         return raw
     return default

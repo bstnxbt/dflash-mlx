@@ -22,7 +22,7 @@ from dflash_mlx.cache.snapshot import (
 )
 from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
-from dflash_mlx.engine.copyspec import CopySpecIndex
+from dflash_mlx.engine.copyspec import CopySpecAutoGate, CopySpecIndex
 from dflash_mlx.engine.ddtree import (
     build_flat_ddtree,
     build_flat_tree_inputs,
@@ -540,6 +540,7 @@ class SpeculativeSession:
     clear_cache_boundaries: bool
     target_fa_window: int
     copyspec_index: CopySpecIndex
+    copyspec_mode: str
 
     @classmethod
     def open(
@@ -625,6 +626,7 @@ class SpeculativeSession:
             clear_cache_boundaries=bool(runtime_config.clear_cache_boundaries),
             target_fa_window=target_fa_window,
             copyspec_index=CopySpecIndex(prompt_tokens),
+            copyspec_mode=str(getattr(runtime_config, "copyspec_mode", "conservative")),
         )
 
     def clear_cache_boundary(self) -> None:
@@ -1093,7 +1095,7 @@ class SpeculativeSession:
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
-            if state.copyspec_disabled:
+            if self.copyspec_mode == "off" or state.copyspec_disabled:
                 return None
             candidate = self.copyspec_index.draft_after(
                 int(staged_first.item()),
@@ -1601,7 +1603,9 @@ class SpeculativeSession:
             if best.source == "copyspec":
                 copyspec_hits_total += 1
                 copyspec_tokens_total += copyspec_tokens_cycle or max(0, int(block_len) - 1)
-                if acceptance_len == 0:
+                # ddtree path has no adaptive policy / auto-gate: treat auto
+                # as the safe conservative one-strike here.
+                if self.copyspec_mode in ("conservative", "auto") and acceptance_len == 0:
                     state.copyspec_disabled = True
             if profile_cycles:
                 acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
@@ -1845,6 +1849,14 @@ class SpeculativeSession:
             verify_len_cap=cycle_config.verify_len_cap,
             prompt_len=request.prompt_len,
         )
+        # copyspec_mode=auto: a self-gating policy that periodically A/B-probes
+        # copyspec-on vs -off throughput, latches on/off, and signals an
+        # adaptive-policy reset on disengage (so copyspec perturbation is
+        # wiped). Only the linear/adaptive path runs it (the ddtree path maps
+        # auto -> conservative one-strike).
+        copyspec_auto_gate = (
+            CopySpecAutoGate() if self.copyspec_mode == "auto" else None
+        )
         block_token_buffer = mx.full(
             (effective_block_tokens,),
             int(draft_model.mask_token_id),
@@ -1868,7 +1880,7 @@ class SpeculativeSession:
             block_len: int,
             draft_context: mx.array,
         ) -> mx.array | None:
-            if state.copyspec_disabled:
+            if self.copyspec_mode == "off" or state.copyspec_disabled:
                 return None
             candidate = self.copyspec_index.draft_after(
                 int(staged_first.item()),
@@ -1876,6 +1888,8 @@ class SpeculativeSession:
                 forbidden_tokens=forbidden_copy_tokens,
             )
             if candidate is None:
+                return None
+            if copyspec_auto_gate is not None and not copyspec_auto_gate.engage_copy():
                 return None
             draft_backend.advance_context(
                 draft_model=draft_model,
@@ -2128,10 +2142,10 @@ class SpeculativeSession:
             if draft_source == "copyspec":
                 state.copyspec_hits += 1
                 state.copyspec_tokens += copyspec_tokens or max(0, int(block_len) - 1)
-                if acceptance_len == 0:
+                if self.copyspec_mode == "conservative" and acceptance_len == 0:
                     state.copyspec_disabled = True
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
-            if adaptive_block_policy is not None:
+            if adaptive_block_policy is not None or copyspec_auto_gate is not None:
                 cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
                 cycle_pause_ns = max(0, yield_pause.pause_ns - cycle_pause_start_ns)
                 adaptive_cycle_cost_ns = max(0, cycle_wall_ns - cycle_pause_ns)
@@ -2144,11 +2158,30 @@ class SpeculativeSession:
                         + commit_cycle_ns
                         + replay_cycle_ns
                     )
-                adaptive_block_policy.record(
-                    block_len=block_len,
-                    acceptance_len=acceptance_len,
-                    cycle_cost_ns=adaptive_cycle_cost_ns,
-                )
+                if copyspec_auto_gate is not None and block_len > 1:
+                    copyspec_auto_gate.record_cycle(
+                        source=("copy" if draft_source == "copyspec" else "dflash"),
+                        commit_count=commit_count,
+                        cycle_cost_ns=adaptive_cycle_cost_ns,
+                    )
+                    # On disengage the gate asks for a clean adaptive policy so
+                    # copyspec's perturbation does not drag the rest of the run.
+                    if (
+                        copyspec_auto_gate.take_reset()
+                        and adaptive_block_policy is not None
+                    ):
+                        adaptive_block_policy = _AdaptiveBlockPolicy.from_runtime(
+                            runtime_config=runtime_config,
+                            effective_block_tokens=effective_block_tokens,
+                            verify_len_cap=cycle_config.verify_len_cap,
+                            prompt_len=request.prompt_len,
+                        )
+                if adaptive_block_policy is not None:
+                    adaptive_block_policy.record(
+                        block_len=block_len,
+                        acceptance_len=acceptance_len,
+                        cycle_cost_ns=adaptive_cycle_cost_ns,
+                    )
             committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
             self.copyspec_index.append_committed(committed_ids)
             if not profile_cycles:

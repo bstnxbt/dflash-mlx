@@ -92,6 +92,7 @@ CONTROLLED_FLAG_NAMES = (
     "draft_window_size",
     "verify_len_cap",
     "verify_mode",
+    "copyspec_mode",
     "only_dflash",
     "out",
 )
@@ -512,6 +513,7 @@ def _build_config(
     draft_window_size: int,
     verify_len_cap: int,
     verify_mode: str,
+    copyspec_mode: str,
     only_dflash: bool,
 ) -> dict[str, Any]:
     return {
@@ -532,6 +534,7 @@ def _build_config(
         "draft_window_size": int(draft_window_size),
         "verify_len_cap": int(verify_len_cap),
         "verify_mode": str(verify_mode),
+        "copyspec_mode": str(copyspec_mode),
         "only_dflash": bool(only_dflash),
         "prompt": prompt,
         "prompt_tokens": int(prompt_tokens),
@@ -547,6 +550,7 @@ def _offline_runtime_values(
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
 ) -> dict[str, Any]:
     cfg = build_offline_runtime_config(
         prefill_step_size=prefill_step_size,
@@ -555,6 +559,7 @@ def _offline_runtime_values(
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     return {
         "prefill_step_size": int(cfg.prefill_step_size),
@@ -563,6 +568,7 @@ def _offline_runtime_values(
         "draft_window_size": int(cfg.draft_window_size),
         "verify_len_cap": int(cfg.verify_len_cap),
         "verify_mode": str(cfg.verify_mode),
+        "copyspec_mode": str(cfg.copyspec_mode),
     }
 
 def _build_single_case_report(
@@ -586,6 +592,7 @@ def _build_single_case_report(
     draft_window_size: int,
     verify_len_cap: int,
     verify_mode: str,
+    copyspec_mode: str,
     only_dflash: bool,
 ) -> dict[str, Any]:
     run_entries = [_format_run_entry(run) for run in runs]
@@ -653,6 +660,7 @@ def _build_single_case_report(
             draft_window_size=draft_window_size,
             verify_len_cap=verify_len_cap,
             verify_mode=verify_mode,
+            copyspec_mode=copyspec_mode,
             only_dflash=only_dflash,
         ),
         "runs": run_entries,
@@ -1017,6 +1025,7 @@ def _run_once_sequential(
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
     expected_answer: str | None = None,
     cooldown: int = 0,
     only_dflash: bool = False,
@@ -1073,6 +1082,7 @@ def _run_once_sequential(
             draft_window_size=draft_window_size,
             verify_len_cap=verify_len_cap,
             verify_mode=verify_mode,
+            copyspec_mode=copyspec_mode,
         )
         bundle = load_runtime_bundle(
             model_ref=target_model_ref,
@@ -1190,6 +1200,7 @@ def benchmark_once(
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
     cooldown: int = 10,
     expected_answer: str | None = None,
     only_dflash: bool = False,
@@ -1201,6 +1212,7 @@ def benchmark_once(
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     thermal_pressure = _get_thermal_pressure()
     _warn_if_throttled(thermal_pressure)
@@ -1258,6 +1270,7 @@ def benchmark_repeated(
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    copyspec_mode: str | None = None,
     cooldown: int = 10,
     expected_answer: str | None = None,
     only_dflash: bool = False,
@@ -1269,6 +1282,7 @@ def benchmark_repeated(
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
+        copyspec_mode=copyspec_mode,
     )
     target_meta: dict[str, Any] | None = None
     draft_meta: dict[str, Any] | None = None
@@ -1349,6 +1363,7 @@ def benchmark_suite(
         "draft_window_size": args.draft_window_size,
         "verify_len_cap": args.verify_len_cap,
         "verify_mode": args.verify_mode,
+        "copyspec_mode": args.copyspec_mode,
         "cooldown": args.cooldown,
         "only_dflash": bool(args.only_dflash),
     }
@@ -1567,6 +1582,7 @@ def _controlled_flag_values(
         "draft_window_size": int(args.draft_window_size),
         "verify_len_cap": int(args.verify_len_cap),
         "verify_mode": str(args.verify_mode),
+        "copyspec_mode": str(args.copyspec_mode),
         "only_dflash": bool(args.only_dflash),
         "out": str(output_path),
     }
@@ -1603,6 +1619,7 @@ def _explicit_flag_values(
         "--draft-window-size": "draft_window_size",
         "--verify-len-cap": "verify_len_cap",
         "--verify-mode": "verify_mode",
+        "--copyspec-mode": "copyspec_mode",
         "--only-dflash": "only_dflash",
         "--out": "out",
     }
