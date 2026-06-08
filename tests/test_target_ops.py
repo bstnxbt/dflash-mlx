@@ -53,6 +53,16 @@ class _FakeTarget:
             embed_tokens=_FakeEmbed(),
         )
 
+class _WrongOuterEmbed:
+    def as_linear(self, hidden: mx.array) -> mx.array:
+        del hidden
+        return mx.array([[[1.0, 0.0]]])
+
+class _RealQwenLmHead:
+    def __call__(self, hidden: mx.array) -> mx.array:
+        del hidden
+        return mx.array([[[0.0, 1.0]]])
+
 def _fake_qwen_full_attention(*, q_heads: int = 4, kv_heads: int = 1, head_dim: int = 256):
     class _Proj:
         def __init__(self, out_dim: int) -> None:
@@ -260,6 +270,31 @@ def test_resolver_rejects_empty_model_type_even_with_qwen_like_shape():
         assert "model_type=unknown" in str(exc)
     else:
         raise AssertionError("empty model_type must not resolve to Qwen ops")
+
+def test_qwen_text_wrapper_prefers_language_model_over_outer_model():
+    real_text_wrapper = SimpleNamespace(
+        args=SimpleNamespace(tie_word_embeddings=False),
+        model=SimpleNamespace(layers=[_FakeFaLayer()], embed_tokens=_FakeEmbed()),
+        lm_head=_RealQwenLmHead(),
+    )
+    outer_wrapper = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[_FakeFaLayer()],
+            embed_tokens=_WrongOuterEmbed(),
+        ),
+        language_model=real_text_wrapper,
+    )
+
+    ops = QwenGdnTargetOps()
+    hidden = mx.zeros((1, 1, 1))
+    logits = ops.logits_from_hidden(outer_wrapper, hidden)
+    expected = real_text_wrapper.lm_head(hidden)
+    mx.eval(logits, expected)
+
+    assert ops.text_wrapper(outer_wrapper) is real_text_wrapper
+    assert int(mx.argmax(logits[:, -1, :], axis=-1).item()) == int(
+        mx.argmax(expected[:, -1, :], axis=-1).item()
+    )
 
 def test_capabilities_for_distinguishes_hybrid_and_pure_attention():
     ops = QwenGdnTargetOps()
