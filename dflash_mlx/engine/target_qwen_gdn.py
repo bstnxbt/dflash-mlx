@@ -756,10 +756,11 @@ class QwenGdnTargetOps:
         return hasattr(inner, "layers") and hasattr(inner, "embed_tokens")
 
     def text_wrapper(self, target_model: Any) -> Any:
+        language_model = getattr(target_model, "language_model", None)
+        if language_model is not None and hasattr(language_model, "model"):
+            return language_model
         if hasattr(target_model, "model"):
             return target_model
-        if hasattr(target_model, "language_model"):
-            return target_model.language_model
         raise AttributeError(f"Unsupported target model wrapper: {type(target_model)!r}")
 
     def text_model(self, target_model: Any) -> Any:
