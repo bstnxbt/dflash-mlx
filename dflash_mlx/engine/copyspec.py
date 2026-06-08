@@ -118,6 +118,7 @@ COPYSPEC_PROBE_ON_MIN_COPY = 6
 COPYSPEC_PROBE_ON_MAX_CYCLES = 48
 COPYSPEC_LATCH_CYCLES = 200
 COPYSPEC_MARGIN = 1.0
+COPYSPEC_BACKOFF_CAP = 4  # max dormant-period doublings (latch_cycles * 2^cap)
 
 
 class CopySpecAutoGate:
@@ -138,6 +139,7 @@ class CopySpecAutoGate:
         probe_on_max_cycles: int = COPYSPEC_PROBE_ON_MAX_CYCLES,
         latch_cycles: int = COPYSPEC_LATCH_CYCLES,
         margin: float = COPYSPEC_MARGIN,
+        backoff_cap: int = COPYSPEC_BACKOFF_CAP,
     ) -> None:
         if probe_off_cycles < 1:
             raise ValueError("probe_off_cycles must be >= 1")
@@ -149,12 +151,15 @@ class CopySpecAutoGate:
             raise ValueError("latch_cycles must be >= 1")
         if margin <= 0:
             raise ValueError("margin must be > 0")
+        if backoff_cap < 0:
+            raise ValueError("backoff_cap must be >= 0")
 
         self._probe_off_cycles = probe_off_cycles
         self._probe_on_min_copy = probe_on_min_copy
         self._probe_on_max_cycles = probe_on_max_cycles
         self._latch_cycles = latch_cycles
         self._margin = margin
+        self._backoff_cap = backoff_cap
 
         # Phase
         self.phase: str = "measure_off"
@@ -169,6 +174,11 @@ class CopySpecAutoGate:
         self._off_rate: float | None = None
         self._latch_remaining: int = 0
         self._pending_reset: bool = False
+        # Consecutive disengages → exponentially longer dormant periods, so a
+        # workload where copyspec never wins stops paying repeated probe cost
+        # (each probe engages copyspec briefly and is wasted there). Reset to
+        # 0 on any engage, so a workload that turns copy-heavy stays responsive.
+        self._consecutive_losses: int = 0
 
         # Metrics
         self._engaged_cycles: int = 0
@@ -220,12 +230,16 @@ class CopySpecAutoGate:
                     or on_rate < self._off_rate * self._margin
                 ):
                     self.phase = "dormant"
-                    self._latch_remaining = self._latch_cycles
+                    self._latch_remaining = self._latch_cycles * (
+                        2 ** min(self._consecutive_losses, self._backoff_cap)
+                    )
+                    self._consecutive_losses += 1
                     self._pending_reset = True
                     self._disengages += 1
                 else:
                     self.phase = "engaged"
                     self._latch_remaining = self._latch_cycles
+                    self._consecutive_losses = 0
                     self._engages += 1
 
         elif self.phase == "engaged":
