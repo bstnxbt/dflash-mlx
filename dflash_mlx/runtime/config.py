@@ -216,11 +216,12 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         field="copyspec_mode",
         flags=("--copyspec-mode",),
         env="DFLASH_COPYSPEC_MODE",
-        choices=("conservative", "aggressive", "off"),
+        choices=("conservative", "aggressive", "off", "auto"),
         help=(
-            "Prompt-lookup (copyspec) drafting. Default conservative disables copyspec after one missed copy block. "
-            "'aggressive' keeps it on (best for copy-heavy workloads on large MoE targets; can regress non-copy "
-            "prompts). 'off' disables it."
+            "Prompt-lookup (copyspec) drafting. 'conservative' disables copyspec after one missed copy block. "
+            "'aggressive' keeps it on (copy-heavy workloads on large MoE targets; can regress non-copy prompts). "
+            "'off' disables it. 'auto' self-gates: periodically A/B-probes copyspec on vs off and latches to "
+            "whichever is faster, resetting adaptive state on disengage (safe across workloads)."
         ),
         surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
@@ -661,9 +662,9 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError(
             "--verify-mode / verify_mode must be dflash, adaptive, ddtree, or off"
         )
-    if cfg.copyspec_mode not in ("conservative", "aggressive", "off"):
+    if cfg.copyspec_mode not in ("conservative", "aggressive", "off", "auto"):
         raise ValueError(
-            "--copyspec-mode / copyspec_mode must be conservative, aggressive, or off"
+            "--copyspec-mode / copyspec_mode must be conservative, aggressive, off, or auto"
         )
     if not cfg.prefix_cache and cfg.prefix_cache_l2:
         return replace(cfg, prefix_cache_l2=False)
