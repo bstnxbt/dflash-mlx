@@ -113,6 +113,168 @@ class CopySpecIndex:
         return positions
 
 
+COPYSPEC_PROBE_OFF_CYCLES = 24
+COPYSPEC_PROBE_ON_MIN_COPY = 6
+COPYSPEC_PROBE_ON_MAX_CYCLES = 48
+COPYSPEC_LATCH_CYCLES = 200
+COPYSPEC_MARGIN = 1.0
+
+
+class CopySpecAutoGate:
+    """Windowed A/B latch that decides per-cycle whether copyspec should draft.
+
+    Four-phase state machine:
+      measure_off  → gather a baseline (copyspec disabled)
+      measure_on   → probe with copyspec enabled
+      engaged      → copyspec is winning; stay on for latch_cycles
+      dormant      → copyspec is losing; stay off for latch_cycles
+    """
+
+    def __init__(
+        self,
+        *,
+        probe_off_cycles: int = COPYSPEC_PROBE_OFF_CYCLES,
+        probe_on_min_copy: int = COPYSPEC_PROBE_ON_MIN_COPY,
+        probe_on_max_cycles: int = COPYSPEC_PROBE_ON_MAX_CYCLES,
+        latch_cycles: int = COPYSPEC_LATCH_CYCLES,
+        margin: float = COPYSPEC_MARGIN,
+    ) -> None:
+        if probe_off_cycles < 1:
+            raise ValueError("probe_off_cycles must be >= 1")
+        if probe_on_min_copy < 1:
+            raise ValueError("probe_on_min_copy must be >= 1")
+        if probe_on_max_cycles < 1:
+            raise ValueError("probe_on_max_cycles must be >= 1")
+        if latch_cycles < 1:
+            raise ValueError("latch_cycles must be >= 1")
+        if margin <= 0:
+            raise ValueError("margin must be > 0")
+
+        self._probe_off_cycles = probe_off_cycles
+        self._probe_on_min_copy = probe_on_min_copy
+        self._probe_on_max_cycles = probe_on_max_cycles
+        self._latch_cycles = latch_cycles
+        self._margin = margin
+
+        # Phase
+        self.phase: str = "measure_off"
+
+        # Window accumulators
+        self._win_commits: int = 0
+        self._win_cost_ns: int = 0
+        self._win_cycles: int = 0
+        self._win_copy_blocks: int = 0
+
+        # State
+        self._off_rate: float | None = None
+        self._latch_remaining: int = 0
+        self._pending_reset: bool = False
+
+        # Metrics
+        self._engaged_cycles: int = 0
+        self._dormant_cycles: int = 0
+        self._probes: int = 0
+        self._engages: int = 0
+        self._disengages: int = 0
+
+    def engage_copy(self) -> bool:
+        """Return True iff copyspec should draft this cycle."""
+        return self.phase in ("measure_on", "engaged")
+
+    def record_cycle(
+        self,
+        *,
+        source: str,
+        commit_count: int,
+        cycle_cost_ns: int | None,
+    ) -> None:
+        """Called once per cycle that ran a real draft (block_len > 1)."""
+        # Accumulate
+        self._win_commits += commit_count
+        if isinstance(cycle_cost_ns, int) and cycle_cost_ns > 0:
+            self._win_cost_ns += cycle_cost_ns
+        self._win_cycles += 1
+        if source == "copy":
+            self._win_copy_blocks += 1
+
+        # Advance phase machine
+        if self.phase == "measure_off":
+            if self._win_cycles >= self._probe_off_cycles:
+                self._off_rate = self._win_rate()
+                self._reset_window()
+                self.phase = "measure_on"
+                self._probes += 1
+
+        elif self.phase == "measure_on":
+            ended = (
+                self._win_copy_blocks >= self._probe_on_min_copy
+                or self._win_cycles >= self._probe_on_max_cycles
+            )
+            if ended:
+                on_rate = self._win_rate()
+                copy_seen = self._win_copy_blocks
+                self._reset_window()
+                if (
+                    copy_seen == 0
+                    or self._off_rate is None
+                    or on_rate < self._off_rate * self._margin
+                ):
+                    self.phase = "dormant"
+                    self._latch_remaining = self._latch_cycles
+                    self._pending_reset = True
+                    self._disengages += 1
+                else:
+                    self.phase = "engaged"
+                    self._latch_remaining = self._latch_cycles
+                    self._engages += 1
+
+        elif self.phase == "engaged":
+            self._engaged_cycles += 1
+            self._latch_remaining -= 1
+            if self._latch_remaining <= 0:
+                self._pending_reset = True
+                self.phase = "measure_off"
+                self._reset_window()
+
+        elif self.phase == "dormant":
+            self._dormant_cycles += 1
+            self._latch_remaining -= 1
+            if self._latch_remaining <= 0:
+                self.phase = "measure_off"
+                self._reset_window()
+
+    def take_reset(self) -> bool:
+        """Return True if the adaptive policy should be reset, then clear the flag."""
+        result = self._pending_reset
+        self._pending_reset = False
+        return result
+
+    def _win_rate(self) -> float:
+        """Realized throughput for the current window."""
+        if self._win_cost_ns > 0:
+            return self._win_commits / (self._win_cost_ns / 1e9)
+        if self._win_cycles > 0:
+            return self._win_commits / self._win_cycles
+        return 0.0
+
+    def _reset_window(self) -> None:
+        self._win_commits = 0
+        self._win_cost_ns = 0
+        self._win_cycles = 0
+        self._win_copy_blocks = 0
+
+    def metrics(self) -> dict:
+        return {
+            "state": self.phase,
+            "off_rate": self._off_rate,
+            "engaged_cycles": int(self._engaged_cycles),
+            "dormant_cycles": int(self._dormant_cycles),
+            "probes": int(self._probes),
+            "engages": int(self._engages),
+            "disengages": int(self._disengages),
+        }
+
+
 def _hash_tokens(tokens: Sequence[int]) -> int:
     value = _FNV_OFFSET_BASIS
     for token in tokens:
