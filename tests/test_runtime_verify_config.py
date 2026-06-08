@@ -420,7 +420,7 @@ def test_copyspec_mode_default_is_conservative():
 
 
 def test_copyspec_mode_accepts_valid_choices():
-    for mode in ("conservative", "aggressive", "off"):
+    for mode in ("conservative", "auto", "off"):
         cfg = runtime_config_from_defaults(copyspec_mode=mode)
         assert cfg.copyspec_mode == mode
 
@@ -434,9 +434,9 @@ def test_offline_runtime_arguments_accept_copyspec_mode():
     parser = argparse.ArgumentParser()
     add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
 
-    args = parser.parse_args(["--copyspec-mode", "aggressive"])
+    args = parser.parse_args(["--copyspec-mode", "auto"])
 
-    assert offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS)["copyspec_mode"] == "aggressive"
+    assert offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS)["copyspec_mode"] == "auto"
 
 
 def test_offline_runtime_arguments_reject_invalid_copyspec_mode():
