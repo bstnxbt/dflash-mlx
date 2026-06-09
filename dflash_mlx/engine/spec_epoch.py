@@ -98,6 +98,11 @@ class _SessionRequest:
     prefix_cache_active: bool = False
     publish_generation_snapshot: bool = True
     prefix_hit_kind: str = "miss"
+    # Original positions of the prompt tokens for positional sparse prefill. When
+    # None (default), prefill is dense and tokens occupy contiguous positions
+    # 0..prompt_len-1. When provided, prompt_tokens are a selected subset and each
+    # is RoPE'd at its original position (see SPARSE_PREFILL_DESIGN.md).
+    prompt_token_positions: Optional[tuple[int, ...]] = None
     prompt_array: mx.array = field(init=False, repr=False)
     prompt_len: int = field(init=False)
     stop_token_array: Optional[mx.array] = field(init=False, repr=False)
@@ -117,6 +122,7 @@ class _SessionRequest:
         prefix_cache_active: bool,
         publish_generation_snapshot: bool = True,
         prefix_hit_kind: str = "miss",
+        prompt_token_positions: Optional[list[int]] = None,
     ) -> "_SessionRequest":
         return cls(
             prompt_tokens=tuple(int(token) for token in prompt_tokens),
@@ -134,10 +140,16 @@ class _SessionRequest:
             prefix_cache_active=bool(prefix_cache_active),
             publish_generation_snapshot=bool(publish_generation_snapshot),
             prefix_hit_kind=str(prefix_hit_kind),
+            prompt_token_positions=(
+                tuple(int(pos) for pos in prompt_token_positions)
+                if prompt_token_positions is not None
+                else None
+            ),
         )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt_len", len(self.prompt_tokens))
+        self._validate_token_positions()
         object.__setattr__(
             self,
             "prompt_array",
@@ -149,6 +161,31 @@ class _SessionRequest:
             else None
         )
         object.__setattr__(self, "stop_token_array", stop_array)
+
+    def _validate_token_positions(self) -> None:
+        positions = self.prompt_token_positions
+        if positions is None:
+            return
+        if self.prefix_cache_active:
+            raise ValueError(
+                "prompt_token_positions cannot be combined with an active prefix "
+                "cache; sparse prefill drops tokens, which invalidates the "
+                "contiguous-position prefix snapshot"
+            )
+        if len(positions) != self.prompt_len:
+            raise ValueError(
+                "prompt_token_positions and prompt_tokens must have the same "
+                f"length (got {len(positions)} positions for {self.prompt_len} "
+                "tokens)"
+            )
+        if positions and positions[0] < 0:
+            raise ValueError("prompt_token_positions must be non-negative")
+        for prev, cur in zip(positions, positions[1:]):
+            if cur <= prev:
+                raise ValueError(
+                    "prompt_token_positions must be strictly increasing "
+                    f"(got {prev} followed by {cur})"
+                )
 
     def should_collect_generation_snapshot_hidden(
         self,
@@ -2565,6 +2602,7 @@ def stream_dflash_generate_impl(
     stop_token_ids: Optional[list[int]] = None,
     suppress_token_ids: Optional[list[int]] = None,
     prompt_tokens_override: Optional[list[int]] = None,
+    prompt_token_positions: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
     prefix_snapshot: Optional[DFlashPrefixSnapshot] = None,
     snapshot_service: Optional[SnapshotService] = None,
@@ -2628,6 +2666,7 @@ def stream_dflash_generate_impl(
         prefix_cache_active=prefix_cache_active,
         publish_generation_snapshot=publish_generation_snapshot,
         prefix_hit_kind=prefix_hit_kind,
+        prompt_token_positions=prompt_token_positions,
     )
 
     session = SpeculativeSession.open(
