@@ -107,7 +107,7 @@ class _SessionRequest:
     # Original positions of the prompt tokens for positional sparse prefill. When
     # None (default), prefill is dense and tokens occupy contiguous positions
     # 0..prompt_len-1. When provided, prompt_tokens are a selected subset and each
-    # is RoPE'd at its original position (see SPARSE_PREFILL_DESIGN.md).
+    # is RoPE'd at its original position.
     prompt_token_positions: Optional[tuple[int, ...]] = None
     prompt_array: mx.array = field(init=False, repr=False)
     prompt_len: int = field(init=False)

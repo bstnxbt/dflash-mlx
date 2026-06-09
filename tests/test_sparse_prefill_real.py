@@ -23,6 +23,7 @@ from dflash_mlx.engine.sparse_rope import (
     restore_ropes,
 )
 from dflash_mlx.engine.target_ops import resolve_target_ops
+from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("DFLASH_RUN_REAL_MODEL_TESTS") != "1",
@@ -134,3 +135,79 @@ def test_restore_returns_native_trajectory():
 
     mx.eval(before, after)
     assert float(mx.abs(before.astype(mx.float32) - after.astype(mx.float32)).max()) == 0.0
+
+
+# --- End-to-end generate parity (full target + draft DFlash pipeline) ---
+
+_E2E_TARGET = os.environ.get("DFLASH_E2E_TARGET", "Qwen/Qwen3-4B")
+_E2E_DRAFT = os.environ.get("DFLASH_E2E_DRAFT", "z-lab/Qwen3-4B-DFlash-b16")
+
+
+def _load_bundle():
+    from dflash_mlx.runtime.bundle import load_runtime_bundle
+    from dflash_mlx.runtime.context import build_offline_runtime_context
+
+    rc = build_offline_runtime_context(
+        prefill_step_size=2048, target_fa_window=0, draft_sink_size=64,
+        draft_window_size=1024, verify_len_cap=0, verify_mode="dflash",
+        copyspec_mode="off",
+    )
+    try:
+        bundle = load_runtime_bundle(
+            model_ref=_E2E_TARGET, draft_ref=_E2E_DRAFT, verify_config=rc.verify
+        )
+    except Exception as exc:  # pragma: no cover - env-dependent
+        pytest.skip(f"DFlash bundle unavailable ({_E2E_TARGET} + {_E2E_DRAFT}): {exc}")
+    return bundle, rc
+
+
+def _generate_ids(bundle, rc, prompt_tokens, positions, max_new=24):
+    from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
+
+    kwargs = dict(
+        target_model=bundle.target_model, target_ops=bundle.target_ops,
+        tokenizer=bundle.tokenizer, draft_model=bundle.draft_model,
+        draft_backend=bundle.draft_backend, prompt="", max_new_tokens=max_new,
+        stop_token_ids=get_stop_token_ids(bundle.tokenizer),
+        prompt_tokens_override=prompt_tokens, runtime_context=rc,
+    )
+    if positions is not None:
+        kwargs["prompt_token_positions"] = positions
+    out = []
+    stream = stream_dflash_generate(**kwargs)
+    try:
+        for ev in stream:
+            if isinstance(ev, TokenEvent):
+                out.append(int(ev.token_id))
+            elif isinstance(ev, SummaryEvent):
+                break
+    finally:
+        stream.close()
+    return out
+
+
+def test_e2e_select_all_generate_matches_dense():
+    # The whole run_events lifecycle (install -> switch -> restore) must be a
+    # no-op for select-all positions: byte-identical generated token ids.
+    bundle, rc = _load_bundle()
+    ids = list(bundle.tokenizer.encode(
+        "Explain in one short paragraph why the sky appears blue during the day."
+    ))
+    dense = _generate_ids(bundle, rc, ids, None)
+    sparse = _generate_ids(bundle, rc, ids, list(range(len(ids))))
+    assert sparse == dense, f"select-all diverged from dense:\n{dense}\n{sparse}"
+
+
+def test_e2e_chunk_sparse_generate_runs():
+    # A genuine chunk selection runs end-to-end and yields valid tokens.
+    bundle, rc = _load_bundle()
+    ids = list(bundle.tokenizer.encode(
+        "The quick brown fox jumps over the lazy dog. " * 8
+    ))
+    n = len(ids)
+    keep = sorted(set(list(range(0, n // 3)) + list(range(2 * n // 3, n))))
+    sel = [ids[i] for i in keep]
+    out = _generate_ids(bundle, rc, sel, keep)
+    assert len(out) > 0
+    vocab = int(bundle.target_ops.text_model(bundle.target_model).embed_tokens.weight.shape[0])
+    assert all(0 <= t < vocab for t in out)
