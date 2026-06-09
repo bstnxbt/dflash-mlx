@@ -38,6 +38,12 @@ from dflash_mlx.engine.ddtree import (
 )
 from dflash_mlx.engine.fallback import stream_baseline_generate
 from dflash_mlx.engine.prefill import compute_snapshot_boundary
+from dflash_mlx.engine.sparse_rope import (
+    decode_position_adjustment,
+    install_position_mapped_rope,
+    restore_ropes,
+    switch_to_offset_adjusted_rope,
+)
 from dflash_mlx.engine.sampling import (
     build_suppress_token_mask,
     eval_logits_and_captured,
@@ -191,6 +197,10 @@ class _SessionRequest:
         self,
         supports_prefix_snapshot: bool,
     ) -> bool:
+        if self.prompt_token_positions is not None:
+            # Sparse prefill stores KV at non-contiguous positions; a snapshot
+            # keyed on a dense token prefix would be unusable.
+            return False
         if not supports_prefix_snapshot or not self.publish_generation_snapshot:
             return False
         if self.snapshot_service is None or not self.snapshot_service.active:
@@ -734,6 +744,10 @@ class SpeculativeSession:
         publish_prefix_snapshots = bool(
             supports_prefix_snapshot and snapshot_service is not None
         )
+        if request.prompt_token_positions is not None:
+            # Sparse prefill RoPEs tokens at non-contiguous positions, so a
+            # prefix snapshot keyed on a dense token prefix cannot be replayed.
+            publish_prefix_snapshots = False
 
         start_ns = time.perf_counter_ns()
         evt = self.memory_waterfall_event("after_target_cache_create")
@@ -2413,6 +2427,8 @@ class SpeculativeSession:
         yield_pause = _YieldPauseTracker(enabled=bool(profile_cycles or memory_waterfall))
         state = _RequestState()
 
+        sparse_rope_saved = self._install_sparse_prefill_rope(request)
+
         try:
             prefill = yield from self._run_prefill_events(
                 request=request,
@@ -2423,6 +2439,12 @@ class SpeculativeSession:
             start_ns = prefill.start_ns
             prefill_ns = prefill.prefill_ns
             supports_prefix_snapshot = prefill.supports_prefix_snapshot
+
+            if sparse_rope_saved is not None:
+                switch_to_offset_adjusted_rope(
+                    sparse_rope_saved,
+                    decode_position_adjustment(request.prompt_token_positions),
+                )
 
             decode = yield from self._run_decode_events(
                 request=request,
@@ -2505,7 +2527,26 @@ class SpeculativeSession:
             )
             yield summary
         finally:
+            if sparse_rope_saved is not None:
+                restore_ropes(sparse_rope_saved)
             self.close()
+
+    def _install_sparse_prefill_rope(
+        self, request: _SessionRequest
+    ) -> Optional[list[tuple[Any, Any]]]:
+        """Install position-mapped RoPE on the target for sparse prefill.
+
+        Returns the saved (attn, original_rope) pairs for later restoration, or
+        None when this is an ordinary dense request. The draft model is wired in
+        a follow-up phase; with the target alone the output is already correct
+        (the target verifies every token) — only draft acceptance is affected.
+        """
+        positions = request.prompt_token_positions
+        if positions is None:
+            return None
+        text_model = self.target_ops.text_model(self.target_model)
+        positions_array = mx.array(positions, dtype=mx.int32)
+        return install_position_mapped_rope(text_model, positions_array, cache_start=0)
 
     def close(self) -> None:
         self.target_ops.cleanup_generation_caches(self.target_cache, self.draft_cache)

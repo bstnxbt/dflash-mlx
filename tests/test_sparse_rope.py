@@ -17,7 +17,12 @@ import pytest
 from dflash_mlx.engine.sparse_rope import (
     OffsetAdjustedRoPE,
     PositionMappedRoPE,
+    decode_position_adjustment,
+    install_position_mapped_rope,
+    iter_attention_modules,
     manual_rope,
+    restore_ropes,
+    switch_to_offset_adjusted_rope,
 )
 
 _ATOL = 2e-4
@@ -60,6 +65,91 @@ class TestManualRope:
         real = rope(x, offset=2)
         manual = manual_rope(x, mx.arange(2, 7), dims=dims, base=base)
         assert mx.allclose(real, manual, atol=_ATOL)
+
+    def test_preserves_bfloat16_dtype(self):
+        # The downstream SDPA contract requires bf16/fp16 in == out.
+        dims, base = 128, 1_000_000.0
+        rope = _rope(dims, base)
+        x = mx.random.normal((1, 4, 6, dims)).astype(mx.bfloat16)
+        manual = manual_rope(x, mx.arange(0, 6), dims=dims, base=base)
+        assert manual.dtype == mx.bfloat16
+        real = rope(x, offset=0)
+        assert mx.allclose(real.astype(mx.float32), manual.astype(mx.float32), atol=8e-3)
+
+
+class _FakeAttn:
+    def __init__(self, rope):
+        self.rope = rope
+
+
+class _FakeLayer:
+    def __init__(self, *, is_linear, rope=None):
+        self.is_linear = is_linear
+        if not is_linear:
+            self.self_attn = _FakeAttn(rope)
+
+
+class _FakeTextModel:
+    def __init__(self, layers):
+        self.layers = layers
+
+
+class TestRopeLifecycle:
+    def _model(self):
+        rope = _rope()
+        # 2 full-attention layers (have rope), 1 GDN layer (no rope), interleaved.
+        return _FakeTextModel(
+            [
+                _FakeLayer(is_linear=False, rope=_rope()),
+                _FakeLayer(is_linear=True),
+                _FakeLayer(is_linear=False, rope=_rope()),
+            ]
+        ), rope
+
+    def test_iter_attention_modules_skips_gdn_layers(self):
+        model, _ = self._model()
+        attns = list(iter_attention_modules(model))
+        assert len(attns) == 2  # the GDN layer is skipped
+
+    def test_install_switch_restore_roundtrip(self):
+        model, _ = self._model()
+        originals = [layer.self_attn.rope for layer in model.layers if not layer.is_linear]
+
+        saved = install_position_mapped_rope(model, mx.array([0, 1, 2]), cache_start=0)
+        installed = [a.rope for a in iter_attention_modules(model)]
+        assert all(isinstance(r, PositionMappedRoPE) for r in installed)
+
+        switch_to_offset_adjusted_rope(saved, adjustment=5)
+        switched = [a.rope for a in iter_attention_modules(model)]
+        assert all(isinstance(r, OffsetAdjustedRoPE) for r in switched)
+
+        restore_ropes(saved)
+        restored = [a.rope for a in iter_attention_modules(model)]
+        assert restored == originals  # exact original objects, not copies
+
+    def test_switch_wraps_original_not_prefill_wrapper(self):
+        # OffsetAdjustedRoPE must compose over the original rope, not over the
+        # PositionMappedRoPE installed during prefill.
+        model, _ = self._model()
+        originals = [layer.self_attn.rope for layer in model.layers if not layer.is_linear]
+        saved = install_position_mapped_rope(model, mx.array([0, 1, 2]))
+        switch_to_offset_adjusted_rope(saved, adjustment=3)
+        for attn, original in zip(iter_attention_modules(model), originals):
+            assert attn.rope._original is original
+
+
+class TestDecodePositionAdjustment:
+    def test_dense_select_all_is_zero(self):
+        # Select-all (dense) must make the decode wrapper a no-op.
+        assert decode_position_adjustment(tuple(range(10))) == 0
+
+    def test_sparse_subset_shift(self):
+        # 4 selected tokens, last at original position 99 -> first decode at 100,
+        # cache holds 4 entries -> adjustment 100 - 4 = 96.
+        assert decode_position_adjustment((0, 40, 70, 99)) == 96
+
+    def test_empty(self):
+        assert decode_position_adjustment(()) == 0
 
 
 class TestPositionMappedRoPE:
