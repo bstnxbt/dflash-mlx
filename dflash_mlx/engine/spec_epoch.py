@@ -38,6 +38,14 @@ from dflash_mlx.engine.ddtree import (
 )
 from dflash_mlx.engine.fallback import stream_baseline_generate
 from dflash_mlx.engine.prefill import compute_snapshot_boundary
+from dflash_mlx.engine.sparse_rope import (
+    clear_sparse_positions,
+    decode_position_adjustment,
+    install_position_mapped_rope,
+    restore_ropes,
+    set_sparse_positions,
+    switch_to_offset_adjusted_rope,
+)
 from dflash_mlx.engine.sampling import (
     build_suppress_token_mask,
     eval_logits_and_captured,
@@ -98,6 +106,11 @@ class _SessionRequest:
     prefix_cache_active: bool = False
     publish_generation_snapshot: bool = True
     prefix_hit_kind: str = "miss"
+    # Original positions of the prompt tokens for positional sparse prefill. When
+    # None (default), prefill is dense and tokens occupy contiguous positions
+    # 0..prompt_len-1. When provided, prompt_tokens are a selected subset and each
+    # is RoPE'd at its original position.
+    prompt_token_positions: Optional[tuple[int, ...]] = None
     prompt_array: mx.array = field(init=False, repr=False)
     prompt_len: int = field(init=False)
     stop_token_array: Optional[mx.array] = field(init=False, repr=False)
@@ -117,6 +130,7 @@ class _SessionRequest:
         prefix_cache_active: bool,
         publish_generation_snapshot: bool = True,
         prefix_hit_kind: str = "miss",
+        prompt_token_positions: Optional[list[int]] = None,
     ) -> "_SessionRequest":
         return cls(
             prompt_tokens=tuple(int(token) for token in prompt_tokens),
@@ -134,10 +148,16 @@ class _SessionRequest:
             prefix_cache_active=bool(prefix_cache_active),
             publish_generation_snapshot=bool(publish_generation_snapshot),
             prefix_hit_kind=str(prefix_hit_kind),
+            prompt_token_positions=(
+                tuple(int(pos) for pos in prompt_token_positions)
+                if prompt_token_positions is not None
+                else None
+            ),
         )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt_len", len(self.prompt_tokens))
+        self._validate_token_positions()
         object.__setattr__(
             self,
             "prompt_array",
@@ -150,10 +170,45 @@ class _SessionRequest:
         )
         object.__setattr__(self, "stop_token_array", stop_array)
 
+    def _validate_token_positions(self) -> None:
+        positions = self.prompt_token_positions
+        if positions is None:
+            return
+        if self.prefix_snapshot is not None:
+            raise ValueError(
+                "prompt_token_positions cannot be combined with a prefix "
+                "snapshot; sparse prefill drops tokens, which invalidates the "
+                "contiguous-position prefix snapshot"
+            )
+        if self.prefix_cache_active:
+            raise ValueError(
+                "prompt_token_positions cannot be combined with an active prefix "
+                "cache; sparse prefill drops tokens, which invalidates the "
+                "contiguous-position prefix snapshot"
+            )
+        if len(positions) != self.prompt_len:
+            raise ValueError(
+                "prompt_token_positions and prompt_tokens must have the same "
+                f"length (got {len(positions)} positions for {self.prompt_len} "
+                "tokens)"
+            )
+        if positions and positions[0] < 0:
+            raise ValueError("prompt_token_positions must be non-negative")
+        for prev, cur in zip(positions, positions[1:]):
+            if cur <= prev:
+                raise ValueError(
+                    "prompt_token_positions must be strictly increasing "
+                    f"(got {prev} followed by {cur})"
+                )
+
     def should_collect_generation_snapshot_hidden(
         self,
         supports_prefix_snapshot: bool,
     ) -> bool:
+        if self.prompt_token_positions is not None:
+            # Sparse prefill stores KV at non-contiguous positions; a snapshot
+            # keyed on a dense token prefix would be unusable.
+            return False
         if not supports_prefix_snapshot or not self.publish_generation_snapshot:
             return False
         if self.snapshot_service is None or not self.snapshot_service.active:
@@ -697,6 +752,10 @@ class SpeculativeSession:
         publish_prefix_snapshots = bool(
             supports_prefix_snapshot and snapshot_service is not None
         )
+        if request.prompt_token_positions is not None:
+            # Sparse prefill RoPEs tokens at non-contiguous positions, so a
+            # prefix snapshot keyed on a dense token prefix cannot be replayed.
+            publish_prefix_snapshots = False
 
         start_ns = time.perf_counter_ns()
         evt = self.memory_waterfall_event("after_target_cache_create")
@@ -2376,6 +2435,8 @@ class SpeculativeSession:
         yield_pause = _YieldPauseTracker(enabled=bool(profile_cycles or memory_waterfall))
         state = _RequestState()
 
+        sparse_rope_saved = self._install_sparse_prefill_rope(request)
+
         try:
             prefill = yield from self._run_prefill_events(
                 request=request,
@@ -2386,6 +2447,12 @@ class SpeculativeSession:
             start_ns = prefill.start_ns
             prefill_ns = prefill.prefill_ns
             supports_prefix_snapshot = prefill.supports_prefix_snapshot
+
+            if sparse_rope_saved is not None:
+                switch_to_offset_adjusted_rope(
+                    sparse_rope_saved,
+                    decode_position_adjustment(request.prompt_token_positions),
+                )
 
             decode = yield from self._run_decode_events(
                 request=request,
@@ -2468,7 +2535,38 @@ class SpeculativeSession:
             )
             yield summary
         finally:
+            if sparse_rope_saved is not None:
+                restore_ropes(sparse_rope_saved)
+                clear_sparse_positions(
+                    self.target_ops.text_model(self.target_model)
+                )
             self.close()
+
+    def _install_sparse_prefill_rope(
+        self, request: _SessionRequest
+    ) -> Optional[list[tuple[Any, Any]]]:
+        """Install position-mapped RoPE on the target for sparse prefill.
+
+        Returns the saved (attn, original_rope) pairs for later restoration, or
+        None when this is an ordinary dense request. The draft model is wired in
+        a follow-up phase; with the target alone the output is already correct
+        (the target verifies every token) — only draft acceptance is affected.
+        """
+        positions = request.prompt_token_positions
+        if positions is None:
+            return None
+        text_model = self.target_ops.text_model(self.target_model)
+        positions_array = mx.array(positions, dtype=mx.int32)
+        # Position-dependent masks (gemma4 sliding window) read this; full-
+        # attention backends ignore it.
+        set_sparse_positions(text_model, positions_array)
+        try:
+            return install_position_mapped_rope(
+                text_model, positions_array, cache_start=0
+            )
+        except Exception:
+            clear_sparse_positions(text_model)
+            raise
 
     def close(self) -> None:
         self.target_ops.cleanup_generation_caches(self.target_cache, self.draft_cache)
@@ -2565,6 +2663,7 @@ def stream_dflash_generate_impl(
     stop_token_ids: Optional[list[int]] = None,
     suppress_token_ids: Optional[list[int]] = None,
     prompt_tokens_override: Optional[list[int]] = None,
+    prompt_token_positions: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
     prefix_snapshot: Optional[DFlashPrefixSnapshot] = None,
     snapshot_service: Optional[SnapshotService] = None,
@@ -2628,6 +2727,7 @@ def stream_dflash_generate_impl(
         prefix_cache_active=prefix_cache_active,
         publish_generation_snapshot=publish_generation_snapshot,
         prefix_hit_kind=prefix_hit_kind,
+        prompt_token_positions=prompt_token_positions,
     )
 
     session = SpeculativeSession.open(
