@@ -252,9 +252,15 @@ def install_position_mapped_rope(
 ) -> list[tuple[Any, Any]]:
     """Swap each attention rope to a PositionMappedRoPE; return originals."""
     saved: list[tuple[Any, Any]] = []
-    for attn in iter_attention_modules(text_model):
-        saved.append((attn, attn.rope))
-        attn.rope = PositionMappedRoPE(attn.rope, positions, cache_start=cache_start)
+    try:
+        for attn in iter_attention_modules(text_model):
+            saved.append((attn, attn.rope))
+            attn.rope = PositionMappedRoPE(
+                attn.rope, positions, cache_start=cache_start
+            )
+    except Exception:
+        restore_ropes(saved)
+        raise
     return saved
 
 

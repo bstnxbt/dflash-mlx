@@ -137,6 +137,22 @@ class TestRopeLifecycle:
         for attn, original in zip(iter_attention_modules(model), originals):
             assert attn.rope._original is original
 
+    def test_install_failure_restores_already_swapped_ropes(self):
+        first = _rope()
+        unsupported = nn.RoPE(dims=64, traditional=True, base=10_000.0)
+        model = _FakeTextModel(
+            [
+                _FakeLayer(is_linear=False, rope=first),
+                _FakeLayer(is_linear=False, rope=unsupported),
+            ]
+        )
+
+        with pytest.raises(NotImplementedError, match="traditional"):
+            install_position_mapped_rope(model, mx.array([0, 1, 2]))
+
+        assert model.layers[0].self_attn.rope is first
+        assert model.layers[1].self_attn.rope is unsupported
+
 
 class TestDecodePositionAdjustment:
     def test_dense_select_all_is_zero(self):

@@ -174,6 +174,12 @@ class _SessionRequest:
         positions = self.prompt_token_positions
         if positions is None:
             return
+        if self.prefix_snapshot is not None:
+            raise ValueError(
+                "prompt_token_positions cannot be combined with a prefix "
+                "snapshot; sparse prefill drops tokens, which invalidates the "
+                "contiguous-position prefix snapshot"
+            )
         if self.prefix_cache_active:
             raise ValueError(
                 "prompt_token_positions cannot be combined with an active prefix "
@@ -2554,7 +2560,13 @@ class SpeculativeSession:
         # Position-dependent masks (gemma4 sliding window) read this; full-
         # attention backends ignore it.
         set_sparse_positions(text_model, positions_array)
-        return install_position_mapped_rope(text_model, positions_array, cache_start=0)
+        try:
+            return install_position_mapped_rope(
+                text_model, positions_array, cache_start=0
+            )
+        except Exception:
+            clear_sparse_positions(text_model)
+            raise
 
     def close(self) -> None:
         self.target_ops.cleanup_generation_caches(self.target_cache, self.draft_cache)
