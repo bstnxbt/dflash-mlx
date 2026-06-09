@@ -39,9 +39,11 @@ from dflash_mlx.engine.ddtree import (
 from dflash_mlx.engine.fallback import stream_baseline_generate
 from dflash_mlx.engine.prefill import compute_snapshot_boundary
 from dflash_mlx.engine.sparse_rope import (
+    clear_sparse_positions,
     decode_position_adjustment,
     install_position_mapped_rope,
     restore_ropes,
+    set_sparse_positions,
     switch_to_offset_adjusted_rope,
 )
 from dflash_mlx.engine.sampling import (
@@ -2529,6 +2531,9 @@ class SpeculativeSession:
         finally:
             if sparse_rope_saved is not None:
                 restore_ropes(sparse_rope_saved)
+                clear_sparse_positions(
+                    self.target_ops.text_model(self.target_model)
+                )
             self.close()
 
     def _install_sparse_prefill_rope(
@@ -2546,6 +2551,9 @@ class SpeculativeSession:
             return None
         text_model = self.target_ops.text_model(self.target_model)
         positions_array = mx.array(positions, dtype=mx.int32)
+        # Position-dependent masks (gemma4 sliding window) read this; full-
+        # attention backends ignore it.
+        set_sparse_positions(text_model, positions_array)
         return install_position_mapped_rope(text_model, positions_array, cache_start=0)
 
     def close(self) -> None:

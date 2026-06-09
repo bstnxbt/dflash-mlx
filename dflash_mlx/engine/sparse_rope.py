@@ -29,6 +29,11 @@ from typing import Any
 
 import mlx.core as mx
 
+# Attribute set on a text model while sparse prefill is active, holding the
+# selected tokens' true positions. Backends that build position-dependent masks
+# (e.g. gemma4 sliding-window) read it; full-attention backends ignore it.
+SPARSE_POSITIONS_ATTR = "_dflash_sparse_positions"
+
 __all__ = [
     "manual_rope",
     "manual_rope_with_freqs",
@@ -39,7 +44,21 @@ __all__ = [
     "switch_to_offset_adjusted_rope",
     "restore_ropes",
     "decode_position_adjustment",
+    "SPARSE_POSITIONS_ATTR",
+    "set_sparse_positions",
+    "clear_sparse_positions",
 ]
+
+
+def set_sparse_positions(text_model: Any, positions: mx.array) -> None:
+    """Publish the selected tokens' true positions on the text model."""
+    setattr(text_model, SPARSE_POSITIONS_ATTR, positions)
+
+
+def clear_sparse_positions(text_model: Any) -> None:
+    """Remove the sparse-position annotation from the text model."""
+    if hasattr(text_model, SPARSE_POSITIONS_ATTR):
+        delattr(text_model, SPARSE_POSITIONS_ATTR)
 
 
 def _scalar_offset(offset: Any) -> int:

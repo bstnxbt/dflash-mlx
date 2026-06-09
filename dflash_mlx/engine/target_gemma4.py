@@ -16,7 +16,40 @@ from dflash_mlx.engine.gqa_sdpa import (
     per_head_gqa_sdpa,
     repeat_gqa_mask,
 )
+from dflash_mlx.engine.sparse_rope import SPARSE_POSITIONS_ATTR
 from dflash_mlx.engine.target_ops import TargetCapabilities
+
+
+def _cache_offset(cache: list[Any]) -> int:
+    for entry in cache:
+        if entry is not None:
+            return int(getattr(entry, "offset", 0) or 0)
+    return 0
+
+
+def _sparse_layer_masks(inner: Any, h: mx.array, positions: mx.array, cache: list[Any]):
+    """Per-layer attention masks for sparse prefill, using true token positions.
+
+    Full-attention layers get a plain causal mask (positions are monotonic, so
+    causal-over-positions equals causal-over-index). Sliding layers additionally
+    require the query/key *position* distance to be within the window — this is
+    what differs from the dense contiguous mask. Keys span the already-cached
+    selected tokens plus the current chunk.
+    """
+    n_q = int(h.shape[1])
+    offset = _cache_offset(cache)
+    total = offset + n_q
+    key_pos = positions[:total]
+    q_pos = key_pos[offset:total][:, None]
+    k_pos = key_pos[None, :]
+    causal = q_pos >= k_pos
+    window = int(getattr(inner, "window_size", 0) or 0)
+    sliding = (causal & (q_pos - k_pos < window)) if window > 0 else causal
+    masks = []
+    for layer in inner.layers:
+        is_sliding = getattr(layer, "layer_type", None) == "sliding_attention"
+        masks.append(sliding if is_sliding else causal)
+    return masks
 
 
 def _model_args(model: Any) -> Any:
@@ -416,7 +449,11 @@ class Gemma4TargetOps:
             capture_layer_ids = set(capture_layer_ids)
             captured = {0: h} if 0 in capture_layer_ids else {}
 
-        masks = inner._make_masks(h, cache)
+        sparse_positions = getattr(inner, SPARSE_POSITIONS_ATTR, None)
+        if sparse_positions is not None:
+            masks = _sparse_layer_masks(inner, h, sparse_positions, cache)
+        else:
+            masks = inner._make_masks(h, cache)
         intermediates = [(None, None)] * len(inner.layers)
         for idx, (layer, layer_cache, mask, prev_idx, per_layer_input) in enumerate(
             zip(
