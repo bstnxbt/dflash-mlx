@@ -374,11 +374,12 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
         target_ops=object(),
         cli_args=SimpleNamespace(runtime_context=runtime_context),
     )
+    flow_snapshot = object()
     prefix_flow = SimpleNamespace(
         hit_tokens=4,
         hit_kind="l1_exact",
         lookup_ms=0.25,
-        snapshot=object(),
+        snapshot=flow_snapshot,
         snapshot_service=object(),
         stable_prefix_len=3,
         cache_active=True,
@@ -473,7 +474,9 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
     )
 
     assert captured["publish_generation_snapshot"] is True
-    assert captured["prefix_snapshot"] is prefix_flow.snapshot
+    assert captured["prefix_snapshot"] is flow_snapshot
+    # The server drops its snapshot ref once the engine owns it.
+    assert prefix_flow.snapshot is None
     assert captured["snapshot_service"] is prefix_flow.snapshot_service
     assert captured["stable_prefix_len"] == 3
     assert captured["prefix_cache_active"] is True

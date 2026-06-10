@@ -970,6 +970,13 @@ class SpeculativeSession:
             and prefix_snapshot.last_logits is None
         ):
             raise ValueError("prefill snapshot requires last_logits")
+        if prefix_snapshot is not None:
+            # The snapshot is fully consumed (target cache hydrated at open,
+            # features rebuilt, seam logits restored). Drop every reference
+            # now so eviction can actually free the arrays during decode
+            # instead of keeping a request-pinned copy alive to the end.
+            object.__setattr__(request, "prefix_snapshot", None)
+            prefix_snapshot = None
         if publish_prefix_snapshots and not exact_snapshot_restore:
             _snapshot_build = yield_pause.mark()
             snapshot_event = _publish_snapshot_event(
@@ -2791,4 +2798,8 @@ def stream_dflash_generate_impl(
         target_fa_window=target_fa_window,
         runtime_context=runtime_context,
     )
+    # This generator frame lives for the whole generation; drop its snapshot
+    # ref so the prefill seam (which nulls request.prefix_snapshot) actually
+    # releases the multi-GB arrays instead of leaving them pinned here.
+    prefix_snapshot = None
     yield from session.run_events(request)

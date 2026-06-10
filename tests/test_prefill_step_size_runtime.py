@@ -812,6 +812,59 @@ def test_generation_snapshot_restore_computes_only_prompt_tail():
     assert prefill_event.prefill_tokens_computed == 2
 
 
+def test_prefix_snapshot_released_after_prefill_seam():
+    import gc
+    import weakref
+
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    snapshot = _prefix_snapshot(
+        token_ids=(1, 2, 0, 0, 0),
+        kind="generation",
+    )
+    snapshot_ref = weakref.ref(snapshot)
+    context = build_runtime_context(
+        runtime_config_from_defaults(
+            prefill_step_size=4,
+            prefix_cache=True,
+            prefix_cache_l2=False,
+        )
+    )
+
+    events = spec_epoch.stream_dflash_generate_impl(
+        target_model=object(),
+        target_ops=target_ops,
+        tokenizer=object(),
+        draft_model=draft_model,
+        draft_backend=draft_backend,
+        prompt="unused",
+        max_new_tokens=8,
+        prompt_tokens_override=[1, 2, 0, 0, 0, 88, 89],
+        prefix_snapshot=snapshot,
+        snapshot_service=_snapshot_service(draft_model),
+        stable_prefix_len=7,
+        prefix_cache_active=True,
+        runtime_context=context,
+    )
+    del snapshot
+    try:
+        saw_prefill_complete = False
+        for event in events:
+            if isinstance(event, PrefillCompleteEvent):
+                saw_prefill_complete = True
+                break
+        assert saw_prefill_complete
+        gc.collect()
+        assert snapshot_ref() is None, (
+            "prefix snapshot must be released once prefill consumed it, "
+            "not stay pinned by request/generator refs for the whole "
+            "generation"
+        )
+    finally:
+        events.close()
+
+
 def test_warm_exact_hit_skips_prefill_republish():
     target_ops = _FakeTargetOps()
     draft_backend = _FakeDraftBackend()

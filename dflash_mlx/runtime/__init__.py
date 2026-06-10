@@ -78,7 +78,7 @@ def stream_dflash_generate(
 
     gen_stream = mx.default_stream(mx.default_device())
     with mx.stream(gen_stream):
-        yield from _stream_dflash_generate_impl(
+        inner = _stream_dflash_generate_impl(
             target_model=target_model,
             target_ops=target_ops,
             tokenizer=tokenizer,
@@ -101,3 +101,7 @@ def stream_dflash_generate(
             prefix_hit_kind=prefix_hit_kind,
             runtime_context=runtime_context,
         )
+        # This wrapper frame lives for the whole generation; the snapshot is
+        # bound into the inner generator, so drop the local ref here too.
+        prefix_snapshot = None
+        yield from inner
