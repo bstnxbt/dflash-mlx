@@ -17,11 +17,6 @@ from mlx_lm.models.base import (
     scaled_dot_product_attention,
 )
 
-from dflash_mlx.engine.fused_norm_rope_qwen import (
-    fused_norm_rope_qwen,
-    is_fused_norm_rope_qwen_eligible,
-    make_qwen_cos_sin,
-)
 from dflash_mlx.engine.gqa_sdpa import (
     async_per_head_gqa_sdpa,
     grouped_gqa_sdpa,
@@ -29,7 +24,6 @@ from dflash_mlx.engine.gqa_sdpa import (
     repeat_gqa_mask,
 )
 from dflash_mlx.engine.target_ops import TargetCapabilities
-from dflash_mlx.internal_debug import fused_norm_rope_enabled
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
 _HYBRID_SDPA_EXACT_KV_THRESHOLD = 1024
@@ -218,64 +212,6 @@ def _apply_rope_positions(rope: Any, x: mx.array, positions: mx.array) -> mx.arr
         return rope(x, offset=pos[0])
     chunks = [rope(x[:, :, index : index + 1, :], offset=value) for index, value in enumerate(pos)]
     return mx.concatenate(chunks, axis=2)
-
-
-def _can_fuse_qwen_qk_norm_rope(attn: Any, queries: mx.array, keys: mx.array) -> bool:
-    if not fused_norm_rope_enabled():
-        return False
-    rope = getattr(attn, "rope", None)
-    q_weight = getattr(getattr(attn, "q_norm", None), "weight", None)
-    k_weight = getattr(getattr(attn, "k_norm", None), "weight", None)
-    rope_dims = getattr(rope, "dims", None)
-    rope_base = getattr(rope, "base", None)
-    if rope_dims is None or rope_base is None or q_weight is None or k_weight is None:
-        return False
-    # Plain nn.RoPE only: scaled/llama3/yarn variants bake different freqs.
-    if float(getattr(rope, "scale", 0.0)) != 1.0:
-        return False
-    head_dim = int(queries.shape[-1])
-    if int(keys.shape[-1]) != head_dim or queries.dtype != keys.dtype:
-        return False
-    if int(q_weight.shape[0]) != head_dim or int(k_weight.shape[0]) != head_dim:
-        return False
-    return is_fused_norm_rope_qwen_eligible(
-        head_dim=head_dim,
-        partial_rotary_factor=float(rope_dims) / float(head_dim),
-        rope_traditional=bool(getattr(rope, "traditional", False)),
-        q_len=int(queries.shape[1]),
-        dtype=queries.dtype,
-    )
-
-
-def _apply_qwen_qk_norm_rope(
-    attn: Any,
-    queries: mx.array,
-    keys: mx.array,
-    *,
-    offset: int = 0,
-    positions: Optional[mx.array] = None,
-) -> tuple[mx.array, mx.array]:
-    if _can_fuse_qwen_qk_norm_rope(attn, queries, keys):
-        if positions is None:
-            pos = mx.arange(offset, offset + int(queries.shape[1]), dtype=mx.int32)
-        else:
-            pos = positions.astype(mx.int32)
-        cos, sin = make_qwen_cos_sin(pos, float(attn.rope.base))
-        fused_q = fused_norm_rope_qwen(
-            queries, attn.q_norm.weight, cos, sin, eps=float(attn.q_norm.eps)
-        )
-        fused_k = fused_norm_rope_qwen(
-            keys, attn.k_norm.weight, cos, sin, eps=float(attn.k_norm.eps)
-        )
-        return fused_q, fused_k
-    q = attn.q_norm(queries).transpose(0, 2, 1, 3)
-    k = attn.k_norm(keys).transpose(0, 2, 1, 3)
-    if positions is not None:
-        return (
-            _apply_rope_positions(attn.rope, q, positions),
-            _apply_rope_positions(attn.rope, k, positions),
-        )
-    return attn.rope(q, offset=offset), attn.rope(k, offset=offset)
 
 
 def _tree_path_indices(parent_ids: list[int], slot_index: int) -> list[int]:
@@ -468,17 +404,17 @@ def _tree_attention_call(
     keys = attn.k_proj(x)
     values = attn.v_proj(x)
 
+    queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+    keys = attn.k_norm(keys.reshape(batch_size, seq_len, num_key_value_heads, -1)).transpose(
+        0, 2, 1, 3
+    )
     values = values.reshape(batch_size, seq_len, num_key_value_heads, -1).transpose(
         0, 2, 1, 3
     )
 
     positions = getattr(cache, _TREE_POSITIONS_ATTR)
-    queries, keys = _apply_qwen_qk_norm_rope(
-        attn,
-        queries,
-        keys.reshape(batch_size, seq_len, num_key_value_heads, -1),
-        positions=positions,
-    )
+    queries = _apply_rope_positions(attn.rope, queries, positions)
+    keys = _apply_rope_positions(attn.rope, keys, positions)
     keys, values = cache.update_and_fetch(keys, values)
     tree_mask = getattr(cache, _TREE_ATTENTION_MASK_ATTR, mask)
     output = _gqa_reshape_sdpa(
@@ -758,7 +694,10 @@ def _install_full_attention_gqa_hook(attn: Any) -> None:
         keys = self.k_proj(x)
         values = self.v_proj(x)
 
-        keys = keys.reshape(B, L, num_key_value_heads, -1)
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_norm(keys.reshape(B, L, num_key_value_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
         values = values.reshape(B, L, num_key_value_heads, -1).transpose(
             0, 2, 1, 3
         )
@@ -770,9 +709,8 @@ def _install_full_attention_gqa_hook(attn: Any) -> None:
         if not can_use_gqa_fast_path:
             return original_call(self, x, mask=mask, cache=cache)
 
-        queries, keys = _apply_qwen_qk_norm_rope(
-            self, queries, keys, offset=cached_prefix_len
-        )
+        queries = self.rope(queries, offset=cached_prefix_len)
+        keys = self.rope(keys, offset=cached_prefix_len)
         keys, values = cache.update_and_fetch(keys, values)
         output = _gqa_reshape_sdpa(
             queries,

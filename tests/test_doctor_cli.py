@@ -36,7 +36,6 @@ _DOCTOR_ENV_KEYS = (
     "DFLASH_VERIFY_MAX_N",
     "DFLASH_VERIFY_QMM_KPARTS",
     "DFLASH_VERIFY_INCLUDE",
-    "DFLASH_FUSED_NORM_ROPE",
 )
 
 def _clear_doctor_env(monkeypatch):
