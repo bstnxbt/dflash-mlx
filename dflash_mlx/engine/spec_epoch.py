@@ -13,7 +13,7 @@ from typing import Any, Literal, Optional
 
 import mlx.core as mx
 
-from dflash_mlx.cache.codecs import hydrate_target_cache
+from dflash_mlx.cache.codecs import hydrate_target_cache, requires_full_target_hidden
 from dflash_mlx.cache.snapshot_service import SnapshotPublication, SnapshotService
 from dflash_mlx.cache.snapshot import (
     DFlashPrefixSnapshot,
@@ -37,7 +37,7 @@ from dflash_mlx.engine.ddtree import (
     verify_candidates_batch as ddtree_verify_candidates_batch,
 )
 from dflash_mlx.engine.fallback import stream_baseline_generate
-from dflash_mlx.engine.prefill import compute_snapshot_boundary
+from dflash_mlx.engine.prefill import compute_snapshot_boundary, snapshot_covers_prefix
 from dflash_mlx.engine.sparse_rope import (
     clear_sparse_positions,
     decode_position_adjustment,
@@ -625,6 +625,18 @@ class SpeculativeSession:
         if not supports_prefix_snapshot:
             snap_prefix_len = 0
         if snap_prefix_len > 0 and (quantize_kv_cache or target_fa_window > 0):
+            snap_prefix_len = 0
+        if (
+            snap_prefix_len > 0
+            and allow_full_context_draft_layers
+            and requires_full_target_hidden(
+                draft_model,
+                allow_full_attention_context=True,
+            )
+            and not snapshot_covers_prefix(prefix_snapshot, snap_prefix_len)
+        ):
+            # A trimmed-feature snapshot would zero-fill the context features
+            # the full-attention draft layer attends; treat it as a miss.
             snap_prefix_len = 0
         if snap_prefix_len > 0:
             template_cache = target_ops.make_cache(

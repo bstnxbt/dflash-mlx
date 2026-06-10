@@ -44,14 +44,14 @@ def _resolve_effective_trim_window(
         context_len=int(total_len),
         allow_full_attention_context=allow_full_attention_context,
     )
-    if _requires_full_target_hidden(
+    if requires_full_target_hidden(
         draft_model,
         allow_full_attention_context=allow_full_attention_context,
     ):
         effective = max(effective, int(total_len))
     return max(0, int(sink)), max(0, int(effective))
 
-def _requires_full_target_hidden(
+def requires_full_target_hidden(
     draft_model: Any,
     *,
     allow_full_attention_context: bool,

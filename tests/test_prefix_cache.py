@@ -20,6 +20,7 @@ from dflash_mlx.cache.codecs import (
     serialize_target_cache,
 )
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
+from dflash_mlx.engine.prefill import snapshot_covers_prefix
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 from dflash_mlx.cache.store import PrefixSnapshotStore
@@ -631,6 +632,65 @@ class TestSerializeHydrate:
         assert len(snapshot.target_hidden_chunks) == 2
         assert snapshot.target_hidden_chunk_spans == ((0, 4), (84, 100))
         assert snapshot.target_hidden_total_len == 100
+
+    def test_trimmed_snapshot_does_not_cover_prefix(self):
+        draft_model = SimpleNamespace(
+            args=SimpleNamespace(
+                layer_types=("sliding_attention", "full_attention"),
+                sliding_window=16,
+            )
+        )
+        snapshot = build_snapshot(
+            token_ids=list(range(100)),
+            target_cache=[_make_kv_cache_populated(n_tokens=100)],
+            target_hidden=mx.zeros((1, 100, 4), dtype=mx.float32),
+            last_logits=mx.zeros((1, 10), dtype=mx.float32),
+            key=_make_key(),
+            draft_model=draft_model,
+            draft_sink_size=4,
+            draft_window_size=16,
+            allow_full_attention_context=False,
+        )
+
+        assert snapshot.target_hidden_chunk_spans == ((0, 4), (84, 100))
+        assert not snapshot_covers_prefix(snapshot, 100)
+        assert not snapshot_covers_prefix(snapshot, 50)
+        assert snapshot_covers_prefix(snapshot, 4)
+
+    def test_full_snapshot_covers_prefix(self):
+        draft_model = SimpleNamespace(
+            args=SimpleNamespace(
+                layer_types=("sliding_attention", "full_attention"),
+                sliding_window=16,
+            )
+        )
+        snapshot = build_snapshot(
+            token_ids=list(range(100)),
+            target_cache=[_make_kv_cache_populated(n_tokens=100)],
+            target_hidden=mx.zeros((1, 100, 4), dtype=mx.float32),
+            last_logits=mx.zeros((1, 10), dtype=mx.float32),
+            key=_make_key(),
+            draft_model=draft_model,
+            draft_sink_size=4,
+            draft_window_size=16,
+            allow_full_attention_context=True,
+        )
+
+        assert snapshot.target_hidden_chunk_spans == ((0, 100),)
+        assert snapshot_covers_prefix(snapshot, 100)
+        assert snapshot_covers_prefix(snapshot, 1)
+
+    def test_contiguous_generation_chunks_cover_prefix(self):
+        snap = SimpleNamespace(
+            target_hidden_chunk_spans=((0, 50), (50, 80), (80, 100)),
+        )
+        assert snapshot_covers_prefix(snap, 100)
+        assert snapshot_covers_prefix(snap, 0)
+
+    def test_gap_in_spans_does_not_cover(self):
+        snap = SimpleNamespace(target_hidden_chunk_spans=((0, 4), (10, 100)))
+        assert not snapshot_covers_prefix(snap, 100)
+        assert snapshot_covers_prefix(snap, 4)
 
     def test_snapshot_target_hidden_is_clamped_to_token_prefix(self):
         target_hidden = mx.zeros((1, 8, 4), dtype=mx.float32)
