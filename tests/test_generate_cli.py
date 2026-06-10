@@ -98,6 +98,7 @@ def test_generate_cli_passes_verify_mode(monkeypatch):
             "prefill_step_size": 8192,
             "draft_sink_size": 32,
             "draft_window_size": 512,
+            "draft_full_context_min_ctx": 16384,
             "verify_len_cap": 8,
             "verify_mode": "off",
             "copyspec_mode": "conservative",

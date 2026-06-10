@@ -93,6 +93,24 @@ _ADAPTIVE_TPC_THRESHOLD = 3.5
 _ADAPTIVE_RESUME_SPEED_RATIO = 1.0
 
 
+def resolve_full_context_draft_layers(
+    *,
+    supports: bool,
+    projected_ctx: int,
+    min_ctx: int,
+) -> bool:
+    """Full-context draft layers engage above a projected-context threshold.
+
+    Below it the windowed draft sees the same effective conditioning while
+    skipping the full-attention pass over all context features (a measured
+    pure cost at short context, a large acceptance win at depth).
+    """
+    if not supports:
+        return False
+    if min_ctx <= 0:
+        return True
+    return int(projected_ctx) >= int(min_ctx)
+
 @dataclass(frozen=True)
 class _SessionRequest:
     prompt_tokens: tuple[int, ...]
@@ -2689,9 +2707,6 @@ def stream_dflash_generate_impl(
     supports_prefix_snapshot = bool(
         getattr(target_capabilities, "supports_prefix_snapshot", True)
     )
-    allow_full_context_draft_layers = bool(
-        getattr(target_capabilities, "supports_full_context_draft_layers", False)
-    )
     prompt_tokens = (
         list(prompt_tokens_override)
         if prompt_tokens_override is not None
@@ -2707,6 +2722,13 @@ def stream_dflash_generate_impl(
     dflash_max_ctx = configured_max_ctx if configured_max_ctx > 0 else sys.maxsize
     target_fa_window = int(runtime_config.target_fa_window)
     projected_ctx = prompt_len + max(0, int(max_new_tokens))
+    allow_full_context_draft_layers = resolve_full_context_draft_layers(
+        supports=bool(
+            getattr(target_capabilities, "supports_full_context_draft_layers", False)
+        ),
+        projected_ctx=projected_ctx,
+        min_ctx=int(runtime_config.draft_full_context_min_ctx),
+    )
     if projected_ctx >= dflash_max_ctx:
         fallback_reason = (
             f"projected_ctx={projected_ctx} "

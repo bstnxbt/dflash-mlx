@@ -306,6 +306,8 @@ def test_capabilities_for_distinguishes_hybrid_and_pure_attention():
     assert hybrid.supports_dflash is True
     assert hybrid.supports_prefix_snapshot is True
     assert hybrid.supports_tree_verify is True
+    assert hybrid.supports_full_context_draft_layers is True
+    assert pure.supports_full_context_draft_layers is True
     assert pure.supports_recurrent_rollback is False
     assert pure.supports_dflash is True
     assert pure.supports_kv_trim is True

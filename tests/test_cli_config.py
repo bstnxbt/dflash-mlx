@@ -692,6 +692,10 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
         (["--model", "m", "--prefill-step-size", "0"], "--prefill-step-size"),
         (["--model", "m", "--draft-sink-size", "-1"], "draft_sink_size"),
         (["--model", "m", "--draft-window-size", "0"], "draft_window_size"),
+        (
+            ["--model", "m", "--draft-full-context-min-ctx", "-1"],
+            "draft_full_context_min_ctx",
+        ),
         (["--model", "m", "--verify-len-cap", "-1"], "verify_len_cap"),
         (["--model", "m", "--fastpath-max-tokens", "-1"], "--fastpath-max-tokens"),
     ],
@@ -709,6 +713,7 @@ def test_serve_default_sets_product_runtime(monkeypatch):
     assert cfg.prefill_step_size == 2048
     assert cfg.draft_sink_size == 64
     assert cfg.draft_window_size == 1024
+    assert cfg.draft_full_context_min_ctx == 16384
     assert cfg.verify_len_cap == 0
     assert cfg.prefix_cache is True
     assert cfg.prefix_cache_max_entries == 8

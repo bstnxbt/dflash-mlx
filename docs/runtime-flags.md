@@ -62,6 +62,7 @@ DFlash runtime:
 | `--prefill-step-size INT` | target prefill chunk size |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
+| `--draft-full-context-min-ctx INT` | projected context (prompt + max new tokens) at or above which the draft full-attention layer attends all context features; `0` means always; default `16384` |
 | `--verify-len-cap INT` | max tokens per verify forward, `0` means block size |
 | `--verify-mode {dflash,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
 | `--dflash-max-ctx INT` | DFlash runtime context cap; `0` means no cap |
@@ -156,6 +157,7 @@ Runtime override flags:
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
+| `--draft-full-context-min-ctx INT` | projected context (prompt + max new tokens) at or above which the draft full-attention layer attends all context features; `0` means always; default `16384` |
 | `--verify-len-cap INT` | max tokens per verify forward, `0` means block size |
 
 Generate disables cross-request prefix caching. Use it for local sanity checks, not for
@@ -212,6 +214,7 @@ Runtime override flags:
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
+| `--draft-full-context-min-ctx INT` | projected context (prompt + max new tokens) at or above which the draft full-attention layer attends all context features; `0` means always; default `16384` |
 | `--verify-len-cap INT` | max tokens per verify forward, `0` means block size |
 
 Benchmark output flags:

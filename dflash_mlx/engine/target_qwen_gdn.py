@@ -798,6 +798,9 @@ class QwenGdnTargetOps:
             supports_target_hidden_capture=True,
             supports_verify_linear=self._supports_verify_linear(target_model),
             supports_tree_verify=True,
+            # The DFlash draft is trained with full attention over context
+            # features; the engine gates engagement on draft_full_context_min_ctx.
+            supports_full_context_draft_layers=True,
         )
 
     def supports_tree_cache(self, cache_entries: list[Any]) -> bool:

@@ -59,6 +59,7 @@ class EffectiveRuntimeConfig:
     prefill_step_size: int
     draft_sink_size: int
     draft_window_size: int
+    draft_full_context_min_ctx: int
     verify_len_cap: int
     prefix_cache: bool
     prefix_cache_max_entries: int
@@ -79,6 +80,7 @@ DEFAULT_RUNTIME_CONFIG = EffectiveRuntimeConfig(
     prefill_step_size=2048,
     draft_sink_size=64,
     draft_window_size=1024,
+    draft_full_context_min_ctx=16384,
     verify_len_cap=0,
     prefix_cache=True,
     prefix_cache_max_entries=8,
@@ -185,6 +187,21 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         env="DFLASH_DRAFT_WINDOW_SIZE",
         value_type=int,
         help="Draft context cache rolling window tokens.",
+        metavar="INT",
+        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
+    ),
+    RuntimeConfigFieldSpec(
+        field="draft_full_context_min_ctx",
+        flags=("--draft-full-context-min-ctx",),
+        env="DFLASH_DRAFT_FULL_CONTEXT_MIN_CTX",
+        value_type=int,
+        help=(
+            "Projected context (prompt + max new tokens) at or above which the "
+            "draft full-attention layer attends all context features instead of "
+            "the sink+window slice. 0 = always full-context. Short contexts pay "
+            "a measured pure cost with no acceptance gain; deep contexts gain "
+            "from matching the draft's full-attention training condition."
+        ),
         metavar="INT",
         surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
@@ -404,6 +421,7 @@ _GENERATE_RUNTIME_FIELD_ORDER = (
     "quantize_kv_cache",
     "draft_sink_size",
     "draft_window_size",
+    "draft_full_context_min_ctx",
     "verify_len_cap",
 )
 
@@ -415,6 +433,7 @@ _BENCHMARK_RUNTIME_FIELD_ORDER = (
     "quantize_kv_cache",
     "draft_sink_size",
     "draft_window_size",
+    "draft_full_context_min_ctx",
     "verify_len_cap",
 )
 
@@ -433,6 +452,7 @@ def runtime_config_from_defaults(
     prefill_step_size: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
+    draft_full_context_min_ctx: int | None = None,
     verify_len_cap: int | None = None,
     prefix_cache: bool | None = None,
     prefix_cache_max_entries: int | None = None,
@@ -466,6 +486,11 @@ def runtime_config_from_defaults(
                 defaults.draft_window_size
                 if draft_window_size is None
                 else int(draft_window_size)
+            ),
+            draft_full_context_min_ctx=(
+                defaults.draft_full_context_min_ctx
+                if draft_full_context_min_ctx is None
+                else int(draft_full_context_min_ctx)
             ),
             verify_len_cap=(
                 defaults.verify_len_cap
@@ -540,6 +565,11 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             getattr(args, "draft_window_size", None),
             _runtime_env("draft_window_size"),
             defaults.draft_window_size,
+        ),
+        draft_full_context_min_ctx=_resolve_int(
+            getattr(args, "draft_full_context_min_ctx", None),
+            _runtime_env("draft_full_context_min_ctx"),
+            defaults.draft_full_context_min_ctx,
         ),
         verify_len_cap=_resolve_int(
             getattr(args, "verify_len_cap", None),
@@ -623,6 +653,10 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--draft-sink-size / draft_sink_size must be >= 0")
     if cfg.draft_window_size <= 0:
         raise ValueError("--draft-window-size / draft_window_size must be > 0")
+    if cfg.draft_full_context_min_ctx < 0:
+        raise ValueError(
+            "--draft-full-context-min-ctx / draft_full_context_min_ctx must be >= 0"
+        )
     if cfg.verify_len_cap < 0:
         raise ValueError("--verify-len-cap / verify_len_cap must be >= 0")
     if cfg.quantize_kv_cache and cfg.target_fa_window > 0:

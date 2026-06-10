@@ -12,6 +12,7 @@ from dflash_mlx.engine.prefill import (
     compute_snapshot_boundary,
     init_target_hidden_from_snapshot,
 )
+from dflash_mlx.engine.spec_epoch import resolve_full_context_draft_layers
 
 def test_snapshot_boundary_defaults_to_prompt_len_when_unset():
     assert compute_snapshot_boundary(prompt_len=128, stable_prefix_len=None) == 128
@@ -25,6 +26,34 @@ def test_snapshot_boundary_ignores_stable_prefix_overshoot():
 def test_snapshot_boundary_ignores_zero_or_negative_stable_prefix():
     assert compute_snapshot_boundary(prompt_len=64, stable_prefix_len=0) == 64
     assert compute_snapshot_boundary(prompt_len=64, stable_prefix_len=-1) == 64
+
+def test_full_context_draft_requires_capability():
+    assert (
+        resolve_full_context_draft_layers(
+            supports=False, projected_ctx=100_000, min_ctx=16384
+        )
+        is False
+    )
+
+def test_full_context_draft_engages_at_threshold():
+    assert (
+        resolve_full_context_draft_layers(
+            supports=True, projected_ctx=16384, min_ctx=16384
+        )
+        is True
+    )
+    assert (
+        resolve_full_context_draft_layers(
+            supports=True, projected_ctx=16383, min_ctx=16384
+        )
+        is False
+    )
+
+def test_full_context_draft_zero_threshold_means_always():
+    assert (
+        resolve_full_context_draft_layers(supports=True, projected_ctx=1, min_ctx=0)
+        is True
+    )
 
 def _full_chunk_snap(target_hidden):
     total_len = int(target_hidden.shape[1])
