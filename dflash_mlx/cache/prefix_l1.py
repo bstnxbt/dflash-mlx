@@ -59,6 +59,7 @@ class DFlashPrefixCache:
             "prefill_tokens_saved": 0,
             "fingerprint_rejects": 0,
             "sidecar_hits": 0,
+            "coverage_rejects": 0,
         }
         # Updated on every record=True lookup; "miss" / "l1_exact" / "l1_prefix".
         # Guarded by _lock; readable via last_hit_kind property.
@@ -96,6 +97,7 @@ class DFlashPrefixCache:
         *,
         record: bool = True,
         request_id: int | None = None,
+        require_full_coverage: bool = False,
     ) -> tuple[int, Optional[DFlashPrefixSnapshot]]:
         req_tuple = tuple(int(t) for t in req_tokens)
         t_start = time.perf_counter_ns()
@@ -108,6 +110,7 @@ class DFlashPrefixCache:
             best_sidecar_id = -1
             best_sidecar_carrier: Optional[DFlashPrefixSnapshot] = None
             saw_fingerprint_reject = 0
+            coverage_rejects = 0
             longest_fingerprint_match_len = 0
             longest_fingerprint_first_divergence = -1
             for eid, snap in self._entries.items():
@@ -138,6 +141,9 @@ class DFlashPrefixCache:
                         best_sidecar_id = eid
                         best_sidecar_carrier = snap
                     continue
+                if require_full_coverage and not snapshot_covers_prefix(snap, snap_len):
+                    coverage_rejects += 1
+                    continue
                 if snap_len > best_len:
                     best_len = snap_len
                     best_id = eid
@@ -153,6 +159,9 @@ class DFlashPrefixCache:
                     best_sidecar_carrier
                 )
                 sidecar_used = True
+
+            if record and coverage_rejects:
+                self._stats["coverage_rejects"] += coverage_rejects
 
             if best_snapshot is not None and best_len > 0:
                 exact = best_len == len(req_tuple)
@@ -198,6 +207,8 @@ class DFlashPrefixCache:
                 if saw_fingerprint_reject == len(self._entries):
                     miss_reason = "fingerprint_reject_all"
                     self._stats["fingerprint_rejects"] += 1
+                elif coverage_rejects > 0:
+                    miss_reason = "coverage_reject"
                 elif saw_fingerprint_reject > 0 and longest_fingerprint_match_len == 0:
                     miss_reason = "fingerprint_reject_partial_no_token_match"
                     self._stats["fingerprint_rejects"] += 1
@@ -207,6 +218,7 @@ class DFlashPrefixCache:
                     miss_reason = "token_divergence"
             entries_count = len(self._entries)
             sfr = int(saw_fingerprint_reject)
+            cov_rejects = int(coverage_rejects)
             longest_match = int(longest_fingerprint_match_len)
             first_div = int(longest_fingerprint_first_divergence)
 
@@ -218,6 +230,7 @@ class DFlashPrefixCache:
             matched_len=0,
             entries=entries_count,
             fingerprint_reject=sfr,
+            coverage_rejects=cov_rejects,
             miss_reason=miss_reason,
             longest_token_match_len=longest_match,
             first_divergence_pos=first_div,

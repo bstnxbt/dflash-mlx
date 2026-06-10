@@ -25,6 +25,7 @@ import mlx.core as mx
 import dflash_mlx
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+from dflash_mlx.engine.prefill import snapshot_covers_prefix, spans_cover_prefix
 
 _LOG = logging.getLogger(__name__)
 
@@ -151,6 +152,11 @@ def _fingerprint(snapshot: DFlashPrefixSnapshot) -> str:
     # (key, kind, tokens) so the insert exists-check cannot shadow them.
     if int(snapshot.sidecar_boundary) > 0:
         payload["sidecar_boundary"] = int(snapshot.sidecar_boundary)
+    # Marker only when coverage is full: trimmed files keep their legacy
+    # fingerprint, while a full-coverage twin of the same (key, kind, tokens)
+    # gets a distinct filename the exists-check cannot shadow.
+    if snapshot_covers_prefix(snapshot, snapshot.prefix_len):
+        payload["full_coverage"] = True
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
@@ -438,6 +444,7 @@ class DFlashPrefixL2Cache:
             "load_total_us": 0,
             "lookup_loads": 0,
             "lookup_hash_filtered": 0,
+            "coverage_rejects": 0,
         }
         self._stop = threading.Event()
         # Set = writes allowed. Cleared while a request is being served so
@@ -504,6 +511,7 @@ class DFlashPrefixL2Cache:
         key: DFlashPrefixKey,
         *,
         min_token_len: int = 0,
+        require_full_coverage: bool = False,
     ) -> Optional[DFlashPrefixSnapshot]:
         t0 = time.perf_counter_ns()
         req_tokens = tuple(int(t) for t in req_tokens)
@@ -544,7 +552,11 @@ class DFlashPrefixL2Cache:
             with self._lock:
                 self._stats["lookup_loads"] += 1
             snap = self._load_and_validate(
-                path, key=key, req_tokens=req_tokens, parts=parts
+                path,
+                key=key,
+                req_tokens=req_tokens,
+                parts=parts,
+                require_full_coverage=require_full_coverage,
             )
             if snap is None:
                 continue
@@ -779,6 +791,7 @@ class DFlashPrefixL2Cache:
         key: DFlashPrefixKey,
         req_tokens: tuple[int, ...],
         parts: _Parts,
+        require_full_coverage: bool = False,
     ) -> Optional[DFlashPrefixSnapshot]:
         try:
             arrays, metadata = mx.load(
@@ -870,6 +883,25 @@ class DFlashPrefixL2Cache:
                 self._stats["schema_rejects"] += 1
             self._unlink_if_writable(path)
             return None
+        if require_full_coverage:
+            spans_raw = meta.get("target_hidden_chunk_spans")
+            if not isinstance(spans_raw, list) or not all(
+                isinstance(span, list)
+                and len(span) == 2
+                and all(_is_json_int(v) for v in span)
+                for span in spans_raw
+            ):
+                with self._lock:
+                    self._stats["schema_rejects"] += 1
+                self._unlink_if_writable(path)
+                return None
+            if not spans_cover_prefix(
+                ((int(s), int(e)) for s, e in spans_raw), n
+            ):
+                # Still valid for windowed requesters: reject without unlink.
+                with self._lock:
+                    self._stats["coverage_rejects"] += 1
+                return None
         try:
             return _deserialize(arrays, meta)
         except Exception as e:

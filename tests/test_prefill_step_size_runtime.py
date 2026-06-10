@@ -147,7 +147,7 @@ class _RecordingL2:
     def __init__(self) -> None:
         self.snapshots: list[DFlashPrefixSnapshot] = []
 
-    def lookup(self, req_tokens, key, *, min_token_len: int = 0):
+    def lookup(self, req_tokens, key, *, min_token_len: int = 0, require_full_coverage: bool = False):
         req_tuple = tuple(int(token) for token in req_tokens)
         matches = [
             snapshot

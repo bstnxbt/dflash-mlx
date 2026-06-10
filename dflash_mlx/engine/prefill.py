@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Optional
 
 import mlx.core as mx
@@ -18,6 +19,22 @@ def compute_snapshot_boundary(
         return int(stable_prefix_len)
     return int(prompt_len)
 
+def spans_cover_prefix(
+    spans: Iterable[tuple[int, int]],
+    prefix_len: int,
+) -> bool:
+    needed = int(prefix_len)
+    if needed <= 0:
+        return True
+    covered = 0
+    for start, end in sorted((int(start), int(end)) for start, end in spans):
+        if start > covered:
+            return False
+        covered = max(covered, end)
+        if covered >= needed:
+            return True
+    return covered >= needed
+
 def snapshot_covers_prefix(
     prefix_snapshot: DFlashPrefixSnapshot,
     prefix_len: int,
@@ -28,20 +45,7 @@ def snapshot_covers_prefix(
     init_target_hidden_from_snapshot would silently zero-fill; callers that
     need full-context features must treat such snapshots as a miss.
     """
-    needed = int(prefix_len)
-    if needed <= 0:
-        return True
-    covered = 0
-    for start, end in sorted(
-        (int(start), int(end))
-        for start, end in prefix_snapshot.target_hidden_chunk_spans
-    ):
-        if start > covered:
-            return False
-        covered = max(covered, end)
-        if covered >= needed:
-            return True
-    return covered >= needed
+    return spans_cover_prefix(prefix_snapshot.target_hidden_chunk_spans, prefix_len)
 
 def init_target_hidden_from_snapshot(
     prefix_snapshot: DFlashPrefixSnapshot,

@@ -14,9 +14,11 @@ from dflash_mlx.cache.manager import (
     RuntimeCacheManager,
     get_runtime_cache_manager,
 )
+from dflash_mlx.cache.codecs import requires_full_target_hidden
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 from dflash_mlx.cache.snapshot_service import SnapshotService
+from dflash_mlx.engine.spec_epoch import resolve_full_context_draft_layers
 from dflash_mlx.server.prefix_cache_manager import (
     build_prefix_key,
     chat_template_stable_marker,
@@ -114,6 +116,7 @@ class PrefixCacheFlow:
         prompt: list[int],
         request: Any = None,
         request_id: int | None = None,
+        max_new_tokens: int = 0,
         runtime_context: Optional[Any] = None,
     ) -> "PrefixCacheFlow":
         if runtime_context is None:
@@ -135,15 +138,29 @@ class PrefixCacheFlow:
             request=request,
         )
         lookup_tokens = prompt[:stable_prefix_len]
-        try:
-            if request_id is None:
-                lookup = cache_manager.lookup(lookup_tokens, key)
-            else:
-                lookup = cache_manager.lookup(
-                    lookup_tokens,
-                    key,
-                    request_id=request_id,
+        # Order matters: the draft check short-circuits so target capabilities
+        # are only consulted for full-attention drafts (the only consumers).
+        require_full_coverage = requires_full_target_hidden(
+            draft_model,
+            allow_full_attention_context=True,
+        ) and resolve_full_context_draft_layers(
+            supports=bool(
+                getattr(
+                    model_provider.target_ops.capabilities_for(model_provider.model),
+                    "supports_full_context_draft_layers",
+                    False,
                 )
+            ),
+            projected_ctx=len(prompt) + max(0, int(max_new_tokens)),
+            min_ctx=int(runtime_config.draft_full_context_min_ctx),
+        )
+        lookup_kwargs: dict[str, Any] = {}
+        if request_id is not None:
+            lookup_kwargs["request_id"] = request_id
+        if require_full_coverage:
+            lookup_kwargs["require_full_coverage"] = True
+        try:
+            lookup = cache_manager.lookup(lookup_tokens, key, **lookup_kwargs)
         except RuntimeCacheManagerClosed:
             return cls(cache_manager=None)
         hit_tokens = int(lookup.matched_tokens)

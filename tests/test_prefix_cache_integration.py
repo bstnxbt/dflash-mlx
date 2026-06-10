@@ -1282,6 +1282,102 @@ class TestContextConfigExposedCorrectly:
         assert flow.snapshot is snap
         assert flow.stable_prefix_len == len(prompt)
 
+    def test_prefix_flow_requires_full_coverage_above_projected_ctx(self, monkeypatch):
+        import dflash_mlx.server.prefix_cache_flow as flow_mod
+
+        key = _make_key()
+        seen: dict = {}
+
+        class RecordingManager:
+            def lookup(self, tokens, lookup_key, **kwargs):
+                seen.update(kwargs)
+                return PrefixCacheLookupResult(
+                    matched_tokens=0,
+                    snapshot=None,
+                    elapsed_ms=0.0,
+                )
+
+            def log_stats(self, label=""):
+                return None
+
+        monkeypatch.setattr(
+            flow_mod,
+            "get_runtime_cache_manager",
+            lambda _runtime_context, *, cache_identity=None: RecordingManager(),
+        )
+        monkeypatch.setattr(flow_mod, "build_prefix_key", lambda *_args: key)
+
+        provider = _FakeLoadedProvider()
+        provider.model = object()
+        provider.target_ops = SimpleNamespace(
+            capabilities_for=lambda _model: SimpleNamespace(
+                supports_full_context_draft_layers=True
+            )
+        )
+        full_attention_draft = SimpleNamespace(
+            target_layer_ids=[3, 7],
+            args=SimpleNamespace(layer_types=("full_attention",), sliding_window=0),
+        )
+
+        flow_mod.PrefixCacheFlow.for_request(
+            model_provider=provider,
+            draft_model=full_attention_draft,
+            tokenizer=_FakeTokenizer(),
+            prompt=[11, 12, 13, 14],
+            max_new_tokens=32768,
+            runtime_context=_runtime_context(prefix_cache=True),
+        )
+
+        assert seen.get("require_full_coverage") is True
+
+    def test_prefix_flow_skips_coverage_filter_below_projected_ctx(self, monkeypatch):
+        import dflash_mlx.server.prefix_cache_flow as flow_mod
+
+        key = _make_key()
+        seen: dict = {}
+
+        class RecordingManager:
+            def lookup(self, tokens, lookup_key, **kwargs):
+                seen.update(kwargs)
+                return PrefixCacheLookupResult(
+                    matched_tokens=0,
+                    snapshot=None,
+                    elapsed_ms=0.0,
+                )
+
+            def log_stats(self, label=""):
+                return None
+
+        monkeypatch.setattr(
+            flow_mod,
+            "get_runtime_cache_manager",
+            lambda _runtime_context, *, cache_identity=None: RecordingManager(),
+        )
+        monkeypatch.setattr(flow_mod, "build_prefix_key", lambda *_args: key)
+
+        provider = _FakeLoadedProvider()
+        provider.model = object()
+        provider.target_ops = SimpleNamespace(
+            capabilities_for=lambda _model: SimpleNamespace(
+                supports_full_context_draft_layers=True
+            )
+        )
+        full_attention_draft = SimpleNamespace(
+            target_layer_ids=[3, 7],
+            args=SimpleNamespace(layer_types=("full_attention",), sliding_window=0),
+        )
+
+        flow_mod.PrefixCacheFlow.for_request(
+            model_provider=provider,
+            draft_model=full_attention_draft,
+            tokenizer=_FakeTokenizer(),
+            prompt=[11, 12, 13, 14],
+            max_new_tokens=256,
+            runtime_context=_runtime_context(prefix_cache=True),
+        )
+
+        assert "require_full_coverage" not in seen
+
     def test_prefix_flow_keeps_generation_snapshots_for_tool_chat(self, monkeypatch):
         import dflash_mlx.server.prefix_cache_flow as flow_mod
 
@@ -1445,7 +1541,7 @@ class TestContextConfigExposedCorrectly:
                 self.snapshots.append(snapshot)
                 return True
 
-            def lookup(self, tokens, key):
+            def lookup(self, tokens, key, *, min_token_len=0, require_full_coverage=False):
                 req = tuple(tokens)
                 for snapshot in reversed(self.snapshots):
                     if snapshot.key == key and req[: len(snapshot.token_ids)] == snapshot.token_ids:

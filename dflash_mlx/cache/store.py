@@ -55,25 +55,38 @@ class PrefixSnapshotStore:
         key: DFlashPrefixKey,
         *,
         request_id: int | None = None,
+        require_full_coverage: bool = False,
     ) -> tuple[int, DFlashPrefixSnapshot | None]:
         req_tuple = tuple(int(t) for t in req_tokens)
         t_start = time.perf_counter_ns()
         if self._l2 is None:
-            return self._l1_lookup(req_tuple, key, request_id=request_id)
+            return self._l1_lookup(
+                req_tuple,
+                key,
+                request_id=request_id,
+                require_full_coverage=require_full_coverage,
+            )
 
         matched_len, snapshot = self._l1_lookup(
             req_tuple,
             key,
             record=False,
             request_id=request_id,
+            require_full_coverage=require_full_coverage,
         )
         if snapshot is not None or matched_len > 0:
             if matched_len == len(req_tuple):
-                return self._l1_lookup(req_tuple, key, request_id=request_id)
+                return self._l1_lookup(
+                    req_tuple,
+                    key,
+                    request_id=request_id,
+                    require_full_coverage=require_full_coverage,
+                )
             l2_snapshot = self._l2.lookup(
                 req_tuple,
                 key,
                 min_token_len=matched_len,
+                require_full_coverage=require_full_coverage,
             )
             if l2_snapshot is not None:
                 return self._record_l2_hit(
@@ -85,9 +98,16 @@ class PrefixSnapshotStore:
             else:
                 with self._lock:
                     self._stats["l2_misses"] += 1
-            return self._l1_lookup(req_tuple, key, request_id=request_id)
+            return self._l1_lookup(
+                req_tuple,
+                key,
+                request_id=request_id,
+                require_full_coverage=require_full_coverage,
+            )
 
-        l2_snapshot = self._l2.lookup(req_tuple, key)
+        l2_snapshot = self._l2.lookup(
+            req_tuple, key, require_full_coverage=require_full_coverage
+        )
         if l2_snapshot is None:
             with self._lock:
                 self._stats["l2_misses"] += 1
@@ -140,13 +160,16 @@ class PrefixSnapshotStore:
         *,
         record: bool = True,
         request_id: int | None = None,
+        require_full_coverage: bool = False,
     ) -> tuple[int, DFlashPrefixSnapshot | None]:
-        if request_id is None and record:
-            result = self._l1.lookup(req_tuple, key)
-        elif request_id is None:
-            result = self._l1.lookup(req_tuple, key, record=record)
-        else:
-            result = self._l1.lookup(req_tuple, key, record=record, request_id=request_id)
+        kwargs: dict[str, Any] = {}
+        if not record or request_id is not None:
+            kwargs["record"] = record
+        if request_id is not None:
+            kwargs["request_id"] = request_id
+        if require_full_coverage:
+            kwargs["require_full_coverage"] = True
+        result = self._l1.lookup(req_tuple, key, **kwargs)
         if record:
             self._last_hit_kind = self._l1.last_hit_kind
         return result

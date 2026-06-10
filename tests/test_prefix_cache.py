@@ -152,6 +152,28 @@ def _make_full_hidden_snapshot(
         kind=kind,
     )
 
+def _make_trimmed_snapshot(
+    token_ids: list[int],
+    key: DFlashPrefixKey,
+    kind: str = "prefill",
+) -> DFlashPrefixSnapshot:
+    n = len(token_ids)
+    snapshot = build_snapshot(
+        token_ids=token_ids,
+        target_cache=[
+            _make_kv_cache_populated(n_tokens=n),
+            _make_gdn_cache_populated(),
+        ],
+        target_hidden=mx.zeros((1, n, 8), dtype=mx.float32),
+        last_logits=mx.zeros((1, 32), dtype=mx.float32),
+        key=key,
+        kind=kind,
+        draft_sink_size=4,
+        draft_window_size=16,
+    )
+    assert not snapshot_covers_prefix(snapshot, n)
+    return snapshot
+
 def test_l1_generation_snapshot_without_logits_is_prefix_only():
     cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
     key = _make_key()
@@ -1831,3 +1853,74 @@ class TestSidecar:
         ) + int(snap.sidecar_last_logits.nbytes)
         assert breakdown["sidecar"] == expected
         assert snap.nbytes > expected
+
+class TestCoverageFilterL1:
+    def test_lookup_rejects_trimmed_snapshot_when_full_coverage_required(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        trimmed = _make_trimmed_snapshot(list(range(100)), key)
+        cache.insert(trimmed)
+
+        matched, hit = cache.lookup(
+            list(range(100)) + [999], key, require_full_coverage=True
+        )
+        assert matched == 0
+        assert hit is None
+        stats = cache.stats()
+        assert stats["coverage_rejects"] == 1
+        assert stats["misses"] == 1
+
+        matched, hit = cache.lookup(list(range(100)) + [999], key)
+        assert matched == 100
+        assert hit is trimmed
+        assert cache.stats()["coverage_rejects"] == 1
+
+    def test_lookup_falls_back_to_shorter_covering_snapshot(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        trimmed_long = _make_trimmed_snapshot(list(range(60)), key)
+        covering_short = _make_synthetic_snapshot(list(range(30)), key)
+        cache.insert(trimmed_long)
+        cache.insert(covering_short)
+
+        matched, hit = cache.lookup(
+            list(range(60)) + [999], key, require_full_coverage=True
+        )
+        assert matched == 30
+        assert hit is covering_short
+        stats = cache.stats()
+        assert stats["coverage_rejects"] == 1
+        assert stats["prefix_hits"] == 1
+
+    def test_full_snapshot_serves_windowed_and_full_context_requests(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        full = _make_synthetic_snapshot([1, 2, 3, 4], key)
+        cache.insert(full)
+
+        matched, hit = cache.lookup([1, 2, 3, 4, 5], key)
+        assert (matched, hit) == (4, full)
+
+        matched, hit = cache.lookup(
+            [1, 2, 3, 4, 5], key, require_full_coverage=True
+        )
+        assert (matched, hit) == (4, full)
+        assert cache.stats()["coverage_rejects"] == 0
+
+    def test_sidecar_hit_survives_coverage_filter(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        snap = _make_sidecar_generation_snapshot(tokens, 5, key)
+        cache.insert(snap)
+
+        matched, hit = cache.lookup(
+            [1, 2, 3, 4, 5, 99, 98], key, require_full_coverage=True
+        )
+        assert matched == 5
+        assert hit is not None
+        assert hit.kind == "prefill"
+        assert snapshot_covers_prefix(hit, hit.prefix_len)
+        stats = cache.stats()
+        assert stats["sidecar_hits"] == 1
+        assert stats["coverage_rejects"] == 0

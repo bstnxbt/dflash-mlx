@@ -102,6 +102,7 @@ class RuntimeCacheManager:
         key: DFlashPrefixKey,
         *,
         request_id: int | None = None,
+        require_full_coverage: bool = False,
     ) -> PrefixCacheLookupResult:
         lookup_t0 = time.perf_counter_ns()
         with self._state_lock:
@@ -110,6 +111,7 @@ class RuntimeCacheManager:
                 tokens,
                 key,
                 request_id=request_id,
+                require_full_coverage=require_full_coverage,
             )
             hit_kind: HitKind = self._store._last_hit_kind  # type: ignore[assignment]
         return PrefixCacheLookupResult(
@@ -409,13 +411,15 @@ def _format_stats_line(store: PrefixSnapshotStore, label: str = "") -> None:
         f"insertions={stats['insertions']} "
         f"evictions={stats['evictions']} "
         f"prefill_tokens_saved={stats['prefill_tokens_saved']} "
-        f"sidecar_hits={stats.get('sidecar_hits', 0)}"
+        f"sidecar_hits={stats.get('sidecar_hits', 0)} "
+        f"coverage_rejects={stats.get('coverage_rejects', 0)}"
     )
     l2 = stats.get("l2")
     if l2:
         line += (
             f" l2_hits={stats.get('l2_hits', 0)} l2_misses={stats.get('l2_misses', 0)} "
-            f"l2_writes={l2.get('writes', 0)} l2_bytes={l2.get('current_bytes', 0)}/{l2.get('max_bytes', 0)}"
+            f"l2_writes={l2.get('writes', 0)} l2_bytes={l2.get('current_bytes', 0)}/{l2.get('max_bytes', 0)} "
+            f"l2_coverage_rejects={l2.get('coverage_rejects', 0)}"
         )
     sys.stderr.write(line + "\n")
     sys.stderr.flush()

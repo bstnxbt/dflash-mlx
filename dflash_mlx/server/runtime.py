@@ -142,6 +142,7 @@ class ServerRuntime:
             prompt=prepared.prompt,
             request=request,
             request_id=request_id,
+            max_new_tokens=int(args.max_tokens),
             runtime_context=runtime_context,
         )
         ctx.prompt_cache_count = prefix_flow.hit_tokens

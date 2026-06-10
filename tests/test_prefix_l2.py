@@ -32,11 +32,13 @@ from dflash_mlx.cache.prefix_l2 import (
 )
 from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.diagnostics import TraceConfig
+from dflash_mlx.engine.prefill import snapshot_covers_prefix
 from tests.test_prefix_cache import (
     _make_full_hidden_snapshot,
     _make_key,
     _make_rotating_cache_populated,
     _make_synthetic_snapshot,
+    _make_trimmed_snapshot,
 )
 
 def _all_snapshot_files(cache_dir: Path) -> list[Path]:
@@ -1334,3 +1336,98 @@ class TestSidecarRoundTrip:
         with_sidecar = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6], 4, key)
         plain = _make_synthetic_snapshot([1, 2, 3, 4, 5, 6], key, kind="generation")
         assert _fingerprint(with_sidecar) != _fingerprint(plain)
+
+class TestCoverageFilterL2:
+    def test_lookup_rejects_trimmed_on_metadata_before_eval(self, tmp_path, monkeypatch):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            _insert_l2_sync(l2, _make_trimmed_snapshot(list(range(100)), key))
+
+            def _no_eval(_arrays):
+                raise AssertionError(
+                    "coverage reject must happen before array eval"
+                )
+
+            monkeypatch.setattr("dflash_mlx.cache.prefix_l2._eval_arrays", _no_eval)
+
+            assert l2.lookup(tuple(range(100)), key, require_full_coverage=True) is None
+            stats = l2.stats()
+            assert stats["coverage_rejects"] == 1
+            assert stats["lookup_loads"] == 1
+            assert stats["misses"] == 1
+            assert len(_all_snapshot_files(tmp_path)) == 1
+        finally:
+            l2.shutdown()
+
+    def test_trimmed_file_still_serves_windowed_requests(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            _insert_l2_sync(l2, _make_trimmed_snapshot(list(range(100)), key))
+
+            snap = l2.lookup(tuple(range(100)), key)
+            assert snap is not None
+            assert snap.token_ids == tuple(range(100))
+            assert l2.stats()["coverage_rejects"] == 0
+        finally:
+            l2.shutdown()
+
+    def test_coverage_reject_keeps_scanning_to_shorter_covering_file(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            _insert_l2_sync(l2, _make_trimmed_snapshot(list(range(60)), key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot(list(range(30)), key))
+
+            snap = l2.lookup(tuple(range(60)), key, require_full_coverage=True)
+            assert snap is not None
+            assert snap.token_ids == tuple(range(30))
+            stats = l2.stats()
+            assert stats["coverage_rejects"] == 1
+            assert stats["hits"] == 1
+        finally:
+            l2.shutdown()
+
+    def test_full_twin_coexists_with_trimmed_file_and_serves_full_context(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            tokens = list(range(100))
+            _insert_l2_sync(l2, _make_trimmed_snapshot(tokens, key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot(tokens, key))
+
+            assert len(_all_snapshot_files(tmp_path)) == 2
+
+            snap = l2.lookup(tuple(tokens), key, require_full_coverage=True)
+            assert snap is not None
+            assert snapshot_covers_prefix(snap, len(tokens))
+        finally:
+            l2.shutdown()
+
+    def test_fingerprint_distinguishes_trimmed_and_full_twins(self):
+        key = _make_key()
+        tokens = list(range(100))
+        trimmed = _make_trimmed_snapshot(tokens, key)
+        full = _make_synthetic_snapshot(tokens, key)
+        assert trimmed.token_ids == full.token_ids
+        assert trimmed.kind == full.kind
+        assert _fingerprint(trimmed) != _fingerprint(full)
+
+    def test_store_lookup_demotes_trimmed_l1_and_hits_covering_l2(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            tokens = list(range(100))
+            _insert_l2_sync(l2, _make_synthetic_snapshot(tokens, key))
+            store = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            store.insert(_make_trimmed_snapshot(tokens, key))
+            _wait_writes(l2, expected=2)
+
+            matched, snap = store.lookup(tokens, key, require_full_coverage=True)
+            assert matched == 100
+            assert snap is not None
+            assert snapshot_covers_prefix(snap, 100)
+            assert store.stats()["l2_hits"] == 1
+        finally:
+            l2.shutdown()
