@@ -1219,6 +1219,38 @@ def test_summary_event_keeps_cycle_profile_typed_until_serialization():
     assert payload["cycle_profile_us"][0]["draft_source"] == "dflash"
 
 
+def test_cycle_event_token_id_capture_fields_round_trip():
+    base = dict(
+        cycle=1,
+        block_len=16,
+        commit_count=3,
+        acceptance_len=2,
+        draft_us=1.0,
+        verify_us=2.0,
+        acceptance_us=3.0,
+        hidden_extraction_us=4.0,
+        rollback_us=5.0,
+        other_us=6.0,
+        cycle_total_us=21.0,
+    )
+    captured = CycleCompleteEvent(
+        **base,
+        proposed_ids=(11, 22, 33, 44),
+        posterior_ids=(11, 22, 99, 77),
+        committed_ids=(11, 22, 99),
+    )
+    payload = captured.to_payload()
+    assert payload["proposed_ids"] == [11, 22, 33, 44]
+    assert payload["posterior_ids"] == [11, 22, 99, 77]
+    assert payload["committed_ids"] == [11, 22, 99]
+
+    uncaptured = CycleCompleteEvent(**base)
+    payload = uncaptured.to_payload()
+    assert "proposed_ids" not in payload
+    assert "posterior_ids" not in payload
+    assert "committed_ids" not in payload
+
+
 def test_benchmark_cleanup_failure_is_reported(monkeypatch, capsys):
     def clear_cache_fails():
         raise RuntimeError("clear failed")

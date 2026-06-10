@@ -1875,6 +1875,9 @@ class SpeculativeSession:
                     verify_token_count=int(verify_token_count),
                     draft_source=str(best.source),
                     candidate_count=len(candidate_ids_list),
+                    proposed_ids=tuple(int(t) for t in best.ids.tolist()),
+                    posterior_ids=tuple(int(t) for t in best.posterior.tolist()),
+                    committed_ids=tuple(int(t) for t in committed_ids),
                 )
                 cycle_profiles.append(cycle_profile_entry)
                 _pre_yield = yield_pause.mark()
@@ -2451,6 +2454,9 @@ class SpeculativeSession:
                     verify_token_count=int(verify_token_count),
                     draft_source=str(draft_source),
                     candidate_count=1,
+                    proposed_ids=tuple(int(t) for t in verify_token_ids.tolist()),
+                    posterior_ids=tuple(int(t) for t in posterior.tolist()),
+                    committed_ids=tuple(int(t) for t in committed_ids),
                 )
                 cycle_profiles.append(cycle_profile_entry)
                 _pre_yield = yield_pause.mark()

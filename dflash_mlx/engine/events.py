@@ -108,6 +108,9 @@ class CycleCompleteEvent:
     prefix_len: int | None = None
     draft_source: str | None = None
     candidate_count: int | None = None
+    proposed_ids: tuple[int, ...] | None = None
+    posterior_ids: tuple[int, ...] | None = None
+    committed_ids: tuple[int, ...] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         cycle_wall_us = (
@@ -140,6 +143,12 @@ class CycleCompleteEvent:
             payload["draft_source"] = str(self.draft_source)
         if self.candidate_count is not None:
             payload["candidate_count"] = int(self.candidate_count)
+        if self.proposed_ids is not None:
+            payload["proposed_ids"] = [int(t) for t in self.proposed_ids]
+        if self.posterior_ids is not None:
+            payload["posterior_ids"] = [int(t) for t in self.posterior_ids]
+        if self.committed_ids is not None:
+            payload["committed_ids"] = [int(t) for t in self.committed_ids]
         return payload
 
 
