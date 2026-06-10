@@ -190,6 +190,112 @@ def test_l1_generation_snapshot_without_logits_is_prefix_only():
     assert prefix is snapshot
 
 
+def test_l1_generation_hit_is_consumed_on_serve():
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    key = _make_key()
+    snapshot = _make_synthetic_snapshot([1, 2, 3], key, kind="generation")
+    cache.insert(snapshot)
+
+    matched, served = cache.lookup([1, 2, 3, 4], key)
+    assert matched == 3
+    assert served is snapshot
+    stats = cache.stats()
+    assert stats["generation_consumed"] == 1
+    assert stats["current_entries"] == 0
+
+    matched2, served2 = cache.lookup([1, 2, 3, 4], key)
+    assert matched2 == 0
+    assert served2 is None
+
+
+def test_l1_generation_record_false_lookup_does_not_consume():
+    # The store's L2 min_token_len pre-pass uses record=False; it must not
+    # consume the entry the final record=True lookup will serve.
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    key = _make_key()
+    snapshot = _make_synthetic_snapshot([1, 2, 3], key, kind="generation")
+    cache.insert(snapshot)
+
+    matched, served = cache.lookup([1, 2, 3, 4], key, record=False)
+    assert matched == 3
+    assert served is snapshot
+    stats = cache.stats()
+    assert stats["generation_consumed"] == 0
+    assert stats["current_entries"] == 1
+
+    matched2, served2 = cache.lookup([1, 2, 3, 4], key)
+    assert matched2 == 3
+    assert served2 is snapshot
+    assert cache.stats()["generation_consumed"] == 1
+
+
+def test_l1_prefill_hit_is_not_consumed():
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    key = _make_key()
+    snapshot = _make_synthetic_snapshot([1, 2, 3], key, kind="prefill")
+    cache.insert(snapshot)
+
+    for _ in range(2):
+        matched, served = cache.lookup([1, 2, 3, 4], key)
+        assert matched == 3
+        assert served is snapshot
+    stats = cache.stats()
+    assert stats["generation_consumed"] == 0
+    assert stats["current_entries"] == 1
+
+
+def test_l1_sidecar_hit_consumes_carrier():
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    key = _make_key()
+    tokens = list(range(10, 100, 10))
+    carrier = _make_sidecar_generation_snapshot(tokens, 5, key)
+    cache.insert(carrier)
+
+    req = tokens[:5] + [777, 778]
+    matched, served = cache.lookup(req, key)
+    assert matched == 5
+    assert served is not carrier
+    assert served.prefix_len == 5
+    stats = cache.stats()
+    assert stats["sidecar_hits"] == 1
+    assert stats["generation_consumed"] == 1
+    assert stats["current_entries"] == 0
+
+    matched2, served2 = cache.lookup(req, key)
+    assert matched2 == 0
+    assert served2 is None
+
+
+def test_store_generation_l2_hit_is_not_promoted_to_l1():
+    key = _make_key()
+    l2_snapshot = _make_synthetic_snapshot([1, 2, 3], key, kind="generation")
+
+    class _HitL2:
+        def __init__(self, snapshot):
+            self.snapshot = snapshot
+
+        def lookup(self, _tokens, _key, **kwargs):
+            min_token_len = int(kwargs.get("min_token_len", 0))
+            if len(self.snapshot.token_ids) <= min_token_len:
+                return None
+            return self.snapshot
+
+        def insert_async(self, snapshot):
+            return True
+
+        def stats(self):
+            return {}
+
+    l1 = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    store = PrefixSnapshotStore(l1=l1, l2=_HitL2(l2_snapshot))
+
+    first_len, first = store.lookup([1, 2, 3, 4], key)
+    assert first_len == 3
+    assert first is l2_snapshot
+    assert l1.stats()["current_entries"] == 0
+    assert store.stats()["l2_hits"] == 1
+
+
 def test_l1_prunes_dominated_prefill_snapshots_without_frontier_stride():
     cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
     key = _make_key()
@@ -916,7 +1022,34 @@ class TestMutationIsolation:
         assert not mx.all(gdn[0][1] == 0).item(), \
             "GDN snapshot shares buffer with live cache — deep-copy is broken"
 
-    def test_hydrate_returns_independent_cache(self):
+    def test_hydrate_adopts_snapshot_arrays_by_reference(self):
+        src = [_make_kv_cache_populated(n_tokens=3), _make_gdn_cache_populated()]
+        fa, gdn = serialize_target_cache(src)
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2, 3),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        template = [
+            KVCache(),
+            RecurrentRollbackCache(size=3, conv_kernel_size=4),
+        ]
+        hydrated = hydrate_target_cache(snapshot, template)
+
+        assert hydrated[0].keys is snapshot.fa_states[0][0]
+        assert hydrated[0].values is snapshot.fa_states[0][1]
+        assert all(
+            live is snap
+            for live, snap in zip(hydrated[1].cache, snapshot.gdn_states[1])
+        )
+
+    def test_hydrate_adopted_cache_grows_away_from_snapshot(self):
+        # Adopted FA arrays have capacity == offset, so the first update takes
+        # the growth path (fresh buffer); the snapshot stays bitwise intact
+        # through both the growth update and a later in-place update.
         src = [_make_kv_cache_populated(n_tokens=3)]
         fa, gdn = serialize_target_cache(src)
         snapshot = _make_full_hidden_snapshot(
@@ -927,17 +1060,64 @@ class TestMutationIsolation:
             last_logits=mx.zeros((1, 10)),
             key=_make_key(),
         )
-        template = [KVCache()]
-        hydrated1 = hydrate_target_cache(snapshot, template)
-        hydrated2 = hydrate_target_cache(snapshot, template)
+        snap_k_before = mx.array(snapshot.fa_states[0][0])
+        snap_v_before = mx.array(snapshot.fa_states[0][1])
+        mx.eval(snap_k_before, snap_v_before)
 
-        hydrated1[0].keys = mx.zeros_like(hydrated1[0].keys)
-        mx.eval(hydrated1[0].keys)
+        hydrated = hydrate_target_cache(snapshot, [KVCache()])
+        adopted_k = hydrated[0].keys
+        new_k = mx.full((1, 2, 1, 8), -7.0, dtype=mx.float32)
+        new_v = mx.full((1, 2, 1, 8), -9.0, dtype=mx.float32)
+        out_k, out_v = hydrated[0].update_and_fetch(new_k, new_v)
+        mx.eval(out_k, out_v)
+        out_k2, out_v2 = hydrated[0].update_and_fetch(new_k + 1.0, new_v + 1.0)
+        mx.eval(out_k2, out_v2)
 
-        h2_k, _ = hydrated2[0].state
-        assert not mx.all(h2_k == 0).item()
-        snap_k, _, _ = snapshot.fa_states[0]
-        assert not mx.all(snap_k == 0).item()
+        assert hydrated[0].keys is not adopted_k
+        assert mx.array_equal(snapshot.fa_states[0][0], snap_k_before).item()
+        assert mx.array_equal(snapshot.fa_states[0][1], snap_v_before).item()
+        assert mx.array_equal(out_k2[..., :3, :], snap_k_before).item()
+        assert mx.array_equal(out_k2[..., 3:4, :], new_k).item()
+        assert mx.array_equal(out_k2[..., 4:5, :], new_k + 1.0).item()
+        assert mx.array_equal(out_v2[..., 3:4, :], new_v).item()
+
+    def test_hydrate_adopted_gdn_survives_live_replacement(self):
+        src = [_make_gdn_cache_populated(size=3, conv_k=4)]
+        fa, gdn = serialize_target_cache(src)
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2, 3),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        before = mx.array(snapshot.gdn_states[0][1])
+        mx.eval(before)
+        hydrated = hydrate_target_cache(
+            snapshot,
+            [RecurrentRollbackCache(size=3, conv_kernel_size=4)],
+        )
+        hydrated[0].cache[1] = mx.zeros_like(hydrated[0].cache[1])
+        mx.eval(hydrated[0].cache[1])
+
+        assert mx.array_equal(snapshot.gdn_states[0][1], before).item()
+
+    def test_hydrate_rejects_fa_arrays_with_spare_capacity(self):
+        # Adoption is only legal for exact-length arrays; spare capacity would
+        # let update_and_fetch write in place into the shared buffer.
+        k = mx.zeros((1, 2, 5, 8), dtype=mx.float32)
+        v = mx.zeros((1, 2, 5, 8), dtype=mx.float32)
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2, 3),
+            fa_states=((k, v, 3),),
+            gdn_states=(None,),
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        with pytest.raises(ValueError, match="cannot adopt"):
+            hydrate_target_cache(snapshot, [KVCache()])
 
 class TestSnapshot:
     def test_prefix_len_matches_token_ids(self):
@@ -1658,16 +1838,20 @@ class TestByteBudget:
 
         assert result.admitted is True
         assert result.inserted_evicted_snapshot is None
+        stats = cache.stats()
+        assert stats["current_entries"] == 2
+        assert stats["evictions"] == 1
+        assert stats["byte_budget_evictions"] == 1
         exact_len, exact = cache.lookup([1, 2, 3], key)
         assert exact_len == 3
         assert exact is prefill
         prefix_len, prefix = cache.lookup([1, 2, 3, 4, 5, 6], key)
         assert prefix_len == 5
         assert prefix is generation
+        # Serving the generation hit consumes it; the prefill entry remains.
         stats = cache.stats()
-        assert stats["current_entries"] == 2
-        assert stats["evictions"] == 1
-        assert stats["byte_budget_evictions"] == 1
+        assert stats["current_entries"] == 1
+        assert stats["generation_consumed"] == 1
 
 def _make_sidecar_generation_snapshot(
     token_ids: list[int],

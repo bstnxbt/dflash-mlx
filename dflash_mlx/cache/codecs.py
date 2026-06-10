@@ -268,15 +268,32 @@ def hydrate_target_cache(
                 size=len(tmpl.cache),
                 conv_kernel_size=tmpl.conv_kernel_size,
             )
-            new_cache.cache = [_clone_array(a) for a in gdn_state]
+            # Adopt by reference: GDN entries are replaced on every update,
+            # never mutated in place (the invariant sidecar capture relies
+            # on), so the snapshot arrays stay frozen as the live cache
+            # advances.
+            new_cache.cache = list(gdn_state)
             result.append(new_cache)
         elif isinstance(tmpl, KVCache):
             if fa_state is None:
                 raise ValueError(f"Snapshot missing FA state at layer {i}")
             k, v, offset = fa_state[:3]
+            if int(k.shape[2]) != int(offset) or int(v.shape[2]) != int(offset):
+                raise ValueError(
+                    f"Snapshot FA arrays at layer {i} are not exact-length "
+                    f"(keys={int(k.shape[2])}, values={int(v.shape[2])}, "
+                    f"offset={int(offset)}); cannot adopt"
+                )
             new_cache = KVCache()
-            new_cache.keys = _clone_array(k)
-            new_cache.values = _clone_array(v)
+            # Adopt by reference: snapshot FA arrays are exact-length
+            # (capacity == offset), so the first update_and_fetch always
+            # takes the growth path (concat into a fresh buffer) and never
+            # writes in place into the adopted arrays — the snapshot stays
+            # valid after restore. Cloning here was a multi-GB allocation
+            # per boundary (plus a second materialization when the snapshot
+            # held lazy slices) and is the prime per-boundary churn source.
+            new_cache.keys = k
+            new_cache.values = v
             new_cache.offset = offset
             result.append(new_cache)
         elif isinstance(tmpl, RotatingKVCache):

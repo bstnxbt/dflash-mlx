@@ -371,7 +371,10 @@ class TestL2Lifecycle:
         finally:
             l2.shutdown()
 
-    def test_l2_generation_prefix_hit_promotes_past_l1_token_cap(self, tmp_path):
+    def test_l2_generation_prefix_hit_is_not_promoted_to_l1(self, tmp_path):
+        # Generation snapshots are consume-on-serve; promoting one to L1
+        # would pin its arrays for a hit that can never come. Repeat
+        # lookups fall back to L2, which keeps serving the file.
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
@@ -393,11 +396,11 @@ class TestL2Lifecycle:
             assert hydrated is not None
             stats = cache.stats()
             assert stats["l2_hits"] == 1
-            assert stats["current_entries"] == 1
+            assert stats["current_entries"] == 0
             assert stats["skipped_too_long"] == 0
 
             cache.lookup([7, 8, 9, 10, 12], key)
-            assert cache.stats()["l2_hits"] == 1
+            assert cache.stats()["l2_hits"] == 2
         finally:
             l2.shutdown()
 

@@ -1422,7 +1422,11 @@ def test_generation_snapshot_carries_gdn_sidecar_at_stable_boundary(monkeypatch)
         )
     )
 
-    matched, snapshot = cache.lookup([1, 2, 3, 0, 0, 0, 0, 0, 0, 99], key)
+    # Non-consuming peek (record=False) to inspect the published snapshot
+    # without serving it.
+    matched, snapshot = cache.lookup(
+        [1, 2, 3, 0, 0, 0, 0, 0, 0, 99], key, record=False
+    )
     assert matched == 9
     assert snapshot is not None
     assert snapshot.kind == "generation"
@@ -1432,7 +1436,8 @@ def test_generation_snapshot_carries_gdn_sidecar_at_stable_boundary(monkeypatch)
     assert snapshot.sidecar_last_logits.shape == (1, 8)
 
     # A request diverging inside the generation snapshot is served back to
-    # the sidecar boundary as a sliced prefill-kind snapshot.
+    # the sidecar boundary as a sliced prefill-kind snapshot; serving it
+    # consumes the carrier.
     matched, sliced = cache.lookup([1, 2, 77, 78], key)
     assert matched == 2
     assert sliced is not None
@@ -1442,6 +1447,8 @@ def test_generation_snapshot_carries_gdn_sidecar_at_stable_boundary(monkeypatch)
     assert sliced.last_logits is not None
     assert mx.array_equal(sliced.last_logits, snapshot.sidecar_last_logits).item()
     assert cache.stats()["sidecar_hits"] == 1
+    assert cache.stats()["generation_consumed"] == 1
+    assert cache.stats()["current_entries"] == 0
 
 
 def test_generation_snapshot_sidecar_skipped_below_min_boundary():

@@ -60,6 +60,7 @@ class DFlashPrefixCache:
             "fingerprint_rejects": 0,
             "sidecar_hits": 0,
             "coverage_rejects": 0,
+            "generation_consumed": 0,
         }
         # Updated on every record=True lookup; "miss" / "l1_exact" / "l1_prefix".
         # Guarded by _lock; readable via last_hit_kind property.
@@ -173,9 +174,23 @@ class DFlashPrefixCache:
                 else:
 
                     if record:
-                        if best_id in self._lru_order:
-                            self._lru_order.remove(best_id)
-                        self._lru_order.append(best_id)
+                        consumed = sidecar_used or best_snapshot.kind == "generation"
+                        if consumed:
+                            # Consume-on-serve: a generation snapshot bridges
+                            # exactly one boundary — the request it serves
+                            # publishes a strictly-dominating successor at its
+                            # end (for sidecar carriers the new boundary covers
+                            # every prefix this entry could still serve), so
+                            # keeping it pins multi-GB buffers for zero future
+                            # hits. record=False pre-passes must not consume.
+                            self._entries.pop(best_id, None)
+                            if best_id in self._lru_order:
+                                self._lru_order.remove(best_id)
+                            self._stats["generation_consumed"] += 1
+                        else:
+                            if best_id in self._lru_order:
+                                self._lru_order.remove(best_id)
+                            self._lru_order.append(best_id)
                         if exact:
                             self._stats["exact_hits"] += 1
                             self._last_hit_kind = "l1_exact"
@@ -193,6 +208,7 @@ class DFlashPrefixCache:
                             req_tokens=len(req_tuple),
                             matched_len=int(best_len),
                             entries=entries_count_log,
+                            consumed=int(consumed),
                             elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
                         )
                     return (best_len, best_snapshot)
