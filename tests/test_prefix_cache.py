@@ -16,8 +16,11 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 from dflash_mlx.cache.codecs import (
     PrefixSnapshotBuilder,
     build_snapshot,
+    capture_gdn_sidecar,
     hydrate_target_cache,
     serialize_target_cache,
+    sidecar_eligible,
+    slice_snapshot_at_sidecar_boundary,
 )
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.engine.prefill import snapshot_covers_prefix
@@ -1643,3 +1646,188 @@ class TestByteBudget:
         assert stats["current_entries"] == 2
         assert stats["evictions"] == 1
         assert stats["byte_budget_evictions"] == 1
+
+def _make_sidecar_generation_snapshot(
+    token_ids: list[int],
+    boundary: int,
+    key: DFlashPrefixKey,
+) -> DFlashPrefixSnapshot:
+    n = len(token_ids)
+    kv_cache = _make_kv_cache_populated(n_tokens=n)
+    gdn_cache = _make_gdn_cache_populated()
+    sidecar_gdn = capture_gdn_sidecar([kv_cache, gdn_cache])
+    return build_snapshot(
+        token_ids=token_ids,
+        target_cache=[kv_cache, gdn_cache],
+        target_hidden=mx.zeros((1, n, 8), dtype=mx.float32),
+        last_logits=mx.zeros((1, 32), dtype=mx.float32),
+        key=key,
+        kind="generation",
+        sidecar_boundary=boundary,
+        sidecar_gdn_states=sidecar_gdn,
+        sidecar_last_logits=mx.full((1, 32), 7.0, dtype=mx.float32),
+    )
+
+
+class TestSidecar:
+    def test_capture_gdn_sidecar_grabs_refs_and_survives_replacement(self):
+        kv_cache = _make_kv_cache_populated()
+        gdn_cache = _make_gdn_cache_populated()
+        sidecar = capture_gdn_sidecar([kv_cache, gdn_cache])
+        assert sidecar[0] is None
+        assert sidecar[1][0] is gdn_cache.cache[0]
+        before = float(sidecar[1][0][0, 0, 0].item())
+        gdn_cache.cache[0] = mx.zeros_like(gdn_cache.cache[0])
+        assert float(sidecar[1][0][0, 0, 0].item()) == before
+
+    def test_sidecar_eligible_rejects_rotating(self):
+        assert sidecar_eligible(
+            [_make_kv_cache_populated(), _make_gdn_cache_populated()]
+        )
+        assert not sidecar_eligible(
+            [_make_rotating_cache_populated(), _make_gdn_cache_populated()]
+        )
+
+    def test_slice_snapshot_at_sidecar_boundary(self):
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        snap = _make_sidecar_generation_snapshot(tokens, 5, key)
+        sliced = slice_snapshot_at_sidecar_boundary(snap)
+        assert sliced.kind == "prefill"
+        assert sliced.token_ids == tuple(tokens[:5])
+        k, v, offset = sliced.fa_states[0]
+        assert k.shape == (1, 2, 5, 8)
+        assert v.shape == (1, 2, 5, 8)
+        assert offset == 5
+        assert mx.array_equal(k, snap.fa_states[0][0][:, :, :5, :]).item()
+        assert sliced.gdn_states is snap.sidecar_gdn_states
+        assert sliced.last_logits is snap.sidecar_last_logits
+        assert sliced.target_hidden_chunk_spans == ((0, 5),)
+        assert sliced.target_hidden_total_len == 5
+        hydrated = hydrate_target_cache(
+            sliced,
+            [KVCache(), _make_gdn_cache_populated()],
+        )
+        assert hydrated[0].offset == 5
+
+    def test_slice_rejects_uncovered_boundary(self):
+        key = _make_key()
+        snap = _make_sidecar_generation_snapshot(list(range(1, 9)), 5, key)
+        snap.target_hidden_chunks = (
+            mx.zeros((1, 2, 8), dtype=mx.float32),
+            mx.zeros((1, 2, 8), dtype=mx.float32),
+        )
+        snap.target_hidden_chunk_spans = ((0, 2), (6, 8))
+        with pytest.raises(ValueError, match="do not cover"):
+            slice_snapshot_at_sidecar_boundary(snap)
+
+    def test_build_snapshot_sidecar_contract(self):
+        key = _make_key()
+        kv_cache = _make_kv_cache_populated(n_tokens=4)
+        gdn_cache = _make_gdn_cache_populated()
+        common = dict(
+            token_ids=[1, 2, 3, 4],
+            target_cache=[kv_cache, gdn_cache],
+            target_hidden=mx.zeros((1, 4, 8), dtype=mx.float32),
+            last_logits=mx.zeros((1, 32), dtype=mx.float32),
+            key=key,
+        )
+        sidecar_gdn = capture_gdn_sidecar([kv_cache, gdn_cache])
+        logits = mx.zeros((1, 32), dtype=mx.float32)
+        with pytest.raises(ValueError, match="generation"):
+            build_snapshot(
+                kind="prefill",
+                sidecar_boundary=2,
+                sidecar_gdn_states=sidecar_gdn,
+                sidecar_last_logits=logits,
+                **common,
+            )
+        with pytest.raises(ValueError, match="must be <"):
+            build_snapshot(
+                kind="generation",
+                sidecar_boundary=4,
+                sidecar_gdn_states=sidecar_gdn,
+                sidecar_last_logits=logits,
+                **common,
+            )
+        with pytest.raises(ValueError, match="requires sidecar"):
+            build_snapshot(kind="generation", sidecar_boundary=2, **common)
+
+    def test_l1_lookup_serves_sidecar_on_divergence_inside_generation(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        snap = _make_sidecar_generation_snapshot(tokens, 5, key)
+        cache.insert(snap)
+
+        matched, hit = cache.lookup([1, 2, 3, 4, 5, 99, 98], key)
+        assert matched == 5
+        assert hit is not None
+        assert hit.kind == "prefill"
+        assert hit.token_ids == tuple(tokens[:5])
+        assert hit.gdn_states is snap.sidecar_gdn_states
+        assert hit.last_logits is snap.sidecar_last_logits
+        assert cache.stats()["sidecar_hits"] == 1
+        assert cache.last_hit_kind == "l1_prefix"
+
+    def test_l1_lookup_sidecar_requires_boundary_within_request(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6, 7, 8], 5, key)
+        cache.insert(snap)
+        matched, hit = cache.lookup([1, 2, 3, 99], key)
+        assert matched == 0
+        assert hit is None
+
+    def test_l1_lookup_sidecar_serves_request_shorter_than_snapshot(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        snap = _make_sidecar_generation_snapshot(tokens, 5, key)
+        cache.insert(snap)
+        matched, hit = cache.lookup(tokens[:6], key)
+        assert matched == 5
+        assert hit is not None
+        assert hit.kind == "prefill"
+        assert hit.token_ids == tuple(tokens[:5])
+
+    def test_l1_lookup_prefers_full_snapshot_over_sidecar_at_same_length(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        gen = _make_sidecar_generation_snapshot(tokens, 5, key)
+        full = _make_synthetic_snapshot(tokens[:5], key)
+        cache.insert(gen)
+        cache.insert(full)
+        matched, hit = cache.lookup([1, 2, 3, 4, 5, 99], key)
+        assert matched == 5
+        assert hit is full
+        assert cache.stats()["sidecar_hits"] == 0
+
+    def test_l1_lookup_sidecar_skips_uncovered_windowed_snapshot(self):
+        cache = DFlashPrefixCache(max_entries=8)
+        key = _make_key()
+        snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6, 7, 8], 5, key)
+        snap.target_hidden_chunks = (
+            mx.zeros((1, 2, 8), dtype=mx.float32),
+            mx.zeros((1, 2, 8), dtype=mx.float32),
+        )
+        snap.target_hidden_chunk_spans = ((0, 2), (6, 8))
+        cache.insert(snap)
+        matched, hit = cache.lookup([1, 2, 3, 4, 5, 99], key)
+        assert matched == 0
+        assert hit is None
+
+    def test_nbytes_breakdown_counts_sidecar(self):
+        key = _make_key()
+        snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6], 4, key)
+        breakdown = snap.nbytes_breakdown()
+        expected = sum(
+            int(a.nbytes)
+            for gdn in snap.sidecar_gdn_states
+            if gdn is not None
+            for a in gdn
+            if a is not None
+        ) + int(snap.sidecar_last_logits.nbytes)
+        assert breakdown["sidecar"] == expected
+        assert snap.nbytes > expected

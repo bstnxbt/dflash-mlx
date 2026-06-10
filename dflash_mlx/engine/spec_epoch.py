@@ -13,7 +13,12 @@ from typing import Any, Literal, Optional
 
 import mlx.core as mx
 
-from dflash_mlx.cache.codecs import hydrate_target_cache, requires_full_target_hidden
+from dflash_mlx.cache.codecs import (
+    capture_gdn_sidecar,
+    hydrate_target_cache,
+    requires_full_target_hidden,
+    sidecar_eligible,
+)
 from dflash_mlx.cache.snapshot_service import SnapshotPublication, SnapshotService
 from dflash_mlx.cache.snapshot import (
     DFlashPrefixSnapshot,
@@ -78,6 +83,9 @@ from dflash_mlx.engine.memory_waterfall import (
 )
 
 _DECODE_CLEAR_CACHE_INTERVAL_TOKENS = 1024
+# Below this stable-prefix depth a boundary sidecar saves at most pennies of
+# re-prefill while degrading the snapshot size ratio; skip it.
+_SIDECAR_MIN_BOUNDARY = 4096
 _DDTREE_TOP_WIDTH = 2
 _DDTREE_MAX_BRANCH_POSITIONS = 2
 _ADAPTIVE_REDUCED_BURST_CYCLES = 64
@@ -1013,6 +1021,25 @@ class SpeculativeSession:
                 yield evt
                 yield_pause.done(_pre_yield)
 
+        if (
+            snapshot_boundary >= _SIDECAR_MIN_BOUNDARY
+            and request.max_new_tokens > 0
+            and request.should_collect_generation_snapshot_hidden(
+                supports_prefix_snapshot
+            )
+            and state.prefill_logits is not None
+            and sidecar_eligible(target_cache)
+        ):
+            # Last moment the boundary state exists: the tail forward below
+            # advances GDN past it and GDN cannot be rewound. Reference-grab
+            # the GDN states (replaced, never mutated in place) + boundary
+            # logits so the generation snapshot can also serve next-turn
+            # requests that diverge inside this generation.
+            state.sidecar_boundary = int(snapshot_boundary)
+            state.sidecar_gdn_states = capture_gdn_sidecar(target_cache)
+            state.sidecar_last_logits = state.prefill_logits[:, -1, :]
+            mx.eval(state.sidecar_last_logits)
+
         if snapshot_boundary < prompt_len:
             if profile_cycles:
                 _t = time.perf_counter_ns()
@@ -1143,6 +1170,9 @@ class SpeculativeSession:
             # End of request: the session never touches target_cache again,
             # so the snapshot adopts the live arrays instead of cloning ~GBs.
             adopt_cache_arrays=True,
+            sidecar_boundary=state.sidecar_boundary,
+            sidecar_gdn_states=state.sidecar_gdn_states,
+            sidecar_last_logits=state.sidecar_last_logits,
         )
         yield_pause.done(_snapshot_build)
         if snapshot_event is not None:
@@ -2637,6 +2667,9 @@ class _RequestState:
     copyspec_hits: int = 0
     copyspec_tokens: int = 0
     copyspec_disabled: bool = False
+    sidecar_boundary: int = 0
+    sidecar_gdn_states: Any = None
+    sidecar_last_logits: mx.array | None = None
 
 
 @dataclass
@@ -2667,6 +2700,9 @@ def _publish_snapshot_event(
     snap_prefix_len: int = 0,
     l2_only: bool = False,
     adopt_cache_arrays: bool = False,
+    sidecar_boundary: int = 0,
+    sidecar_gdn_states: Any = None,
+    sidecar_last_logits: Optional[mx.array] = None,
 ) -> Optional[SnapshotPublishedEvent]:
     if snapshot_service is None or target_hidden is None:
         return None
@@ -2683,6 +2719,9 @@ def _publish_snapshot_event(
         snap_prefix_len=snap_prefix_len,
         l2_only=l2_only,
         adopt_cache_arrays=adopt_cache_arrays,
+        sidecar_boundary=sidecar_boundary,
+        sidecar_gdn_states=sidecar_gdn_states,
+        sidecar_last_logits=sidecar_last_logits,
     )
     if publication is None:
         return None

@@ -1388,6 +1388,103 @@ def test_generation_snapshot_published_for_truncated_stable_prefix():
     assert snapshot.kind == "generation"
 
 
+def test_generation_snapshot_carries_gdn_sidecar_at_stable_boundary(monkeypatch):
+    monkeypatch.setattr(spec_epoch, "_SIDECAR_MIN_BOUNDARY", 2)
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    cache = DFlashPrefixCache(max_entries=4)
+    key = _prefix_key()
+    snapshot_service = _snapshot_service(
+        draft_model,
+        cache=cache,
+        builder=PrefixSnapshotBuilder(
+            key=key,
+            draft_model=draft_model,
+            draft_sink_size=64,
+            draft_window_size=1024,
+        ),
+    )
+
+    list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=6,
+            prompt_tokens_override=[1, 2, 3],
+            snapshot_service=snapshot_service,
+            stable_prefix_len=2,
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    matched, snapshot = cache.lookup([1, 2, 3, 0, 0, 0, 0, 0, 0, 99], key)
+    assert matched == 9
+    assert snapshot is not None
+    assert snapshot.kind == "generation"
+    assert snapshot.sidecar_boundary == 2
+    assert snapshot.sidecar_gdn_states is not None
+    assert snapshot.sidecar_last_logits is not None
+    assert snapshot.sidecar_last_logits.shape == (1, 8)
+
+    # A request diverging inside the generation snapshot is served back to
+    # the sidecar boundary as a sliced prefill-kind snapshot.
+    matched, sliced = cache.lookup([1, 2, 77, 78], key)
+    assert matched == 2
+    assert sliced is not None
+    assert sliced.kind == "prefill"
+    assert sliced.prefix_len == 2
+    assert sliced.token_ids == (1, 2)
+    assert sliced.last_logits is not None
+    assert mx.array_equal(sliced.last_logits, snapshot.sidecar_last_logits).item()
+    assert cache.stats()["sidecar_hits"] == 1
+
+
+def test_generation_snapshot_sidecar_skipped_below_min_boundary():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    cache = DFlashPrefixCache(max_entries=4)
+    key = _prefix_key()
+    snapshot_service = _snapshot_service(
+        draft_model,
+        cache=cache,
+        builder=PrefixSnapshotBuilder(
+            key=key,
+            draft_model=draft_model,
+            draft_sink_size=64,
+            draft_window_size=1024,
+        ),
+    )
+
+    list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=6,
+            prompt_tokens_override=[1, 2, 3],
+            snapshot_service=snapshot_service,
+            stable_prefix_len=2,
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    matched, snapshot = cache.lookup([1, 2, 3, 0, 0, 0, 0, 0, 0, 99], key)
+    assert matched == 9
+    assert snapshot is not None
+    assert snapshot.sidecar_boundary == 0
+    assert snapshot.sidecar_gdn_states is None
+    assert snapshot.sidecar_last_logits is None
+
+
 def test_generation_snapshot_skipped_when_request_policy_disallows_it():
     target_ops = _FakeTargetOps()
     draft_backend = _FakeDraftBackend()

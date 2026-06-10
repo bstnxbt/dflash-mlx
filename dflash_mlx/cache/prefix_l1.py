@@ -11,8 +11,10 @@ from typing import Any, Optional
 
 from dflash_mlx.observability.cache import record_cache_event
 from dflash_mlx.diagnostics import TraceConfig
+from dflash_mlx.cache.codecs import slice_snapshot_at_sidecar_boundary
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+from dflash_mlx.engine.prefill import snapshot_covers_prefix
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class DFlashPrefixCache:
             "cross_kind_prunes": 0,
             "prefill_tokens_saved": 0,
             "fingerprint_rejects": 0,
+            "sidecar_hits": 0,
         }
         # Updated on every record=True lookup; "miss" / "l1_exact" / "l1_prefix".
         # Guarded by _lock; readable via last_hit_kind property.
@@ -69,6 +72,22 @@ class DFlashPrefixCache:
     def last_hit_kind(self) -> str:
         with self._lock:
             return self._last_hit_kind
+
+    @staticmethod
+    def _usable_sidecar_boundary(
+        snap: DFlashPrefixSnapshot,
+        req_tuple: tuple[int, ...],
+    ) -> int:
+        boundary = int(snap.sidecar_boundary)
+        if boundary <= 0 or boundary > len(req_tuple):
+            return 0
+        if snap.sidecar_gdn_states is None or snap.sidecar_last_logits is None:
+            return 0
+        if req_tuple[:boundary] != snap.token_ids[:boundary]:
+            return 0
+        if not snapshot_covers_prefix(snap, boundary):
+            return 0
+        return boundary
 
     def lookup(
         self,
@@ -85,6 +104,9 @@ class DFlashPrefixCache:
             best_len = 0
             best_id = -1
             best_snapshot: Optional[DFlashPrefixSnapshot] = None
+            best_sidecar_len = 0
+            best_sidecar_id = -1
+            best_sidecar_carrier: Optional[DFlashPrefixSnapshot] = None
             saw_fingerprint_reject = 0
             longest_fingerprint_match_len = 0
             longest_fingerprint_first_divergence = -1
@@ -94,6 +116,11 @@ class DFlashPrefixCache:
                     continue
                 snap_len = len(snap.token_ids)
                 if snap_len == 0 or snap_len > len(req_tuple):
+                    boundary = self._usable_sidecar_boundary(snap, req_tuple)
+                    if boundary > best_sidecar_len:
+                        best_sidecar_len = boundary
+                        best_sidecar_id = eid
+                        best_sidecar_carrier = snap
                     continue
                 if req_tuple[:snap_len] != snap.token_ids:
                     common = 0
@@ -105,11 +132,27 @@ class DFlashPrefixCache:
                     if common > longest_fingerprint_match_len:
                         longest_fingerprint_match_len = common
                         longest_fingerprint_first_divergence = common
+                    boundary = self._usable_sidecar_boundary(snap, req_tuple)
+                    if boundary > best_sidecar_len:
+                        best_sidecar_len = boundary
+                        best_sidecar_id = eid
+                        best_sidecar_carrier = snap
                     continue
                 if snap_len > best_len:
                     best_len = snap_len
                     best_id = eid
                     best_snapshot = snap
+
+            sidecar_used = False
+            if best_sidecar_carrier is not None and best_sidecar_len > best_len:
+                # The carrier diverges from the request inside its generation,
+                # but its boundary state restores the shared prefix exactly.
+                best_len = best_sidecar_len
+                best_id = best_sidecar_id
+                best_snapshot = slice_snapshot_at_sidecar_boundary(
+                    best_sidecar_carrier
+                )
+                sidecar_used = True
 
             if best_snapshot is not None and best_len > 0:
                 exact = best_len == len(req_tuple)
@@ -130,6 +173,8 @@ class DFlashPrefixCache:
                         else:
                             self._stats["prefix_hits"] += 1
                             self._last_hit_kind = "l1_prefix"
+                        if sidecar_used:
+                            self._stats["sidecar_hits"] += 1
                         self._stats["prefill_tokens_saved"] += best_len
                         entries_count_log = len(self._entries)
                         self._log_cache(

@@ -17,6 +17,7 @@ from dflash_mlx.cache.snapshot import (
     TargetHiddenChunks,
 )
 from dflash_mlx.engine.config import _effective_draft_window_size
+from dflash_mlx.engine.prefill import snapshot_covers_prefix
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
 def _clone_array(a: Optional[mx.array]) -> Optional[mx.array]:
@@ -107,6 +108,74 @@ def _build_target_hidden_chunks(
         (sink_chunk, tail_chunk),
         ((0, sink), (total_len - window, total_len)),
         total_len,
+    )
+
+def sidecar_eligible(target_cache: list[Any]) -> bool:
+    # RotatingKVCache rings cannot be sliced back to a token boundary.
+    return all(
+        isinstance(entry, (KVCache, RecurrentRollbackCache))
+        and not isinstance(entry, RotatingKVCache)
+        for entry in target_cache
+    )
+
+def capture_gdn_sidecar(
+    target_cache: list[Any],
+) -> tuple[Optional[tuple[Optional[mx.array], ...]], ...]:
+    # Reference grab, no copy: GDN cache entries are replaced on every
+    # update (never mutated in place), so the captured arrays stay frozen
+    # while decode advances the live cache past the boundary.
+    return tuple(
+        tuple(entry.cache) if isinstance(entry, RecurrentRollbackCache) else None
+        for entry in target_cache
+    )
+
+def slice_snapshot_at_sidecar_boundary(
+    snapshot: DFlashPrefixSnapshot,
+) -> DFlashPrefixSnapshot:
+    boundary = int(snapshot.sidecar_boundary)
+    if not 0 < boundary < snapshot.prefix_len:
+        raise ValueError(
+            f"Sidecar boundary {boundary} outside (0, {snapshot.prefix_len})"
+        )
+    if snapshot.sidecar_gdn_states is None or snapshot.sidecar_last_logits is None:
+        raise ValueError("Snapshot has a sidecar boundary but no sidecar states")
+    if not snapshot_covers_prefix(snapshot, boundary):
+        raise ValueError(
+            f"Snapshot feature spans do not cover sidecar boundary {boundary}"
+        )
+    fa: list[Optional[FAState]] = []
+    for layer_idx, state in enumerate(snapshot.fa_states):
+        if state is None:
+            fa.append(None)
+            continue
+        if len(state) != 3:
+            raise ValueError(
+                f"FA state at layer {layer_idx} is not boundary-sliceable"
+            )
+        k, v, _offset = state
+        fa.append((k[:, :, :boundary, :], v[:, :, :boundary, :], boundary))
+    chunks: list[mx.array] = []
+    spans: list[tuple[int, int]] = []
+    for chunk, (start, end) in zip(
+        snapshot.target_hidden_chunks,
+        snapshot.target_hidden_chunk_spans,
+    ):
+        if start >= boundary:
+            continue
+        keep = min(end, boundary) - start
+        chunks.append(chunk[:, :keep, :])
+        spans.append((start, start + keep))
+    return DFlashPrefixSnapshot(
+        token_ids=snapshot.token_ids[:boundary],
+        fa_states=tuple(fa),
+        gdn_states=snapshot.sidecar_gdn_states,
+        target_hidden_chunks=tuple(chunks),
+        target_hidden_chunk_spans=tuple(spans),
+        target_hidden_total_len=boundary,
+        last_logits=snapshot.sidecar_last_logits,
+        key=snapshot.key,
+        kind="prefill",
+        created_at=snapshot.created_at,
     )
 
 def serialize_target_cache(
@@ -247,9 +316,27 @@ def build_snapshot(
     draft_window_size: int = 1024,
     allow_full_attention_context: bool = False,
     adopt_cache_arrays: bool = False,
+    sidecar_boundary: int = 0,
+    sidecar_gdn_states: Optional[
+        tuple[Optional[tuple[Optional[mx.array], ...]], ...]
+    ] = None,
+    sidecar_last_logits: Optional[mx.array] = None,
 ) -> DFlashPrefixSnapshot:
     token_tuple = tuple(int(t) for t in token_ids)
     prefix_len = len(token_tuple)
+    sidecar_boundary = int(sidecar_boundary)
+    if sidecar_boundary > 0:
+        if kind != "generation":
+            raise ValueError("Sidecar boundary is only valid on generation snapshots")
+        if not sidecar_boundary < prefix_len:
+            raise ValueError(
+                f"Sidecar boundary {sidecar_boundary} must be < prefix length {prefix_len}"
+            )
+        if sidecar_gdn_states is None or sidecar_last_logits is None:
+            raise ValueError("Sidecar boundary requires sidecar states and logits")
+    else:
+        sidecar_gdn_states = None
+        sidecar_last_logits = None
     hidden_len = int(target_hidden.shape[1])
     if hidden_len < prefix_len:
         raise ValueError(
@@ -306,6 +393,11 @@ def build_snapshot(
         last_logits=cloned_logits,
         key=key,
         kind=kind,
+        sidecar_boundary=sidecar_boundary,
+        # Sidecar arrays are frozen by construction (GDN entries are
+        # replaced, never mutated), so they are adopted without cloning.
+        sidecar_gdn_states=sidecar_gdn_states,
+        sidecar_last_logits=sidecar_last_logits,
     )
 
 
@@ -326,6 +418,11 @@ class PrefixSnapshotBuilder:
         kind: str,
         allow_full_attention_context: bool = False,
         adopt_cache_arrays: bool = False,
+        sidecar_boundary: int = 0,
+        sidecar_gdn_states: Optional[
+            tuple[Optional[tuple[Optional[mx.array], ...]], ...]
+        ] = None,
+        sidecar_last_logits: Optional[mx.array] = None,
     ) -> DFlashPrefixSnapshot:
         return build_snapshot(
             token_ids=token_ids,
@@ -339,4 +436,7 @@ class PrefixSnapshotBuilder:
             draft_window_size=self.draft_window_size,
             allow_full_attention_context=allow_full_attention_context,
             adopt_cache_arrays=adopt_cache_arrays,
+            sidecar_boundary=sidecar_boundary,
+            sidecar_gdn_states=sidecar_gdn_states,
+            sidecar_last_logits=sidecar_last_logits,
         )

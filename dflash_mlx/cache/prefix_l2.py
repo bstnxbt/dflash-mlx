@@ -147,6 +147,10 @@ def _fingerprint(snapshot: DFlashPrefixSnapshot) -> str:
         "runtime": dflash_mlx.__version__,
         "context_representation": CONTEXT_REPRESENTATION,
     }
+    # Distinguishes sidecar-carrying files from plain twins of the same
+    # (key, kind, tokens) so the insert exists-check cannot shadow them.
+    if int(snapshot.sidecar_boundary) > 0:
+        payload["sidecar_boundary"] = int(snapshot.sidecar_boundary)
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
@@ -238,6 +242,30 @@ def _serialize(snapshot: DFlashPrefixSnapshot) -> tuple[dict[str, mx.array], dic
     if has_last_logits:
         arrays["last_logits"] = snapshot.last_logits
 
+    sidecar_boundary = int(snapshot.sidecar_boundary)
+    sidecar_gdn_present: list[bool] = []
+    sidecar_gdn_arity: list[int] = []
+    sidecar_gdn_array_present: list[list[bool]] = []
+    if sidecar_boundary > 0 and snapshot.sidecar_gdn_states is not None:
+        for i, gdn in enumerate(snapshot.sidecar_gdn_states):
+            if gdn is None:
+                sidecar_gdn_present.append(False)
+                sidecar_gdn_arity.append(0)
+                sidecar_gdn_array_present.append([])
+            else:
+                sidecar_gdn_present.append(True)
+                sidecar_gdn_arity.append(len(gdn))
+                mask = []
+                for j, a in enumerate(gdn):
+                    if a is None:
+                        mask.append(False)
+                    else:
+                        arrays[f"sidecar_gdn_{i}_{j}"] = a
+                        mask.append(True)
+                sidecar_gdn_array_present.append(mask)
+        if snapshot.sidecar_last_logits is not None:
+            arrays["sidecar_last_logits"] = snapshot.sidecar_last_logits
+
     meta = {
         "schema_version": L2_SCHEMA_VERSION,
         "runtime_version": dflash_mlx.__version__,
@@ -255,6 +283,10 @@ def _serialize(snapshot: DFlashPrefixSnapshot) -> tuple[dict[str, mx.array], dic
         "target_hidden_chunk_spans": chunk_spans,
         "target_hidden_total_len": int(snapshot.target_hidden_total_len),
         "has_last_logits": has_last_logits,
+        "sidecar_boundary": sidecar_boundary,
+        "sidecar_gdn_present": sidecar_gdn_present,
+        "sidecar_gdn_arity": sidecar_gdn_arity,
+        "sidecar_gdn_array_present": sidecar_gdn_array_present,
     }
     metadata_dict = {"dflash_meta": json.dumps(meta, separators=(",", ":"))}
     return arrays, metadata_dict
@@ -310,6 +342,30 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
     if meta.get("has_last_logits"):
         last_logits = arrays["last_logits"]
 
+    sidecar_boundary = int(meta.get("sidecar_boundary", 0) or 0)
+    sidecar_gdn_states = None
+    sidecar_last_logits = None
+    if sidecar_boundary > 0:
+        sidecar_present = meta.get("sidecar_gdn_present", [])
+        sidecar_arity = meta.get("sidecar_gdn_arity", [])
+        sidecar_mask = meta.get("sidecar_gdn_array_present", [])
+        states: list[Optional[tuple[Optional[mx.array], ...]]] = []
+        for i, present in enumerate(sidecar_present):
+            if not present:
+                states.append(None)
+            else:
+                arity = int(sidecar_arity[i])
+                mask = sidecar_mask[i]
+                sub: list[Optional[mx.array]] = []
+                for j in range(arity):
+                    if j < len(mask) and mask[j]:
+                        sub.append(arrays[f"sidecar_gdn_{i}_{j}"])
+                    else:
+                        sub.append(None)
+                states.append(tuple(sub))
+        sidecar_gdn_states = tuple(states)
+        sidecar_last_logits = arrays.get("sidecar_last_logits")
+
     _eval_arrays(arrays)
 
     return DFlashPrefixSnapshot(
@@ -325,6 +381,9 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
         key=key,
         kind=str(meta["kind"]),
         created_at=float(meta.get("created_at", time.time())),
+        sidecar_boundary=sidecar_boundary,
+        sidecar_gdn_states=sidecar_gdn_states,
+        sidecar_last_logits=sidecar_last_logits,
     )
 
 @dataclass

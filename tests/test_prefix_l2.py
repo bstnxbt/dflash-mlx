@@ -22,6 +22,7 @@ from dflash_mlx.cache.prefix_l2 import (
     L2_SCHEMA_VERSION,
     DFlashPrefixL2Cache,
     _deserialize,
+    _fingerprint,
     _format_filename,
     _key_hash,
     _runtime_layout_hash,
@@ -1300,3 +1301,36 @@ class TestL2WriteGate:
             manager.shutdown()
         manager.begin_request()
         manager.end_request()
+
+class TestSidecarRoundTrip:
+    def test_serialize_roundtrip_preserves_sidecar(self):
+        from tests.test_prefix_cache import _make_sidecar_generation_snapshot
+
+        snap = _make_sidecar_generation_snapshot(
+            [1, 2, 3, 4, 5, 6, 7, 8], 5, _make_key()
+        )
+        arrays, meta_dict = _serialize(snap)
+        loaded = _deserialize(arrays, json.loads(meta_dict["dflash_meta"]))
+        assert loaded.sidecar_boundary == 5
+        assert loaded.sidecar_last_logits is not None
+        assert mx.array_equal(
+            loaded.sidecar_last_logits, snap.sidecar_last_logits
+        ).item()
+        assert loaded.sidecar_gdn_states[0] is None
+        for got, want in zip(loaded.sidecar_gdn_states[1], snap.sidecar_gdn_states[1]):
+            if want is None:
+                assert got is None
+                continue
+            assert mx.array_equal(got, want).item()
+        from dflash_mlx.cache.codecs import slice_snapshot_at_sidecar_boundary
+
+        sliced = slice_snapshot_at_sidecar_boundary(loaded)
+        assert sliced.token_ids == snap.token_ids[:5]
+
+    def test_fingerprint_distinguishes_sidecar_twin(self):
+        from tests.test_prefix_cache import _make_sidecar_generation_snapshot
+
+        key = _make_key()
+        with_sidecar = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6], 4, key)
+        plain = _make_synthetic_snapshot([1, 2, 3, 4, 5, 6], key, kind="generation")
+        assert _fingerprint(with_sidecar) != _fingerprint(plain)
