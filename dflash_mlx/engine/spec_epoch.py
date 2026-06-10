@@ -786,6 +786,14 @@ class SpeculativeSession:
             # Sparse prefill RoPEs tokens at non-contiguous positions, so a
             # prefix snapshot keyed on a dense token prefix cannot be replayed.
             publish_prefix_snapshots = False
+        if request.max_new_tokens > 0 and request.should_collect_generation_snapshot_hidden(
+            supports_prefix_snapshot
+        ):
+            # The end-of-request generation snapshot subsumes every prefill
+            # prefix (lookup restores partial prefixes from a longer snapshot),
+            # so prefill publishes would only add full-cache clones and
+            # multi-GB L2 writes on every request.
+            publish_prefix_snapshots = False
 
         start_ns = time.perf_counter_ns()
         evt = self.memory_waterfall_event("after_target_cache_create")

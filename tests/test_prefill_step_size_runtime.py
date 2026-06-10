@@ -1312,11 +1312,11 @@ def test_generation_snapshot_published_for_truncated_stable_prefix():
         )
     )
 
-    prefill_snapshot = next(
+    prefill_snapshots = [
         event
         for event in events
         if isinstance(event, SnapshotPublishedEvent) and event.kind == "prefill"
-    )
+    ]
     generation_snapshots = [
         event
         for event in events
@@ -1324,7 +1324,9 @@ def test_generation_snapshot_published_for_truncated_stable_prefix():
     ]
     matched, snapshot = cache.lookup([1, 2, 3, 0, 0, 0, 0, 0, 0, 99], key)
 
-    assert prefill_snapshot.prefix_len == 2
+    # The generation snapshot subsumes every prefill prefix, so no
+    # prefill-kind snapshot is published when generation will run.
+    assert prefill_snapshots == []
     assert len(generation_snapshots) == 1
     assert generation_snapshots[0].kind == "generation"
     assert generation_snapshots[0].prefix_len == 9
