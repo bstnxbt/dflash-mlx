@@ -55,6 +55,33 @@ def greedy_tokens_with_mask(
     return mx.argmax(masked_logits, axis=-1).astype(mx.uint32)
 
 
+def masked_topk_arrays(
+    logits_2d: mx.array,
+    suppress_token_mask: mx.array | None,
+    *,
+    width: int,
+) -> tuple[mx.array, mx.array]:
+    """Per-row top-`width` ids (desc) and masked log-softmax values, as lazy arrays.
+
+    Mirrors greedy_tokens_with_mask masking, so row argmax is always id 0 (up to
+    bf16 ties). No eval here: callers fold both arrays into an existing eval point.
+    """
+    top_width = int(width)
+    if top_width <= 0:
+        raise ValueError("width must be positive")
+    masked = logits_2d
+    if suppress_token_mask is not None:
+        floor = mx.array(-1e9, dtype=logits_2d.dtype)
+        masked = mx.where(suppress_token_mask, floor, logits_2d)
+    top = mx.argpartition(masked, kth=-top_width, axis=-1)[:, -top_width:]
+    top_logits = mx.take_along_axis(masked, top, axis=-1)
+    order = mx.argsort(top_logits, axis=-1)[:, ::-1]
+    top = mx.take_along_axis(top, order, axis=-1)
+    log_probs = masked - mx.logsumexp(masked, axis=-1, keepdims=True)
+    values = mx.take_along_axis(log_probs, top, axis=-1)
+    return top, values
+
+
 def eval_logits_and_captured(
     logits: mx.array,
     captured: list[mx.array] | dict[int, mx.array],

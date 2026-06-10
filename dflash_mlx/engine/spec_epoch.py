@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from collections import deque
@@ -55,6 +56,7 @@ from dflash_mlx.engine.sampling import (
     build_suppress_token_mask,
     eval_logits_and_captured,
     greedy_tokens_with_mask,
+    masked_topk_arrays,
     ns_to_us,
     prepare_prompt_tokens,
 )
@@ -599,6 +601,14 @@ class _AdaptiveBlockPolicy:
             self._enter_reduced()
 
 
+def _capture_rows_int(arr: mx.array) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(int(t) for t in row) for row in arr.tolist())
+
+
+def _capture_rows_float(arr: mx.array) -> tuple[tuple[float, ...], ...]:
+    return tuple(tuple(float(v) for v in row) for row in arr.tolist())
+
+
 @dataclass
 class SpeculativeSession:
     target_model: Any
@@ -622,6 +632,7 @@ class SpeculativeSession:
     target_fa_window: int
     copyspec_index: CopySpecIndex
     copyspec_mode: str
+    capture_logits: bool = False
 
     @classmethod
     def open(
@@ -696,6 +707,7 @@ class SpeculativeSession:
         diagnostics = runtime_context.diagnostics
         profile_cycles = _profile_dflash_cycles_enabled(diagnostics)
         memory_waterfall = _memory_waterfall_enabled(diagnostics)
+        capture_logits = os.environ.get("DFLASH_CAPTURE_LOGITS", "") == "1"
         return cls(
             target_model=target_model,
             draft_model=draft_model,
@@ -703,6 +715,7 @@ class SpeculativeSession:
             target_cache=target_cache,
             draft_cache=draft_cache,
             draft_backend=draft_backend,
+            capture_logits=capture_logits,
             runtime_config=runtime_config,
             quantize_kv_cache=bool(quantize_kv_cache),
             snap_prefix_len=snap_prefix_len,
@@ -1937,6 +1950,9 @@ class SpeculativeSession:
         target_layer_id_list = self.target_layer_id_list
         capture_layer_ids = self.capture_layer_ids
         profile_cycles = self.profile_cycles
+        # Logit capture rides the synchronous profile draft path; outside
+        # profiling there is no per-cycle emission to attach it to.
+        capture_logits = self.capture_logits and profile_cycles
         memory_waterfall = self.memory_waterfall
         target_model = self.target_model
         draft_model = self.draft_model
@@ -2098,6 +2114,10 @@ class SpeculativeSession:
             drafted = None
             draft_source = "none"
             copyspec_tokens = 0
+            draft_topk_ids_arr = None
+            draft_topk_logprobs_arr = None
+            posterior_top2_ids_arr = None
+            posterior_top2_logprobs_arr = None
 
             if block_len > 1:
                 if profile_cycles:
@@ -2110,6 +2130,23 @@ class SpeculativeSession:
                     if drafted is not None:
                         draft_source = "copyspec"
                         copyspec_tokens = int(drafted.shape[0])
+                    elif capture_logits:
+                        drafted, draft_topk_ids_arr, draft_topk_logprobs_arr = (
+                            draft_backend.draft_greedy_capture(
+                                target_model=target_model,
+                                target_ops=target_ops,
+                                draft_model=draft_model,
+                                draft_cache=draft_cache,
+                                staged_first=current_staged_first,
+                                draft_context=feature_store.require_current_hidden(),
+                                block_len=block_len,
+                                mask_token_tail=mask_token_tail,
+                                suppress_token_mask=suppress_token_mask,
+                                async_launch=False,
+                                top_width=8,
+                            )
+                        )
+                        draft_source = "dflash"
                     else:
                         drafted = draft_backend.draft_greedy(
                             target_model=target_model,
@@ -2225,6 +2262,14 @@ class SpeculativeSession:
 
             acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
             posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+            if capture_logits:
+                posterior_top2_ids_arr, posterior_top2_logprobs_arr = (
+                    masked_topk_arrays(
+                        verify_logits[0],
+                        suppress_token_mask,
+                        width=2,
+                    )
+                )
             if not profile_cycles:
                 mx.async_eval(posterior)
             acceptance_len = int(
@@ -2239,7 +2284,15 @@ class SpeculativeSession:
                 target_layer_id_list,
             )[:, : (1 + acceptance_len), :]
             if profile_cycles:
-                mx.eval(committed_hidden, posterior)
+                if posterior_top2_ids_arr is not None:
+                    mx.eval(
+                        committed_hidden,
+                        posterior,
+                        posterior_top2_ids_arr,
+                        posterior_top2_logprobs_arr,
+                    )
+                else:
+                    mx.eval(committed_hidden, posterior)
             else:
                 mx.async_eval(committed_hidden)
             if profile_cycles:
@@ -2457,6 +2510,26 @@ class SpeculativeSession:
                     proposed_ids=tuple(int(t) for t in verify_token_ids.tolist()),
                     posterior_ids=tuple(int(t) for t in posterior.tolist()),
                     committed_ids=tuple(int(t) for t in committed_ids),
+                    draft_topk_ids=(
+                        _capture_rows_int(draft_topk_ids_arr)
+                        if draft_topk_ids_arr is not None
+                        else None
+                    ),
+                    draft_topk_logprobs=(
+                        _capture_rows_float(draft_topk_logprobs_arr)
+                        if draft_topk_logprobs_arr is not None
+                        else None
+                    ),
+                    posterior_top2_ids=(
+                        _capture_rows_int(posterior_top2_ids_arr)
+                        if posterior_top2_ids_arr is not None
+                        else None
+                    ),
+                    posterior_top2_logprobs=(
+                        _capture_rows_float(posterior_top2_logprobs_arr)
+                        if posterior_top2_logprobs_arr is not None
+                        else None
+                    ),
                 )
                 cycle_profiles.append(cycle_profile_entry)
                 _pre_yield = yield_pause.mark()

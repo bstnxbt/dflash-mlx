@@ -1238,17 +1238,39 @@ def test_cycle_event_token_id_capture_fields_round_trip():
         proposed_ids=(11, 22, 33, 44),
         posterior_ids=(11, 22, 99, 77),
         committed_ids=(11, 22, 99),
+        draft_topk_ids=((22, 5), (33, 7)),
+        draft_topk_logprobs=((-0.125, -2.5), (-0.0625, -3.0)),
+        posterior_top2_ids=((11, 2), (22, 4), (99, 6), (77, 8)),
+        posterior_top2_logprobs=(
+            (-0.25, -1.5),
+            (-0.5, -2.0),
+            (-0.75, -2.25),
+            (-1.0, -2.625),
+        ),
     )
     payload = captured.to_payload()
     assert payload["proposed_ids"] == [11, 22, 33, 44]
     assert payload["posterior_ids"] == [11, 22, 99, 77]
     assert payload["committed_ids"] == [11, 22, 99]
+    assert payload["draft_topk_ids"] == [[22, 5], [33, 7]]
+    assert payload["draft_topk_logprobs"] == [[-0.125, -2.5], [-0.0625, -3.0]]
+    assert payload["posterior_top2_ids"] == [[11, 2], [22, 4], [99, 6], [77, 8]]
+    assert payload["posterior_top2_logprobs"] == [
+        [-0.25, -1.5],
+        [-0.5, -2.0],
+        [-0.75, -2.25],
+        [-1.0, -2.625],
+    ]
 
     uncaptured = CycleCompleteEvent(**base)
     payload = uncaptured.to_payload()
     assert "proposed_ids" not in payload
     assert "posterior_ids" not in payload
     assert "committed_ids" not in payload
+    assert "draft_topk_ids" not in payload
+    assert "draft_topk_logprobs" not in payload
+    assert "posterior_top2_ids" not in payload
+    assert "posterior_top2_logprobs" not in payload
 
 
 def test_benchmark_cleanup_failure_is_reported(monkeypatch, capsys):

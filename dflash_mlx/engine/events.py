@@ -111,6 +111,10 @@ class CycleCompleteEvent:
     proposed_ids: tuple[int, ...] | None = None
     posterior_ids: tuple[int, ...] | None = None
     committed_ids: tuple[int, ...] | None = None
+    draft_topk_ids: tuple[tuple[int, ...], ...] | None = None
+    draft_topk_logprobs: tuple[tuple[float, ...], ...] | None = None
+    posterior_top2_ids: tuple[tuple[int, ...], ...] | None = None
+    posterior_top2_logprobs: tuple[tuple[float, ...], ...] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         cycle_wall_us = (
@@ -149,6 +153,23 @@ class CycleCompleteEvent:
             payload["posterior_ids"] = [int(t) for t in self.posterior_ids]
         if self.committed_ids is not None:
             payload["committed_ids"] = [int(t) for t in self.committed_ids]
+        if self.draft_topk_ids is not None:
+            payload["draft_topk_ids"] = [
+                [int(t) for t in row] for row in self.draft_topk_ids
+            ]
+        if self.draft_topk_logprobs is not None:
+            payload["draft_topk_logprobs"] = [
+                [round(float(v), 6) for v in row] for row in self.draft_topk_logprobs
+            ]
+        if self.posterior_top2_ids is not None:
+            payload["posterior_top2_ids"] = [
+                [int(t) for t in row] for row in self.posterior_top2_ids
+            ]
+        if self.posterior_top2_logprobs is not None:
+            payload["posterior_top2_logprobs"] = [
+                [round(float(v), 6) for v in row]
+                for row in self.posterior_top2_logprobs
+            ]
         return payload
 
 

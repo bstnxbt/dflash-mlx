@@ -8,7 +8,7 @@ from typing import Any, Optional, Protocol
 
 import mlx.core as mx
 
-from dflash_mlx.engine.sampling import greedy_tokens_with_mask
+from dflash_mlx.engine.sampling import greedy_tokens_with_mask, masked_topk_arrays
 from dflash_mlx.model import (
     ContextOnlyDraftKVCache,
     DFlashDraftModel,
@@ -56,6 +56,23 @@ class DraftBackend(Protocol):
         suppress_token_mask: Optional[mx.array],
         top_width: int,
     ) -> tuple[mx.array, list[list[int]], list[list[float]]]:
+        ...
+
+    def draft_greedy_capture(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        staged_first: mx.array,
+        draft_context: mx.array,
+        block_len: int,
+        mask_token_tail: mx.array,
+        suppress_token_mask: Optional[mx.array],
+        async_launch: bool,
+        top_width: int,
+    ) -> tuple[mx.array, mx.array, mx.array]:
         ...
 
     def draft_branch_blocks_batch(
@@ -106,7 +123,7 @@ class EagerDraftBackend:
                 )
         return caches
 
-    def draft_greedy(
+    def _draft_block_logits(
         self,
         *,
         target_model: Any,
@@ -117,8 +134,6 @@ class EagerDraftBackend:
         draft_context: mx.array,
         block_len: int,
         mask_token_tail: mx.array,
-        suppress_token_mask: Optional[mx.array],
-        async_launch: bool,
     ) -> mx.array:
         if int(block_len) <= 1:
             raise ValueError("draft_greedy requires block_len > 1")
@@ -139,9 +154,34 @@ class EagerDraftBackend:
             draft_context=draft_context,
             cache=draft_cache,
         )
-        draft_logits = target_ops.logits_from_hidden(
+        return target_ops.logits_from_hidden(
             target_model,
             draft_hidden[:, 1:, :],
+        )
+
+    def draft_greedy(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        staged_first: mx.array,
+        draft_context: mx.array,
+        block_len: int,
+        mask_token_tail: mx.array,
+        suppress_token_mask: Optional[mx.array],
+        async_launch: bool,
+    ) -> mx.array:
+        draft_logits = self._draft_block_logits(
+            target_model=target_model,
+            target_ops=target_ops,
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            staged_first=staged_first,
+            draft_context=draft_context,
+            block_len=block_len,
+            mask_token_tail=mask_token_tail,
         )
         drafted = greedy_tokens_with_mask(
             draft_logits,
@@ -152,6 +192,46 @@ class EagerDraftBackend:
         else:
             mx.eval(draft_logits)
         return drafted
+
+    def draft_greedy_capture(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        staged_first: mx.array,
+        draft_context: mx.array,
+        block_len: int,
+        mask_token_tail: mx.array,
+        suppress_token_mask: Optional[mx.array],
+        async_launch: bool,
+        top_width: int,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        draft_logits = self._draft_block_logits(
+            target_model=target_model,
+            target_ops=target_ops,
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            staged_first=staged_first,
+            draft_context=draft_context,
+            block_len=block_len,
+            mask_token_tail=mask_token_tail,
+        )
+        drafted = greedy_tokens_with_mask(
+            draft_logits,
+            suppress_token_mask,
+        ).squeeze(0)
+        top_ids, top_logprobs = masked_topk_arrays(
+            draft_logits.squeeze(0),
+            suppress_token_mask,
+            width=top_width,
+        )
+        if async_launch:
+            mx.async_eval(drafted, top_ids, top_logprobs)
+        else:
+            mx.eval(draft_logits, top_ids, top_logprobs)
+        return drafted, top_ids, top_logprobs
 
     def draft_with_topk(
         self,
