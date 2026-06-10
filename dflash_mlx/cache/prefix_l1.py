@@ -531,5 +531,11 @@ class DFlashPrefixCache:
             self._entries.clear()
             self._lru_order.clear()
 
+    def resident_snapshots(self) -> tuple[DFlashPrefixSnapshot, ...]:
+        with self._lock:
+            return tuple(
+                self._entries[eid] for eid in self._lru_order if eid in self._entries
+            )
+
     def shutdown(self) -> None:
         return None

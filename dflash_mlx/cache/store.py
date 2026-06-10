@@ -255,6 +255,12 @@ class PrefixSnapshotStore:
             self._l2.end_request()
 
     def shutdown(self) -> None:
+        if self._l2 is not None:
+            # Spill resident L1 entries so the next session warm-starts from
+            # L2; consume-on-serve means generation snapshots never reach L2
+            # during the session. Already-written files are skipped by the
+            # L2 exists-check.
+            self._write_snapshots_to_l2(self._l1.resident_snapshots())
         self._l1.shutdown()
         if self._l2 is not None:
             self._l2.shutdown(wait=True)

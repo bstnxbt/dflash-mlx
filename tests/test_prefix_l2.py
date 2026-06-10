@@ -404,6 +404,48 @@ class TestL2Lifecycle:
         finally:
             l2.shutdown()
 
+    def test_store_shutdown_spills_resident_l1_to_l2(self, tmp_path):
+        # Consume-on-serve keeps generation snapshots out of L2 during the
+        # session; the shutdown spill is the only bridge to the next session.
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        key = _make_key()
+        snap = _make_synthetic_snapshot([7, 8, 9, 10], key, kind="generation")
+        snap.last_logits = None
+        cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+        cache.insert(snap)
+        assert _all_snapshot_files(tmp_path) == []
+
+        cache.shutdown()
+
+        assert len(_all_snapshot_files(tmp_path)) == 1
+        l2_reopened = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            fresh = _store(max_entries=4, max_bytes=10**9, l2=l2_reopened)
+            matched, hydrated = fresh.lookup([7, 8, 9, 10, 11], key)
+            assert matched == 4
+            assert hydrated is not None
+            assert fresh.stats()["l2_hits"] == 1
+            assert fresh.stats()["current_entries"] == 0
+        finally:
+            l2_reopened.shutdown()
+
+    def test_store_shutdown_spill_skips_already_written_file(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        key = _make_key()
+        snap = _make_synthetic_snapshot([7, 8, 9, 10], key, kind="generation")
+        snap.last_logits = None
+        cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+        cache.insert(snap)
+        _insert_l2_sync(l2, snap)
+        assert len(_all_snapshot_files(tmp_path)) == 1
+
+        cache.shutdown()
+
+        # "writes" counts admitted inserts including dedup-skips; the spill
+        # must not produce a second physical file.
+        assert len(_all_snapshot_files(tmp_path)) == 1
+        assert l2.stats()["writes"] == 2
+
     def test_l2_prefix_hit_promotes_to_l1(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
