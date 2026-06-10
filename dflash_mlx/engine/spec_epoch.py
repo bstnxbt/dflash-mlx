@@ -789,10 +789,12 @@ class SpeculativeSession:
         if request.max_new_tokens > 0 and request.should_collect_generation_snapshot_hidden(
             supports_prefix_snapshot
         ):
-            # The end-of-request generation snapshot subsumes every prefill
-            # prefix (lookup restores partial prefixes from a longer snapshot),
-            # so prefill publishes would only add full-cache clones and
-            # multi-GB L2 writes on every request.
+            # Hits only ever match a FULL snapshot as a prefix of the request
+            # (GDN recurrent state cannot be rewound, so lookup never cuts
+            # into a snapshot). Skipping prefill publishes therefore loses
+            # next-turn hits that diverge inside the previous generation, but
+            # the measured trade still wins: each prefill publish costs
+            # full-cache clones plus multi-GB L2 writes on every request.
             publish_prefix_snapshots = False
 
         start_ns = time.perf_counter_ns()
