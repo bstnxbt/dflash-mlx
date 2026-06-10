@@ -1432,6 +1432,27 @@ class TestCoverageFilterL2:
         finally:
             l2.shutdown()
 
+    def test_store_l2_miss_fallback_keeps_coverage_filter(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            tokens = list(range(100))
+            l1 = DFlashPrefixCache(max_entries=4, max_bytes=10**9)
+            l1.insert(_make_trimmed_snapshot(tokens, key))
+            store = PrefixSnapshotStore(l1=l1, l2=l2)
+
+            matched, snap = store.lookup(
+                tokens + [999], key, require_full_coverage=True
+            )
+            assert matched == 0
+            assert snap is None
+
+            matched, snap = store.lookup(tokens + [999], key)
+            assert matched == 100
+            assert snap is not None
+        finally:
+            l2.shutdown()
+
 
 class TestEvictionLruOnHit:
     def test_hit_refreshes_mtime_so_eviction_spares_served_file(self, tmp_path):

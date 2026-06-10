@@ -111,7 +111,12 @@ class PrefixSnapshotStore:
         if l2_snapshot is None:
             with self._lock:
                 self._stats["l2_misses"] += 1
-            return self._l1_lookup(req_tuple, key, request_id=request_id)
+            return self._l1_lookup(
+                req_tuple,
+                key,
+                request_id=request_id,
+                require_full_coverage=require_full_coverage,
+            )
 
         return self._record_l2_hit(
             l2_snapshot,
