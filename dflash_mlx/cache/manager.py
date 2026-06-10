@@ -408,7 +408,8 @@ def _format_stats_line(store: PrefixSnapshotStore, label: str = "") -> None:
         f"misses={stats['misses']} "
         f"insertions={stats['insertions']} "
         f"evictions={stats['evictions']} "
-        f"prefill_tokens_saved={stats['prefill_tokens_saved']}"
+        f"prefill_tokens_saved={stats['prefill_tokens_saved']} "
+        f"sidecar_hits={stats.get('sidecar_hits', 0)}"
     )
     l2 = stats.get("l2")
     if l2:
