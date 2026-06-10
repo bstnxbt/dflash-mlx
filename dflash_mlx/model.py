@@ -146,11 +146,30 @@ class ContextOnlyDraftKVCache:
 
 
 class FullContextDraftKVCache(ContextOnlyDraftKVCache):
+    # Contiguous step-grown buffer with in-place slice writes. A per-cycle
+    # mx.concatenate over the whole context (the previous segmented layout)
+    # rematerializes a monotonically-growing buffer every cycle, which the MLX
+    # buffer cache can never reuse — Metal heap churn degraded every forward
+    # pass progressively (×5 wall at ~7000 cycles).
+    step = 256
+
     def __init__(self):
         super().__init__(sink_size=0, window_size=0)
-        self._key_segments: list[mx.array] = []
-        self._value_segments: list[mx.array] = []
-        self._position_segments: list[mx.array] = []
+        self._length = 0
+
+    def _grow(self, template_keys: mx.array, template_values: mx.array, needed: int) -> None:
+        capacity = ((int(needed) + self.step - 1) // self.step) * self.step
+        batch = int(template_keys.shape[0])
+        heads = int(template_keys.shape[1])
+        key_dim = int(template_keys.shape[3])
+        value_dim = int(template_values.shape[3])
+        new_keys = mx.zeros((batch, heads, capacity, key_dim), dtype=template_keys.dtype)
+        new_values = mx.zeros((batch, heads, capacity, value_dim), dtype=template_values.dtype)
+        if self.keys is not None and self._length > 0:
+            new_keys[:, :, : self._length, :] = self.keys[:, :, : self._length, :]
+            new_values[:, :, : self._length, :] = self.values[:, :, : self._length, :]
+        self.keys = new_keys
+        self.values = new_values
 
     def append_context(
         self,
@@ -164,25 +183,21 @@ class FullContextDraftKVCache(ContextOnlyDraftKVCache):
         if context_keys is None or context_values is None or int(num_positions) <= 0:
             return
         append_len = int(context_keys.shape[2])
+        advance = int(advance_positions if advance_positions is not None else num_positions)
         if append_len <= 0:
-            self.offset += int(advance_positions if advance_positions is not None else num_positions)
+            self.offset += advance
             return
-        if positions is None:
-            new_positions = mx.arange(
-                self.offset,
-                self.offset + append_len,
-                dtype=mx.int32,
+        if positions is not None and int(positions.shape[0]) != append_len:
+            raise ValueError(
+                f"positions length {positions.shape[0]} does not match cache append length {append_len}"
             )
-        else:
-            if int(positions.shape[0]) != append_len:
-                raise ValueError(
-                    f"positions length {positions.shape[0]} does not match cache append length {append_len}"
-                )
-            new_positions = positions
-        self._key_segments.append(context_keys)
-        self._value_segments.append(context_values)
-        self._position_segments.append(new_positions)
-        self.offset += int(advance_positions if advance_positions is not None else num_positions)
+        needed = self._length + append_len
+        if self.keys is None or needed > int(self.keys.shape[2]):
+            self._grow(context_keys, context_values, needed)
+        self.keys[:, :, self._length : needed, :] = context_keys
+        self.values[:, :, self._length : needed, :] = context_values
+        self._length = needed
+        self.offset += advance
 
     def context_spans_to_append(self, num_positions: int) -> list[tuple[int, int]]:
         num_positions = int(num_positions)
@@ -191,31 +206,44 @@ class FullContextDraftKVCache(ContextOnlyDraftKVCache):
         return [(0, num_positions)]
 
     def fetch(self) -> tuple[Optional[mx.array], Optional[mx.array]]:
-        if not self._key_segments:
+        if self.keys is None or self._length <= 0:
             return None, None
-        if len(self._key_segments) == 1:
-            return self._key_segments[0], self._value_segments[0]
         return (
-            mx.concatenate(self._key_segments, axis=2),
-            mx.concatenate(self._value_segments, axis=2),
+            self.keys[:, :, : self._length, :],
+            self.values[:, :, : self._length, :],
         )
 
-    def segments(self) -> tuple[tuple[mx.array, ...], tuple[mx.array, ...], tuple[mx.array, ...]]:
+    def fetch_with_block(
+        self,
+        block_keys: mx.array,
+        block_values: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        # Stages the speculative block in the step headroom past _length and
+        # returns [context | block] views without materializing a copy; the
+        # next append_context overwrites the staged rows, so logical cache
+        # state is untouched.
+        block_len = int(block_keys.shape[2])
+        if self.keys is None or self._length <= 0:
+            return block_keys, block_values
+        needed = self._length + block_len
+        if needed > int(self.keys.shape[2]):
+            self._grow(block_keys, block_values, needed)
+        self.keys[:, :, self._length : needed, :] = block_keys
+        self.values[:, :, self._length : needed, :] = block_values
         return (
-            tuple(self._key_segments),
-            tuple(self._value_segments),
-            tuple(self._position_segments),
+            self.keys[:, :, :needed, :],
+            self.values[:, :, :needed, :],
         )
 
     def position_indices(self) -> Optional[mx.array]:
-        if not self._position_segments:
+        # Full-context appends are always contiguous, so positions are always
+        # arange(0, length); synthesized lazily instead of stored.
+        if self._length <= 0:
             return None
-        if len(self._position_segments) == 1:
-            return self._position_segments[0]
-        return mx.concatenate(self._position_segments, axis=0)
+        return mx.arange(self._length, dtype=mx.int32)
 
     def cache_length(self) -> int:
-        return sum(int(segment.shape[2]) for segment in self._key_segments)
+        return self._length
 
 
 @dataclass
@@ -510,19 +538,7 @@ class DFlashAttention(nn.Module):
                     positions=context_positions,
                     advance_positions=ctx_len,
                 )
-                key_segments, value_segments, position_segments = cache.segments()
-                key_parts = [*key_segments, noise_keys]
-                value_parts = [*value_segments, noise_values]
-                keys = (
-                    key_parts[0]
-                    if len(key_parts) == 1
-                    else mx.concatenate(key_parts, axis=-2)
-                )
-                values = (
-                    value_parts[0]
-                    if len(value_parts) == 1
-                    else mx.concatenate(value_parts, axis=-2)
-                )
+                keys, values = cache.fetch_with_block(noise_keys, noise_values)
                 mask = None
                 if self.sliding_window is not None:
                     noise_positions = mx.arange(
@@ -530,11 +546,11 @@ class DFlashAttention(nn.Module):
                         query_offset + block_len,
                         dtype=mx.int32,
                     )
-                    position_parts = [*position_segments, noise_positions]
+                    cached_positions = cache.position_indices()
                     key_positions = (
-                        position_parts[0]
-                        if len(position_parts) == 1
-                        else mx.concatenate(position_parts, axis=0)
+                        noise_positions
+                        if cached_positions is None
+                        else mx.concatenate([cached_positions, noise_positions], axis=0)
                     )
                     mask = self._attention_mask(
                         block_len=block_len,
