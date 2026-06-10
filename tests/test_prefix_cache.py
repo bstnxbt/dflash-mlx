@@ -403,6 +403,44 @@ class TestSerializeHydrate:
         assert mx.all(src_k == h_k).item()
         assert mx.all(src_v == h_v).item()
 
+    def test_adopted_serialize_shares_arrays_and_hydrates_identically(self):
+        src = [_make_kv_cache_populated(n_tokens=5), _make_gdn_cache_populated()]
+        fa, gdn = serialize_target_cache(src, clone=False)
+
+        # Recurrent states are adopted by reference, not copied.
+        assert gdn[1] is not None
+        for adopted, live in zip(gdn[1], src[1].cache):
+            assert adopted is live
+
+        template = [KVCache(), RecurrentRollbackCache(size=3, conv_kernel_size=4)]
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2, 3, 4, 5),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 5, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        hydrated = hydrate_target_cache(snapshot, template)
+        src_k, src_v = src[0].state
+        h_k, h_v = hydrated[0].state
+        assert mx.all(src_k == h_k).item()
+        assert mx.all(src_v == h_v).item()
+
+    def test_build_snapshot_adopts_logits_without_clone(self):
+        logits = mx.arange(10, dtype=mx.float32).reshape(1, 10)
+        mx.eval(logits)
+        snapshot = build_snapshot(
+            token_ids=[1, 2, 3],
+            target_cache=[_make_kv_cache_populated(n_tokens=3)],
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=logits,
+            key=_make_key(),
+            kind="generation",
+            adopt_cache_arrays=True,
+        )
+        assert snapshot.last_logits is logits
+
     def test_rotating_kv_round_trip_uses_temporal_order(self):
         src = [_make_rotating_cache_populated(n_tokens=7, max_size=4, keep=1)]
         fa, gdn = serialize_target_cache(src)

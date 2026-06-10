@@ -96,6 +96,7 @@ class SnapshotService:
         from_snapshot: bool = False,
         snap_prefix_len: int = 0,
         l2_only: bool = False,
+        adopt_cache_arrays: bool = False,
     ) -> SnapshotPublication | None:
         if target_hidden is None:
             return None
@@ -109,6 +110,7 @@ class SnapshotService:
             last_logits=last_logits,
             kind=kind,
             allow_full_attention_context=allow_full_attention_context,
+            adopt_cache_arrays=adopt_cache_arrays,
         )
         cache_manager = self._cache_manager
         if cache_manager is None:

@@ -1131,6 +1131,9 @@ class SpeculativeSession:
             require_logits=False,
             snapshot_boundary=end_total_len,
             allow_full_context_draft_layers=self.allow_full_context_draft_layers,
+            # End of request: the session never touches target_cache again,
+            # so the snapshot adopts the live arrays instead of cloning ~GBs.
+            adopt_cache_arrays=True,
         )
         yield_pause.done(_snapshot_build)
         if snapshot_event is not None:
@@ -2654,6 +2657,7 @@ def _publish_snapshot_event(
     from_snapshot: bool = False,
     snap_prefix_len: int = 0,
     l2_only: bool = False,
+    adopt_cache_arrays: bool = False,
 ) -> Optional[SnapshotPublishedEvent]:
     if snapshot_service is None or target_hidden is None:
         return None
@@ -2669,6 +2673,7 @@ def _publish_snapshot_event(
         from_snapshot=from_snapshot,
         snap_prefix_len=snap_prefix_len,
         l2_only=l2_only,
+        adopt_cache_arrays=adopt_cache_arrays,
     )
     if publication is None:
         return None

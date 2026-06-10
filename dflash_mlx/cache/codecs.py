@@ -79,10 +79,12 @@ def _build_target_hidden_chunks(
     draft_sink_size: int = 64,
     draft_window_size: int = 1024,
     allow_full_attention_context: bool = False,
+    clone: bool = True,
 ) -> tuple[tuple[mx.array, ...], tuple[tuple[int, int], ...], int]:
+    grab = _clone_array if clone else (lambda a: a)
     total_len = int(target_hidden.shape[1])
     if not trim_target_hidden:
-        full = _clone_array(_target_hidden_slice(target_hidden, 0, total_len))
+        full = grab(_target_hidden_slice(target_hidden, 0, total_len))
         assert full is not None
         return (full,), ((0, total_len),), total_len
     sink, window = _resolve_effective_trim_window(
@@ -93,11 +95,11 @@ def _build_target_hidden_chunks(
         allow_full_attention_context=allow_full_attention_context,
     )
     if total_len <= sink + window or sink + window == 0:
-        full = _clone_array(_target_hidden_slice(target_hidden, 0, total_len))
+        full = grab(_target_hidden_slice(target_hidden, 0, total_len))
         assert full is not None
         return (full,), ((0, total_len),), total_len
-    sink_chunk = _clone_array(_target_hidden_slice(target_hidden, 0, sink))
-    tail_chunk = _clone_array(
+    sink_chunk = grab(_target_hidden_slice(target_hidden, 0, sink))
+    tail_chunk = grab(
         _target_hidden_slice(target_hidden, total_len - window, total_len)
     )
     assert sink_chunk is not None and tail_chunk is not None
@@ -109,16 +111,21 @@ def _build_target_hidden_chunks(
 
 def serialize_target_cache(
     target_cache: list[Any],
+    *,
+    clone: bool = True,
 ) -> tuple[
     tuple[Optional[FAState], ...],
     tuple[Optional[tuple[Optional[mx.array], ...]], ...],
 ]:
+    # clone=False adopts the live arrays without copying; callers must
+    # guarantee the cache is never mutated afterwards (end-of-request only).
+    grab = _clone_array if clone else (lambda a: a)
     fa: list[Optional[FAState]] = []
     gdn: list[Optional[tuple[Optional[mx.array], ...]]] = []
     for layer_idx, entry in enumerate(target_cache):
         if isinstance(entry, RecurrentRollbackCache):
             fa.append(None)
-            gdn.append(tuple(_clone_array(a) for a in entry.cache))
+            gdn.append(tuple(grab(a) for a in entry.cache))
         elif isinstance(entry, RotatingKVCache):
             keys = getattr(entry, "keys", None)
             values = getattr(entry, "values", None)
@@ -128,8 +135,8 @@ def serialize_target_cache(
             else:
                 fa.append(
                     (
-                        _clone_array(keys),
-                        _clone_array(values),
+                        grab(keys),
+                        grab(values),
                         int(entry.offset),
                         int(entry._idx),
                     )
@@ -142,7 +149,7 @@ def serialize_target_cache(
                 gdn.append(None)
             else:
                 k, v = state
-                fa.append((_clone_array(k), _clone_array(v), int(entry.offset)))
+                fa.append((grab(k), grab(v), int(entry.offset)))
                 gdn.append(None)
         else:
             raise TypeError(
@@ -239,6 +246,7 @@ def build_snapshot(
     draft_sink_size: int = 64,
     draft_window_size: int = 1024,
     allow_full_attention_context: bool = False,
+    adopt_cache_arrays: bool = False,
 ) -> DFlashPrefixSnapshot:
     token_tuple = tuple(int(t) for t in token_ids)
     prefix_len = len(token_tuple)
@@ -269,7 +277,10 @@ def build_snapshot(
         else:
             target_hidden = target_hidden[:, :prefix_len, :]
 
-    fa, gdn = serialize_target_cache(target_cache)
+    fa, gdn = serialize_target_cache(
+        target_cache,
+        clone=not adopt_cache_arrays,
+    )
     _validate_snapshot_cache_prefix_len(fa, prefix_len=prefix_len)
     chunks, spans, total_len = _build_target_hidden_chunks(
         target_hidden,
@@ -278,8 +289,13 @@ def build_snapshot(
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
         allow_full_attention_context=allow_full_attention_context,
+        clone=not adopt_cache_arrays,
     )
-    cloned_logits = _clone_array(last_logits) if last_logits is not None else None
+    cloned_logits = (
+        last_logits
+        if adopt_cache_arrays
+        else (_clone_array(last_logits) if last_logits is not None else None)
+    )
     return DFlashPrefixSnapshot(
         token_ids=token_tuple,
         fa_states=fa,
@@ -309,6 +325,7 @@ class PrefixSnapshotBuilder:
         last_logits: Optional[mx.array],
         kind: str,
         allow_full_attention_context: bool = False,
+        adopt_cache_arrays: bool = False,
     ) -> DFlashPrefixSnapshot:
         return build_snapshot(
             token_ids=token_ids,
@@ -321,4 +338,5 @@ class PrefixSnapshotBuilder:
             draft_sink_size=self.draft_sink_size,
             draft_window_size=self.draft_window_size,
             allow_full_attention_context=allow_full_attention_context,
+            adopt_cache_arrays=adopt_cache_arrays,
         )
