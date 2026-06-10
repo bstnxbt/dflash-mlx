@@ -568,6 +568,12 @@ class DFlashPrefixL2Cache:
                 self._stats["hits"] += 1
                 self._stats["bytes_out"] += snap.nbytes
                 self._stats["load_total_us"] += int(elapsed_us)
+            # _evict_to_budget orders victims by mtime; touch served files so
+            # budget pressure evicts least-recently-used, not oldest-written.
+            try:
+                os.utime(path)
+            except OSError:
+                pass
             return snap
 
         with self._lock:

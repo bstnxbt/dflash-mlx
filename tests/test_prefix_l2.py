@@ -1431,3 +1431,60 @@ class TestCoverageFilterL2:
             assert store.stats()["l2_hits"] == 1
         finally:
             l2.shutdown()
+
+
+class TestEvictionLruOnHit:
+    def test_hit_refreshes_mtime_so_eviction_spares_served_file(self, tmp_path):
+        import os
+
+        key = _make_key()
+        served = _make_synthetic_snapshot([1, 2, 3], key)
+        idle = _make_synthetic_snapshot([7, 8, 9, 10], key)
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9, max_in_flight=2)
+        try:
+            _insert_l2_sync(l2, served)
+            _insert_l2_sync(l2, idle)
+            served_path = l2._final_path_for(served)
+            idle_path = l2._final_path_for(idle)
+            assert served_path.exists() and idle_path.exists()
+
+            # Backdate both files: `served` written first, `idle` second.
+            os.utime(served_path, ns=(10**9, 10**9))
+            os.utime(idle_path, ns=(2 * 10**9, 2 * 10**9))
+
+            hit = l2.lookup((1, 2, 3), key)
+            assert hit is not None
+            assert served_path.stat().st_mtime_ns > idle_path.stat().st_mtime_ns
+
+            served_size = served_path.stat().st_size
+            idle_size = idle_path.stat().st_size
+            l2._max_bytes = served_size
+            with l2._lock:
+                l2._tracked_disk_bytes = served_size + idle_size
+            l2._evict_to_budget()
+
+            assert served_path.exists()
+            assert not idle_path.exists()
+            assert l2.stats()["evictions"] == 1
+        finally:
+            l2.shutdown()
+
+    def test_lookup_reject_does_not_refresh_mtime(self, tmp_path):
+        import os
+
+        key = _make_key()
+        trimmed = _make_trimmed_snapshot(list(range(100)), key)
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            _insert_l2_sync(l2, trimmed)
+            path = l2._final_path_for(trimmed)
+            os.utime(path, ns=(10**9, 10**9))
+
+            miss = l2.lookup(
+                tuple(range(100)), key, require_full_coverage=True
+            )
+            assert miss is None
+            assert l2.stats()["coverage_rejects"] == 1
+            assert path.stat().st_mtime_ns == 10**9
+        finally:
+            l2.shutdown()
