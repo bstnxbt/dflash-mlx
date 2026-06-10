@@ -368,6 +368,36 @@ class TestL2Lifecycle:
         finally:
             l2.shutdown()
 
+    def test_l2_generation_prefix_hit_promotes_past_l1_token_cap(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            snap = _make_synthetic_snapshot([7, 8, 9, 10], key, kind="generation")
+            snap.last_logits = None
+            _insert_l2_sync(l2, snap)
+            cache = PrefixSnapshotStore(
+                l1=DFlashPrefixCache(
+                    max_entries=4,
+                    max_bytes=10**9,
+                    max_snapshot_tokens=3,
+                ),
+                l2=l2,
+            )
+
+            matched, hydrated = cache.lookup([7, 8, 9, 10, 11], key)
+
+            assert matched == 4
+            assert hydrated is not None
+            stats = cache.stats()
+            assert stats["l2_hits"] == 1
+            assert stats["current_entries"] == 1
+            assert stats["skipped_too_long"] == 0
+
+            cache.lookup([7, 8, 9, 10, 12], key)
+            assert cache.stats()["l2_hits"] == 1
+        finally:
+            l2.shutdown()
+
     def test_l2_prefix_hit_promotes_to_l1(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:

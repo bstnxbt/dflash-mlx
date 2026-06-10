@@ -1398,6 +1398,29 @@ class TestSkipLongSnapshot:
         assert stats["skipped_too_long"] == 0
         assert stats["insertions"] == 1
 
+    def test_generation_snapshot_can_exceed_token_cap(self):
+        cache = DFlashPrefixCache(
+            max_entries=8,
+            max_bytes=8 * 1024 * 1024 * 1024,
+            max_snapshot_tokens=5,
+        )
+        key = _make_key()
+        generation = _make_synthetic_snapshot(
+            [1, 2, 3, 4, 5, 6],
+            key,
+            kind="generation",
+        )
+
+        cache.insert(generation)
+
+        stats = cache.stats()
+        assert stats["current_entries"] == 1
+        assert stats["skipped_too_long"] == 0
+        assert stats["insertions"] == 1
+        prefix_len, prefix = cache.lookup([1, 2, 3, 4, 5, 6, 7], key)
+        assert prefix_len == 6
+        assert prefix is generation
+
     def test_disabled_with_zero(self):
         cache = DFlashPrefixCache(
             max_entries=8,

@@ -199,7 +199,13 @@ class DFlashPrefixCache:
             pre_cross_prunes = self._stats["cross_kind_prunes"]
 
             max_tokens = self._max_snapshot_tokens
-            if skip_too_long and max_tokens > 0 and len(snapshot.token_ids) > max_tokens:
+            token_cap_applies = snapshot.kind != "generation"
+            if (
+                skip_too_long
+                and token_cap_applies
+                and max_tokens > 0
+                and len(snapshot.token_ids) > max_tokens
+            ):
                 self._stats["skipped_too_long"] += 1
                 self._log_cache(
                     op="insert_skipped",
