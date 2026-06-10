@@ -24,6 +24,7 @@ from dflash_mlx.engine.events import (
     SummaryEvent,
     TokenEvent,
 )
+from dflash_mlx.cache.manager import current_runtime_cache_manager
 from dflash_mlx.observability.memory import process_memory_snapshot
 from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 from dflash_mlx.server.metrics import record_cycle_diagnostic, update_live_request
@@ -117,6 +118,11 @@ def consume_dflash_events(
                 fields=memory_start,
             )
 
+    # Pause L2 disk writes while this request is served so multi-GB
+    # snapshot IO never competes with prefill/decode (single-user server).
+    cache_manager = current_runtime_cache_manager()
+    if cache_manager is not None:
+        cache_manager.begin_request()
     try:
         for event in event_iter:
             if isinstance(event, CycleCompleteEvent):
@@ -317,6 +323,8 @@ def consume_dflash_events(
         close = getattr(event_iter, "close", None)
         if close is not None:
             close()
+        if cache_manager is not None:
+            cache_manager.end_request()
         if memory_boundary_enabled:
             memory_event = (
                 collect_memory_waterfall(

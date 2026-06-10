@@ -1246,3 +1246,57 @@ class TestAsyncWriterSafety:
             assert len(_all_snapshot_files(tmp_path)) == 1
         finally:
             l2.shutdown()
+
+class TestL2WriteGate:
+    def test_begin_request_holds_writes_until_last_end_request(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            l2.begin_request()
+            l2.begin_request()
+            assert l2.insert_async(_make_synthetic_snapshot([1, 2, 3], _make_key())) is True
+            time.sleep(0.8)
+            assert l2.stats()["writes"] == 0
+            assert _all_snapshot_files(tmp_path) == []
+            l2.end_request()
+            time.sleep(0.8)
+            assert l2.stats()["writes"] == 0, (
+                "gate must stay closed while another request is active"
+            )
+            l2.end_request()
+            _wait_writes(l2, expected=1)
+            assert len(_all_snapshot_files(tmp_path)) == 1
+        finally:
+            l2.shutdown()
+
+    def test_shutdown_flushes_pending_writes_while_gated(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            l2.begin_request()
+            assert l2.insert_async(_make_synthetic_snapshot([1, 2, 3], _make_key())) is True
+            l2.shutdown()
+            assert l2.stats()["writes"] == 1
+            assert len(_all_snapshot_files(tmp_path)) == 1
+        finally:
+            l2.shutdown()
+
+    def test_request_brackets_forward_and_tolerate_retirement(self, tmp_path):
+        from dflash_mlx.cache.manager import RuntimeCacheManager
+
+        no_l2 = PrefixSnapshotStore(
+            l1=DFlashPrefixCache(max_entries=2, max_bytes=10**9),
+            l2=None,
+        )
+        no_l2.begin_request()
+        no_l2.end_request()
+
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        manager = RuntimeCacheManager(_store(l2=l2))
+        try:
+            manager.begin_request()
+            assert not l2._write_gate.is_set()
+            manager.end_request()
+            assert l2._write_gate.is_set()
+        finally:
+            manager.shutdown()
+        manager.begin_request()
+        manager.end_request()

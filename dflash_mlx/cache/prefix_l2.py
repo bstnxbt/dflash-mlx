@@ -381,6 +381,12 @@ class DFlashPrefixL2Cache:
             "lookup_hash_filtered": 0,
         }
         self._stop = threading.Event()
+        # Set = writes allowed. Cleared while a request is being served so
+        # multi-GB serialization/IO never competes with prefill/decode.
+        self._write_gate = threading.Event()
+        self._write_gate.set()
+        self._gate_lock = threading.Lock()
+        self._active_requests = 0
         self._lock_fp = self._try_acquire_dir_lock()
 
         self._tracked_disk_bytes = self._snapshot_disk_bytes()
@@ -535,7 +541,20 @@ class DFlashPrefixL2Cache:
         out["current_bytes"] = current_bytes
         return out
 
+    def begin_request(self) -> None:
+        with self._gate_lock:
+            self._active_requests += 1
+            self._write_gate.clear()
+
+    def end_request(self) -> None:
+        with self._gate_lock:
+            self._active_requests = max(0, self._active_requests - 1)
+            if self._active_requests == 0:
+                self._write_gate.set()
+
     def shutdown(self, wait: bool = True) -> None:
+        # Release any paused writes so pending jobs flush before the join.
+        self._write_gate.set()
         if self._writer_thread is not None:
 
             self._write_queue.put(None)
@@ -567,6 +586,11 @@ class DFlashPrefixL2Cache:
             if job is None:
                 break
             try:
+                # Hold multi-GB serialization/IO while a request is being
+                # served; shutdown() sets the gate so pending jobs flush.
+                while not self._write_gate.wait(timeout=0.5):
+                    if self._stop.is_set():
+                        break
                 with self._lock:
                     if job.epoch != self._epoch:
                         self._stats["write_drops_epoch_invalidated"] += 1

@@ -214,6 +214,14 @@ class PrefixSnapshotStore:
         if self._l2 is not None:
             self._l2.clear()
 
+    def begin_request(self) -> None:
+        if self._l2 is not None:
+            self._l2.begin_request()
+
+    def end_request(self) -> None:
+        if self._l2 is not None:
+            self._l2.end_request()
+
     def shutdown(self) -> None:
         self._l1.shutdown()
         if self._l2 is not None:

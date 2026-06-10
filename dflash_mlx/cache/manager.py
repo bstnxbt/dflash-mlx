@@ -82,6 +82,20 @@ class RuntimeCacheManager:
             self._ensure_open_locked()
             return self._store.frontier_stride()
 
+    def begin_request(self) -> None:
+        # Pauses L2 disk writes for the duration of a served request; safe
+        # to call around a request even if the manager retires in between.
+        with self._state_lock:
+            if self._retired:
+                return
+            self._store.begin_request()
+
+    def end_request(self) -> None:
+        with self._state_lock:
+            if self._retired:
+                return
+            self._store.end_request()
+
     def lookup(
         self,
         tokens: list[int] | tuple[int, ...],
