@@ -13,6 +13,9 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return int(default)
 
+def fused_norm_rope_enabled() -> bool:
+    return os.environ.get("DFLASH_FUSED_NORM_ROPE", "") == "1"
+
 def verify_linear_override() -> Optional[bool]:
     raw = os.environ.get("DFLASH_VERIFY_LINEAR", "").strip()
     if raw == "1":
