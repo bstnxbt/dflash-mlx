@@ -68,14 +68,19 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
         super().__init__(model_provider, prompt_cache)
         self.server_runtime = server_runtime
         self.last_finish_reason = None
+        self.last_prompt_token_count = None
+        self.last_completion_token_count = None
 
     def generate(self, request, generation_args, progress_callback=None):
-        # Track the finish_reason of the most recent generation so the
-        # handler can close a stream cleanly if tool-call parsing fails
-        # after generation completed (e.g. a tool call truncated by
-        # max_tokens). Generation is serialized through the runtime, so a
-        # plain instance attribute is sufficient.
+        # Track the finish_reason and token counts of the most recent
+        # generation so the handler can close the response cleanly if
+        # tool-call parsing fails after generation completed (e.g. a tool
+        # call truncated by max_tokens): the non-stream completion payload
+        # requires integer token counts. Generation is serialized through
+        # the runtime, so plain instance attributes are sufficient.
         self.last_finish_reason = None
+        self.last_prompt_token_count = None
+        self.last_completion_token_count = None
         ctx, response = super().generate(
             request,
             generation_args,
@@ -87,6 +92,12 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 reason = getattr(gen, "finish_reason", None)
                 if reason is not None:
                     self.last_finish_reason = reason
+                prompt_tokens = getattr(gen, "prompt_tokens", None)
+                if prompt_tokens is not None:
+                    self.last_prompt_token_count = int(prompt_tokens)
+                generation_tokens = getattr(gen, "generation_tokens", None)
+                if generation_tokens is not None:
+                    self.last_completion_token_count = int(generation_tokens)
                 yield gen
 
         return ctx, _track(response)
@@ -431,7 +442,17 @@ class DFlashAPIHandler(mlx_server.APIHandler):
             "failure (tool call likely truncated by max_tokens)",
             finish_reason,
         )
-        response = self.generate_response("", finish_reason)
+        response = self.generate_response(
+            "",
+            finish_reason,
+            prompt_token_count=int(
+                getattr(self.response_generator, "last_prompt_token_count", None) or 0
+            ),
+            completion_token_count=int(
+                getattr(self.response_generator, "last_completion_token_count", None)
+                or 0
+            ),
+        )
         payload = json.dumps(response)
         try:
             if self.stream:

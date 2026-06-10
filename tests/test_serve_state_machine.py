@@ -549,8 +549,15 @@ def test_tool_parse_error_after_stream_start_salvages_stream(monkeypatch):
     handler.response_generator = SimpleNamespace(last_finish_reason="length")
     generated = []
 
-    def fake_generate_response(text, finish_reason):
-        generated.append((text, finish_reason))
+    def fake_generate_response(text, finish_reason, **kwargs):
+        generated.append(
+            (
+                text,
+                finish_reason,
+                kwargs.get("prompt_token_count"),
+                kwargs.get("completion_token_count"),
+            )
+        )
         return {"choices": [{"delta": {}, "finish_reason": finish_reason}]}
 
     handler.generate_response = fake_generate_response
@@ -558,7 +565,7 @@ def test_tool_parse_error_after_stream_start_salvages_stream(monkeypatch):
     DFlashAPIHandler.handle_completion(handler, SimpleNamespace(tools=[]), [])
 
     body = handler.wfile.getvalue().decode()
-    assert generated == [("", "length")]
+    assert generated == [("", "length", 0, 0)]
     assert '"finish_reason": "length"' in body
     assert body.endswith("data: [DONE]\n\n")
     # No late 400 may be written into a live stream.
@@ -579,15 +586,28 @@ def test_tool_parse_error_after_response_start_non_stream_emits_body(monkeypatch
     handler.stream = False
     handler.tool_choice = None
     handler.parallel_tool_calls = True
-    handler.response_generator = SimpleNamespace(last_finish_reason="stop")
-    handler.generate_response = lambda text, finish_reason: {
-        "choices": [{"message": {"content": text}, "finish_reason": finish_reason}]
-    }
+    handler.response_generator = SimpleNamespace(
+        last_finish_reason="stop",
+        last_prompt_token_count=7,
+        last_completion_token_count=3,
+    )
+    generated = []
+
+    def fake_generate_response(text, finish_reason, **kwargs):
+        generated.append(
+            (kwargs.get("prompt_token_count"), kwargs.get("completion_token_count"))
+        )
+        return {
+            "choices": [{"message": {"content": text}, "finish_reason": finish_reason}]
+        }
+
+    handler.generate_response = fake_generate_response
 
     DFlashAPIHandler.handle_completion(handler, SimpleNamespace(tools=[]), [])
 
     payload = json.loads(handler.wfile.getvalue().decode())
     assert payload["choices"][0]["finish_reason"] == "stop"
+    assert generated == [(7, 3)]
     assert handler.statuses == []
 
 
@@ -607,7 +627,7 @@ def test_tool_parse_error_salvage_defaults_to_length_finish_reason(monkeypatch):
     handler.parallel_tool_calls = True
     handler.response_generator = SimpleNamespace(last_finish_reason=None)
     generated = []
-    handler.generate_response = lambda text, finish_reason: generated.append(
+    handler.generate_response = lambda text, finish_reason, **kwargs: generated.append(
         (text, finish_reason)
     ) or {"choices": []}
 
@@ -716,3 +736,59 @@ def test_reasoning_content_is_not_overwritten():
         "role": "assistant",
         "reasoning_content": "server",
     }
+
+
+def _finalize_handler(*, stream: bool) -> DFlashAPIHandler:
+    handler = object.__new__(DFlashAPIHandler)
+    handler.stream = stream
+    handler.wfile = BytesIO()
+    handler.created = 0
+    handler.object_type = "chat.completion" if not stream else "chat.completion.chunk"
+    handler.request_id = "chatcmpl-test"
+    handler.requested_model = "dflash"
+    handler.system_fingerprint = "fp_test"
+    handler._responses_mode = False
+    handler.response_generator = SimpleNamespace(
+        last_finish_reason="length",
+        last_prompt_token_count=62241,
+        last_completion_token_count=1200,
+        model_provider=SimpleNamespace(model_key=None),
+    )
+    return handler
+
+
+def test_finalize_after_tool_parse_error_emits_valid_length_response():
+    # Regression: a tool call truncated by max_tokens used to crash the
+    # finalize path (generate_response without token counts raises
+    # "Response type is complete, but token counts not provided"), leaving
+    # the client an empty body or a hung connection.
+    handler = _finalize_handler(stream=False)
+
+    DFlashAPIHandler._finalize_completion_after_tool_parse_error(handler)
+
+    payload = json.loads(handler.wfile.getvalue().decode())
+    assert payload["choices"][0]["finish_reason"] == "length"
+    assert payload["usage"]["prompt_tokens"] == 62241
+    assert payload["usage"]["completion_tokens"] == 1200
+
+
+def test_finalize_after_tool_parse_error_without_counts_defaults_to_zero():
+    handler = _finalize_handler(stream=False)
+    handler.response_generator.last_prompt_token_count = None
+    handler.response_generator.last_completion_token_count = None
+
+    DFlashAPIHandler._finalize_completion_after_tool_parse_error(handler)
+
+    payload = json.loads(handler.wfile.getvalue().decode())
+    assert payload["choices"][0]["finish_reason"] == "length"
+    assert payload["usage"]["completion_tokens"] == 0
+
+
+def test_finalize_after_tool_parse_error_stream_emits_done():
+    handler = _finalize_handler(stream=True)
+
+    DFlashAPIHandler._finalize_completion_after_tool_parse_error(handler)
+
+    body = handler.wfile.getvalue().decode()
+    assert body.startswith("data: ")
+    assert body.rstrip().endswith("data: [DONE]")
