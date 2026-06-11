@@ -146,11 +146,8 @@ class ContextOnlyDraftKVCache:
 
 
 class FullContextDraftKVCache(ContextOnlyDraftKVCache):
-    # Contiguous step-grown buffer with in-place slice writes. A per-cycle
-    # mx.concatenate over the whole context (the previous segmented layout)
-    # rematerializes a monotonically-growing buffer every cycle, which the MLX
-    # buffer cache can never reuse — Metal heap churn degraded every forward
-    # pass progressively (×5 wall at ~7000 cycles).
+    # In-place step-grown buffer: a per-cycle concat churns the Metal heap
+    # (progressive ×5 wall at ~7000 cycles).
     step = 256
 
     def __init__(self):
@@ -218,10 +215,6 @@ class FullContextDraftKVCache(ContextOnlyDraftKVCache):
         block_keys: mx.array,
         block_values: mx.array,
     ) -> tuple[mx.array, mx.array]:
-        # Stages the speculative block in the step headroom past _length and
-        # returns [context | block] views without materializing a copy; the
-        # next append_context overwrites the staged rows, so logical cache
-        # state is untouched.
         block_len = int(block_keys.shape[2])
         if self.keys is None or self._length <= 0:
             return block_keys, block_values
@@ -236,8 +229,6 @@ class FullContextDraftKVCache(ContextOnlyDraftKVCache):
         )
 
     def position_indices(self) -> Optional[mx.array]:
-        # Full-context appends are always contiguous, so positions are always
-        # arange(0, length); synthesized lazily instead of stored.
         if self._length <= 0:
             return None
         return mx.arange(self._length, dtype=mx.int32)

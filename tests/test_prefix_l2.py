@@ -262,12 +262,8 @@ class TestL2Lifecycle:
         assert "l2" not in stats
 
     def test_evict_promotes_to_l2_disk(self, tmp_path):
-        # max_in_flight=3: the second insert triggers its own write-through AND
-        # an eviction-promotion duplicate of the first file, so up to three
-        # insert_async calls can overlap; with only 2 slots the second
-        # write-through can drop on semaphore contention under load. Wait on
-        # the asserted condition (files on disk), not the writes counter —
-        # dedup-skips of the promotion duplicate also increment that counter.
+        # 3 slots: the eviction-promotion duplicate makes a third overlapping
+        # insert; wait on files, not the dedup-inflated writes counter.
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9, max_in_flight=3)
         try:
             cache = _store(max_entries=1, max_bytes=10**9, l2=l2)

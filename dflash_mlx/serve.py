@@ -72,12 +72,6 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
         self.last_completion_token_count = None
 
     def generate(self, request, generation_args, progress_callback=None):
-        # Track the finish_reason and token counts of the most recent
-        # generation so the handler can close the response cleanly if
-        # tool-call parsing fails after generation completed (e.g. a tool
-        # call truncated by max_tokens): the non-stream completion payload
-        # requires integer token counts. Generation is serialized through
-        # the runtime, so plain instance attributes are sufficient.
         self.last_finish_reason = None
         self.last_prompt_token_count = None
         self.last_completion_token_count = None

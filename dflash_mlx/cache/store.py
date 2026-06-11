@@ -136,9 +136,6 @@ class PrefixSnapshotStore:
         l2_len = len(l2_snapshot.token_ids)
         exact = l2_len == len(req_tuple)
         if l2_snapshot.kind != "generation":
-            # Generation snapshots are consume-on-serve (see prefix_l1);
-            # promoting one to L1 would pin multi-GB arrays for a hit that
-            # can never come once its successor is published.
             promote = self._l1.insert_with_evictions(l2_snapshot, skip_too_long=True)
             self._write_snapshots_to_l2(promote.removed_snapshots)
         with self._lock:
@@ -256,10 +253,6 @@ class PrefixSnapshotStore:
 
     def shutdown(self) -> None:
         if self._l2 is not None:
-            # Spill resident L1 entries so the next session warm-starts from
-            # L2; consume-on-serve means generation snapshots never reach L2
-            # during the session. Already-written files are skipped by the
-            # L2 exists-check.
             self._write_snapshots_to_l2(self._l1.resident_snapshots())
         self._l1.shutdown()
         if self._l2 is not None:

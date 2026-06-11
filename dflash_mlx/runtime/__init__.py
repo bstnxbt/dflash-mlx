@@ -101,7 +101,5 @@ def stream_dflash_generate(
             prefix_hit_kind=prefix_hit_kind,
             runtime_context=runtime_context,
         )
-        # This wrapper frame lives for the whole generation; the snapshot is
-        # bound into the inner generator, so drop the local ref here too.
         prefix_snapshot = None
         yield from inner

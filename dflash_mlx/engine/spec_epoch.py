@@ -85,8 +85,6 @@ from dflash_mlx.engine.memory_waterfall import (
 )
 
 _DECODE_CLEAR_CACHE_INTERVAL_TOKENS = 1024
-# Below this stable-prefix depth a boundary sidecar saves at most pennies of
-# re-prefill while degrading the snapshot size ratio; skip it.
 _SIDECAR_MIN_BOUNDARY = 4096
 _DDTREE_TOP_WIDTH = 2
 _DDTREE_MAX_BRANCH_POSITIONS = 2
@@ -672,8 +670,6 @@ class SpeculativeSession:
             )
             and not snapshot_covers_prefix(prefix_snapshot, snap_prefix_len)
         ):
-            # A trimmed-feature snapshot would zero-fill the context features
-            # the full-attention draft layer attends; treat it as a miss.
             snap_prefix_len = 0
         if snap_prefix_len > 0:
             template_cache = target_ops.make_cache(
@@ -810,12 +806,6 @@ class SpeculativeSession:
         if request.max_new_tokens > 0 and request.should_collect_generation_snapshot_hidden(
             supports_prefix_snapshot
         ):
-            # Hits only ever match a FULL snapshot as a prefix of the request
-            # (GDN recurrent state cannot be rewound, so lookup never cuts
-            # into a snapshot). Skipping prefill publishes therefore loses
-            # next-turn hits that diverge inside the previous generation, but
-            # the measured trade still wins: each prefill publish costs
-            # full-cache clones plus multi-GB L2 writes on every request.
             publish_prefix_snapshots = False
 
         start_ns = time.perf_counter_ns()
@@ -994,10 +984,6 @@ class SpeculativeSession:
         ):
             raise ValueError("prefill snapshot requires last_logits")
         if prefix_snapshot is not None:
-            # The snapshot is fully consumed (target cache hydrated at open,
-            # features rebuilt, seam logits restored). Drop every reference
-            # now so eviction can actually free the arrays during decode
-            # instead of keeping a request-pinned copy alive to the end.
             object.__setattr__(request, "prefix_snapshot", None)
             prefix_snapshot = None
         if publish_prefix_snapshots and not exact_snapshot_restore:
@@ -1043,11 +1029,7 @@ class SpeculativeSession:
             and state.prefill_logits is not None
             and sidecar_eligible(target_cache)
         ):
-            # Last moment the boundary state exists: the tail forward below
-            # advances GDN past it and GDN cannot be rewound. Reference-grab
-            # the GDN states (replaced, never mutated in place) + boundary
-            # logits so the generation snapshot can also serve next-turn
-            # requests that diverge inside this generation.
+            # Last point the boundary state exists; GDN cannot be rewound.
             state.sidecar_boundary = int(snapshot_boundary)
             state.sidecar_gdn_states = capture_gdn_sidecar(target_cache)
             state.sidecar_last_logits = state.prefill_logits[:, -1, :]
@@ -1180,8 +1162,6 @@ class SpeculativeSession:
             require_logits=False,
             snapshot_boundary=end_total_len,
             allow_full_context_draft_layers=self.allow_full_context_draft_layers,
-            # End of request: the session never touches target_cache again,
-            # so the snapshot adopts the live arrays instead of cloning ~GBs.
             adopt_cache_arrays=True,
             sidecar_boundary=state.sidecar_boundary,
             sidecar_gdn_states=state.sidecar_gdn_states,
@@ -1950,8 +1930,6 @@ class SpeculativeSession:
         target_layer_id_list = self.target_layer_id_list
         capture_layer_ids = self.capture_layer_ids
         profile_cycles = self.profile_cycles
-        # Logit capture rides the synchronous profile draft path; outside
-        # profiling there is no per-cycle emission to attach it to.
         capture_logits = self.capture_logits and profile_cycles
         memory_waterfall = self.memory_waterfall
         target_model = self.target_model
@@ -2918,8 +2896,5 @@ def stream_dflash_generate_impl(
         target_fa_window=target_fa_window,
         runtime_context=runtime_context,
     )
-    # This generator frame lives for the whole generation; drop its snapshot
-    # ref so the prefill seam (which nulls request.prefix_snapshot) actually
-    # releases the multi-GB arrays instead of leaving them pinned here.
     prefix_snapshot = None
     yield from session.run_events(request)

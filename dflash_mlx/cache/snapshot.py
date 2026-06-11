@@ -117,10 +117,6 @@ class DFlashPrefixSnapshot:
     key: DFlashPrefixKey
     kind: str = "prefill"
     created_at: float = field(default_factory=time.time)
-    # Boundary sidecar (generation snapshots only): GDN states + logits
-    # captured at the stable-prefix boundary. FA KV can be sliced back to
-    # any prefix, but GDN recurrent state cannot be rewound, so without
-    # this a lookup can never restore at a point inside the snapshot.
     sidecar_boundary: int = 0
     sidecar_gdn_states: Optional[
         tuple[Optional[tuple[Optional[mx.array], ...]], ...]

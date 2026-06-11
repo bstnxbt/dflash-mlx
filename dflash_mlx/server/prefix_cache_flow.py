@@ -138,8 +138,6 @@ class PrefixCacheFlow:
             request=request,
         )
         lookup_tokens = prompt[:stable_prefix_len]
-        # Order matters: the draft check short-circuits so target capabilities
-        # are only consulted for full-attention drafts (the only consumers).
         require_full_coverage = requires_full_target_hidden(
             draft_model,
             allow_full_attention_context=True,

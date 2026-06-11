@@ -111,7 +111,6 @@ def _build_target_hidden_chunks(
     )
 
 def sidecar_eligible(target_cache: list[Any]) -> bool:
-    # RotatingKVCache rings cannot be sliced back to a token boundary.
     return all(
         isinstance(entry, (KVCache, RecurrentRollbackCache))
         and not isinstance(entry, RotatingKVCache)
@@ -121,9 +120,6 @@ def sidecar_eligible(target_cache: list[Any]) -> bool:
 def capture_gdn_sidecar(
     target_cache: list[Any],
 ) -> tuple[Optional[tuple[Optional[mx.array], ...]], ...]:
-    # Reference grab, no copy: GDN cache entries are replaced on every
-    # update (never mutated in place), so the captured arrays stay frozen
-    # while decode advances the live cache past the boundary.
     return tuple(
         tuple(entry.cache) if isinstance(entry, RecurrentRollbackCache) else None
         for entry in target_cache
@@ -186,8 +182,6 @@ def serialize_target_cache(
     tuple[Optional[FAState], ...],
     tuple[Optional[tuple[Optional[mx.array], ...]], ...],
 ]:
-    # clone=False adopts the live arrays without copying; callers must
-    # guarantee the cache is never mutated afterwards (end-of-request only).
     grab = _clone_array if clone else (lambda a: a)
     fa: list[Optional[FAState]] = []
     gdn: list[Optional[tuple[Optional[mx.array], ...]]] = []
@@ -268,10 +262,6 @@ def hydrate_target_cache(
                 size=len(tmpl.cache),
                 conv_kernel_size=tmpl.conv_kernel_size,
             )
-            # Adopt by reference: GDN entries are replaced on every update,
-            # never mutated in place (the invariant sidecar capture relies
-            # on), so the snapshot arrays stay frozen as the live cache
-            # advances.
             new_cache.cache = list(gdn_state)
             result.append(new_cache)
         elif isinstance(tmpl, KVCache):
@@ -285,13 +275,6 @@ def hydrate_target_cache(
                     f"offset={int(offset)}); cannot adopt"
                 )
             new_cache = KVCache()
-            # Adopt by reference: snapshot FA arrays are exact-length
-            # (capacity == offset), so the first update_and_fetch always
-            # takes the growth path (concat into a fresh buffer) and never
-            # writes in place into the adopted arrays — the snapshot stays
-            # valid after restore. Cloning here was a multi-GB allocation
-            # per boundary (plus a second materialization when the snapshot
-            # held lazy slices) and is the prime per-boundary churn source.
             new_cache.keys = k
             new_cache.values = v
             new_cache.offset = offset
@@ -381,6 +364,8 @@ def build_snapshot(
         else:
             target_hidden = target_hidden[:, :prefix_len, :]
 
+    # Adopting is safe: GDN entries are replaced per update, and exact-length
+    # FA arrays force the growth path on the next update.
     fa, gdn = serialize_target_cache(
         target_cache,
         clone=not adopt_cache_arrays,
@@ -411,8 +396,6 @@ def build_snapshot(
         key=key,
         kind=kind,
         sidecar_boundary=sidecar_boundary,
-        # Sidecar arrays are frozen by construction (GDN entries are
-        # replaced, never mutated), so they are adopted without cloning.
         sidecar_gdn_states=sidecar_gdn_states,
         sidecar_last_logits=sidecar_last_logits,
     )

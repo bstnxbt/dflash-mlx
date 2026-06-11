@@ -118,8 +118,6 @@ def consume_dflash_events(
                 fields=memory_start,
             )
 
-    # Pause L2 disk writes while this request is served so multi-GB
-    # snapshot IO never competes with prefill/decode (single-user server).
     cache_manager = current_runtime_cache_manager()
     if cache_manager is not None:
         cache_manager.begin_request()

@@ -176,8 +176,6 @@ class ServerRuntime:
             prefix_hit_kind=prefix_flow.hit_kind,
             runtime_context=runtime_context,
         )
-        # The engine owns the snapshot from here; keeping this server-side
-        # ref would pin the multi-GB arrays for the whole request.
         prefix_flow.snapshot = None
         loop_result = consume_dflash_events(
             event_iter=event_iter,

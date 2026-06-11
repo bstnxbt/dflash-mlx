@@ -152,8 +152,6 @@ class DFlashPrefixCache:
 
             sidecar_used = False
             if best_sidecar_carrier is not None and best_sidecar_len > best_len:
-                # The carrier diverges from the request inside its generation,
-                # but its boundary state restores the shared prefix exactly.
                 best_len = best_sidecar_len
                 best_id = best_sidecar_id
                 best_snapshot = slice_snapshot_at_sidecar_boundary(
@@ -172,17 +170,11 @@ class DFlashPrefixCache:
                 ):
                     best_snapshot = None
                 else:
-
+                    # Served generation snapshots are dominated by the successor
+                    # published at request end; consume them on first serve.
                     if record:
                         consumed = sidecar_used or best_snapshot.kind == "generation"
                         if consumed:
-                            # Consume-on-serve: a generation snapshot bridges
-                            # exactly one boundary — the request it serves
-                            # publishes a strictly-dominating successor at its
-                            # end (for sidecar carriers the new boundary covers
-                            # every prefix this entry could still serve), so
-                            # keeping it pins multi-GB buffers for zero future
-                            # hits. record=False pre-passes must not consume.
                             self._entries.pop(best_id, None)
                             if best_id in self._lru_order:
                                 self._lru_order.remove(best_id)

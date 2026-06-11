@@ -83,8 +83,6 @@ class RuntimeCacheManager:
             return self._store.frontier_stride()
 
     def begin_request(self) -> None:
-        # Pauses L2 disk writes for the duration of a served request; safe
-        # to call around a request even if the manager retires in between.
         with self._state_lock:
             if self._retired:
                 return

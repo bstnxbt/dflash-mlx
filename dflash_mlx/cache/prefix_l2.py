@@ -148,13 +148,10 @@ def _fingerprint(snapshot: DFlashPrefixSnapshot) -> str:
         "runtime": dflash_mlx.__version__,
         "context_representation": CONTEXT_REPRESENTATION,
     }
-    # Distinguishes sidecar-carrying files from plain twins of the same
-    # (key, kind, tokens) so the insert exists-check cannot shadow them.
     if int(snapshot.sidecar_boundary) > 0:
         payload["sidecar_boundary"] = int(snapshot.sidecar_boundary)
-    # Marker only when coverage is full: trimmed files keep their legacy
-    # fingerprint, while a full-coverage twin of the same (key, kind, tokens)
-    # gets a distinct filename the exists-check cannot shadow.
+    # Mark only full coverage so a full twin of a trimmed file gets a
+    # distinct filename the exists-check cannot shadow.
     if snapshot_covers_prefix(snapshot, snapshot.prefix_len):
         payload["full_coverage"] = True
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -447,8 +444,6 @@ class DFlashPrefixL2Cache:
             "coverage_rejects": 0,
         }
         self._stop = threading.Event()
-        # Set = writes allowed. Cleared while a request is being served so
-        # multi-GB serialization/IO never competes with prefill/decode.
         self._write_gate = threading.Event()
         self._write_gate.set()
         self._gate_lock = threading.Lock()
@@ -568,8 +563,6 @@ class DFlashPrefixL2Cache:
                 self._stats["hits"] += 1
                 self._stats["bytes_out"] += snap.nbytes
                 self._stats["load_total_us"] += int(elapsed_us)
-            # _evict_to_budget orders victims by mtime; touch served files so
-            # budget pressure evicts least-recently-used, not oldest-written.
             try:
                 os.utime(path)
             except OSError:
@@ -630,7 +623,6 @@ class DFlashPrefixL2Cache:
                 self._write_gate.set()
 
     def shutdown(self, wait: bool = True) -> None:
-        # Release any paused writes so pending jobs flush before the join.
         self._write_gate.set()
         if self._writer_thread is not None:
 
@@ -663,8 +655,6 @@ class DFlashPrefixL2Cache:
             if job is None:
                 break
             try:
-                # Hold multi-GB serialization/IO while a request is being
-                # served; shutdown() sets the gate so pending jobs flush.
                 while not self._write_gate.wait(timeout=0.5):
                     if self._stop.is_set():
                         break
@@ -904,7 +894,6 @@ class DFlashPrefixL2Cache:
             if not spans_cover_prefix(
                 ((int(s), int(e)) for s, e in spans_raw), n
             ):
-                # Still valid for windowed requesters: reject without unlink.
                 with self._lock:
                     self._stats["coverage_rejects"] += 1
                 return None

@@ -1364,9 +1364,6 @@ def _sustained_summary(gens: list[dict[str, Any]]) -> dict[str, Any]:
         return {"generations": 0}
     fresh = float(gens[0]["decode_tok_s"])
     total_s = float(gens[-1]["t_start_s"]) + float(gens[-1]["wall_s"])
-    # plateau = generations starting in the final 5 minutes, once at least
-    # 5 minutes of continuous load have elapsed (the M5-class cliff sits
-    # near 3 minutes; anything later is the power-envelope equilibrium).
     plateau_start = max(300.0, total_s - 300.0)
     plateau_rows = [g for g in gens if float(g["t_start_s"]) >= plateau_start]
     plateau = (
