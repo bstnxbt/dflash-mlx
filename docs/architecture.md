@@ -204,6 +204,28 @@ The key includes target id, draft id, capture layer ids, draft sink/window,
 target FA window, and format version. This is what prevents incompatible
 snapshots from being reused across different runtime shapes.
 
+## Snapshot Lifecycle
+
+- Prefill publishes are skipped when an end-of-request generation snapshot
+  will follow; that snapshot adopts the live cache arrays instead of cloning
+  them. Adoption is safe because GDN entries are replaced on every update
+  (never mutated in place) and exact-length FA arrays force the growth path
+  on the next update.
+- Generation snapshots carry a GDN boundary sidecar: recurrent state and
+  logits captured at the stable-prefix boundary, the last point where that
+  state exists — GDN cannot be rewound. The sidecar lets a later request
+  restore at a point inside the snapshot instead of missing.
+- L1 serves a generation snapshot once, then consumes it: the request it
+  serves publishes a strictly dominating successor at its end, so keeping
+  the served entry would pin multi-GB arrays for hits that can never come.
+- L2 disk writes are paused while a request is served and flush between
+  requests. At shutdown, resident L1 entries spill to L2 so the next session
+  warm-starts; generation snapshots reach disk only through this spill.
+- L2 eviction is LRU by file mtime and lookups touch served files. A
+  full-coverage snapshot gets a distinct fingerprint so a trimmed twin of
+  the same tokens cannot shadow it, and full-context draft requests reject
+  non-covering snapshots at lookup.
+
 ## Diagnostics
 
 Diagnostics are opt-in for structured JSONL artifacts:

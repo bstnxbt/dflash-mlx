@@ -65,8 +65,10 @@ DFlash runtime:
 | `--draft-full-context-min-ctx INT` | projected context (prompt + max new tokens) at or above which the draft full-attention layer attends all context features; `0` means always; default `16384` |
 | `--verify-len-cap INT` | max tokens per verify forward, `0` means block size |
 | `--verify-mode {dflash,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
+| `--copyspec-mode {conservative,off,auto}` | prompt-lookup (copyspec) drafting; default `conservative` disables copyspec after one missed copy block, `auto` periodically A/B-probes on vs off and latches the faster setting, `off` disables it entirely |
 | `--dflash-max-ctx INT` | DFlash runtime context cap; `0` means no cap |
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
+| `--quantize-kv-cache`, `--no-quantize-kv-cache` | quantize the target full-attention KV cache to 8-bit (group size 64); halves KV memory growth at long context, decode slows as context grows; default disabled; incompatible with `--target-fa-window` |
 | `--clear-cache-boundaries`, `--no-clear-cache-boundaries` | clear the MLX cache at safe request boundaries |
 
 Draft loading:
@@ -96,6 +98,7 @@ Prefix cache:
 | `--prefix-cache-l2`, `--no-prefix-cache-l2` | enable/disable SSD L2 for persisted/spilled snapshots |
 | `--prefix-cache-l2-dir PATH` | L2 root directory |
 | `--prefix-cache-l2-max-bytes BYTES` | L2 disk budget; raw integer bytes or suffixes like `50GB` |
+| `--prefix-cache-l2-frontier-stride INT` | token stride at which L2 frontier snapshots are written during cold prefill; `0` = auto (8192, rounded up to a prefill-step multiple); values below 8192 are raised to the disk-pressure floor |
 
 Notes:
 
@@ -153,8 +156,10 @@ Runtime override flags:
 | Flag | Meaning |
 | --- | --- |
 | `--verify-mode {dflash,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
+| `--copyspec-mode {conservative,off,auto}` | prompt-lookup (copyspec) drafting; default `conservative` disables copyspec after one missed copy block, `auto` periodically A/B-probes on vs off and latches the faster setting, `off` disables it entirely |
 | `--prefill-step-size INT` | target prefill chunk size |
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
+| `--quantize-kv-cache`, `--no-quantize-kv-cache` | quantize the target full-attention KV cache to 8-bit (group size 64); default disabled; incompatible with `--target-fa-window` |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
 | `--draft-full-context-min-ctx INT` | projected context (prompt + max new tokens) at or above which the draft full-attention layer attends all context features; `0` means always; default `16384` |
@@ -210,8 +215,10 @@ Runtime override flags:
 | Flag | Meaning |
 | --- | --- |
 | `--verify-mode {dflash,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
+| `--copyspec-mode {conservative,off,auto}` | prompt-lookup (copyspec) drafting; default `conservative` disables copyspec after one missed copy block, `auto` periodically A/B-probes on vs off and latches the faster setting, `off` disables it entirely |
 | `--prefill-step-size INT` | target prefill chunk size |
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
+| `--quantize-kv-cache`, `--no-quantize-kv-cache` | quantize the target full-attention KV cache to 8-bit (group size 64); default disabled; incompatible with `--target-fa-window` |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
 | `--draft-full-context-min-ctx INT` | projected context (prompt + max new tokens) at or above which the draft full-attention layer attends all context features; `0` means always; default `16384` |
@@ -260,6 +267,9 @@ them.
 | `DFLASH_VERIFY_LEN_CAP` | `--verify-len-cap INT` |
 | `DFLASH_CLEAR_CACHE_BOUNDARIES` | `--clear-cache-boundaries`, `--no-clear-cache-boundaries` |
 | `DFLASH_VERIFY_MODE` | `--verify-mode {dflash,adaptive,ddtree,off}` |
+| `DFLASH_COPYSPEC_MODE` | `--copyspec-mode {conservative,off,auto}` |
+| `DFLASH_QUANTIZE_KV_CACHE` | `--quantize-kv-cache`, `--no-quantize-kv-cache` |
+| `DFLASH_PREFIX_CACHE_L2_FRONTIER_STRIDE` | `--prefix-cache-l2-frontier-stride INT` |
 | `DFLASH_MAX_SNAPSHOT_TOKENS` | `--max-snapshot-tokens INT` |
 | `DFLASH_PREFIX_CACHE_L2_ENABLED` | `--prefix-cache-l2`, `--no-prefix-cache-l2` |
 | `DFLASH_PREFIX_CACHE_L2_DIR` | `--prefix-cache-l2-dir PATH` |
@@ -288,6 +298,8 @@ These are not product flags. They are kept for kernel and verifier experiments:
 - `DFLASH_VERIFY_MAX_N`
 - `DFLASH_VERIFY_QMM_KPARTS`
 - `DFLASH_VERIFY_INCLUDE`
+- `DFLASH_CAPTURE_LOGITS` (slot-level draft/target logit capture in cycle
+  events; only active together with cycle profiling)
 
 Do not use them for public benchmark claims.
 
@@ -307,5 +319,7 @@ The runtime rejects invalid config before serving:
 - `target_fa_window >= 0`
 - `dflash_max_ctx >= 0`
 - `verify_mode in {dflash, adaptive, ddtree, off}`
+- `copyspec_mode in {conservative, off, auto}`
+- `quantize_kv_cache` cannot be combined with `target_fa_window > 0`
 
 Use `dflash doctor --json` to see the resolved effective config.
