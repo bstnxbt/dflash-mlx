@@ -126,6 +126,17 @@ def _wait_writes(l2: DFlashPrefixL2Cache, expected: int, timeout_s: float = 5.0)
         f"L2 writer did not catch up: writes={l2.stats()['writes']} expected>={expected}"
     )
 
+def _wait_files(cache_dir: Path, expected: int, timeout_s: float = 10.0) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if len(_all_snapshot_files(cache_dir)) >= expected:
+            return
+        time.sleep(0.05)
+    raise AssertionError(
+        f"L2 files did not land: have={len(_all_snapshot_files(cache_dir))} "
+        f"expected>={expected}"
+    )
+
 def _insert_l2_sync(l2: DFlashPrefixL2Cache, snap) -> None:
     expected = l2.stats()["writes"] + 1
     assert l2.insert_async(snap) is True
@@ -251,16 +262,19 @@ class TestL2Lifecycle:
         assert "l2" not in stats
 
     def test_evict_promotes_to_l2_disk(self, tmp_path):
-        # max_in_flight=2: lazy publishing means the writer thread holds the slot
-        # for the disk-write duration; allow 2 concurrent writes so both inserts
-        # can pipeline without the second dropping on semaphore contention.
-        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9, max_in_flight=2)
+        # max_in_flight=3: the second insert triggers its own write-through AND
+        # an eviction-promotion duplicate of the first file, so up to three
+        # insert_async calls can overlap; with only 2 slots the second
+        # write-through can drop on semaphore contention under load. Wait on
+        # the asserted condition (files on disk), not the writes counter —
+        # dedup-skips of the promotion duplicate also increment that counter.
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9, max_in_flight=3)
         try:
             cache = _store(max_entries=1, max_bytes=10**9, l2=l2)
             key = _make_key()
             cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
             cache.insert(_make_synthetic_snapshot([4, 5, 6], key))
-            _wait_writes(l2, expected=2)
+            _wait_files(tmp_path, expected=2)
             assert len(_all_snapshot_files(tmp_path)) == 2
         finally:
             l2.shutdown()
