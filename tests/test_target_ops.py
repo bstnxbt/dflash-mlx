@@ -547,7 +547,7 @@ def test_gemma4_full_attention_gqa_hook_is_internal():
     full_attn = model.model.layers[1].self_attn
     assert not hasattr(sliding_attn, "_dflash_split_sdpa_enabled")
     assert not hasattr(full_attn, "_dflash_split_sdpa_enabled")
-    assert getattr(type(full_attn), "_dflash_full_attention_gqa_installed") is True
+    assert getattr(type(full_attn), "_dflash_full_attention_gqa_installed") == "gemma4"
 
 def test_gemma4_logits_use_tied_embedding_head():
     target = _FakeGemmaLogitTarget(tied=True)
