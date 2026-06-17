@@ -189,7 +189,7 @@ class TestServeHelperShapes:
     def test_get_cache_disabled(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
         assert cache_manager_mod.get_runtime_cache_manager(
             _runtime_context(prefix_cache=False)
         ) is None
@@ -197,8 +197,8 @@ class TestServeHelperShapes:
     def test_get_cache_enabled_returns_singleton(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         context = _runtime_context(prefix_cache=True)
         first = cache_manager_mod.get_runtime_cache_manager(context)
         second = cache_manager_mod.get_runtime_cache_manager(context)
@@ -328,7 +328,7 @@ class TestContextConfigExposedCorrectly:
     def test_prefix_cache_config_affects_singleton(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
         assert cache_manager_mod.get_runtime_cache_manager(
             _runtime_context(prefix_cache=False)
         ) is None
@@ -340,8 +340,8 @@ class TestContextConfigExposedCorrectly:
     def test_singleton_rebuilds_when_config_changes(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         first = cache_manager_mod.get_runtime_cache_manager(
             _runtime_context(prefix_cache=True, prefix_cache_max_entries=2)
         )
@@ -364,8 +364,8 @@ class TestContextConfigExposedCorrectly:
             shutdown_calls.append(self)
             return original_shutdown(self)
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         monkeypatch.setattr(DFlashPrefixCache, "shutdown", tracked_shutdown)
 
         first = cache_manager_mod.get_runtime_cache_manager(
@@ -394,29 +394,29 @@ class TestContextConfigExposedCorrectly:
             return _store(max_entries=2)
 
         old_manager = RuntimeCacheManager(_store(BrokenShutdownCache(max_entries=2)))
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {None: (("old",), old_manager)})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         monkeypatch.setattr(cache_manager_mod, "_make_prefix_store", make_cache)
 
         with pytest.raises(RuntimeError, match="cannot close"):
             cache_manager_mod.get_runtime_cache_manager(_runtime_context(prefix_cache=True))
 
         assert cache_manager_mod.current_runtime_cache_manager() is None
-        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_MANAGER is old_manager
+        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_REGISTRY[None][1] is old_manager
         with pytest.raises(RuntimeError, match="shut down"):
             old_manager.stats()
         assert make_calls == []
         with pytest.raises(RuntimeError, match="cannot close"):
             cache_manager_mod.get_runtime_cache_manager(_runtime_context(prefix_cache=True))
         assert cache_manager_mod.current_runtime_cache_manager() is None
-        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_MANAGER is old_manager
+        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_REGISTRY[None][1] is old_manager
         assert make_calls == []
 
     def test_retired_manager_handle_fails_after_clear(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         context = _runtime_context(prefix_cache=True)
         manager = cache_manager_mod.get_runtime_cache_manager(context)
         assert manager is not None
@@ -438,7 +438,7 @@ class TestContextConfigExposedCorrectly:
         thread = threading.Thread(target=worker)
         thread.start()
         assert ready.wait(timeout=2.0)
-        cache_manager_mod._clear_runtime_cache_manager()
+        cache_manager_mod._clear_all_runtime_cache_managers()
         proceed.set()
         thread.join(timeout=2.0)
 
@@ -467,14 +467,14 @@ class TestContextConfigExposedCorrectly:
             return _store(max_entries=2)
 
         old_manager = RuntimeCacheManager(_store(BlockingShutdownCache(max_entries=2)))
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {None: (("old",), old_manager)})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         monkeypatch.setattr(cache_manager_mod, "_make_prefix_store", make_cache)
         context = _runtime_context(prefix_cache=True)
 
         def clear_worker() -> None:
             try:
-                cache_manager_mod._clear_runtime_cache_manager()
+                cache_manager_mod._clear_all_runtime_cache_managers()
             except BaseException as exc:
                 errors.append(exc)
 
@@ -522,12 +522,12 @@ class TestContextConfigExposedCorrectly:
 
         context = _runtime_context(prefix_cache=True)
         old_manager = _manager(BlockingTraceCache(max_entries=2))
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(
             cache_manager_mod,
-            "_DFLASH_RUNTIME_CACHE_CONFIG_KEY",
-            cache_manager_mod._prefix_cache_config_key(context),
+            "_DFLASH_RUNTIME_CACHE_REGISTRY",
+            {None: (cache_manager_mod._prefix_cache_config_key(context), old_manager)},
         )
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
 
         def get_worker() -> None:
             try:
@@ -538,7 +538,7 @@ class TestContextConfigExposedCorrectly:
         def clear_worker() -> None:
             try:
                 clear_started.set()
-                cache_manager_mod._clear_runtime_cache_manager()
+                cache_manager_mod._clear_all_runtime_cache_managers()
             except BaseException as exc:
                 errors.append(exc)
 
@@ -579,12 +579,12 @@ class TestContextConfigExposedCorrectly:
 
         context = _runtime_context(prefix_cache=True)
         old_manager = _manager(BlockingTraceCache(max_entries=2))
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(
             cache_manager_mod,
-            "_DFLASH_RUNTIME_CACHE_CONFIG_KEY",
-            cache_manager_mod._prefix_cache_config_key(context),
+            "_DFLASH_RUNTIME_CACHE_REGISTRY",
+            {None: (cache_manager_mod._prefix_cache_config_key(context), old_manager)},
         )
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
 
         def sync_worker() -> None:
             try:
@@ -595,7 +595,7 @@ class TestContextConfigExposedCorrectly:
         def clear_worker() -> None:
             try:
                 clear_started.set()
-                cache_manager_mod._clear_runtime_cache_manager()
+                cache_manager_mod._clear_all_runtime_cache_managers()
             except BaseException as exc:
                 errors.append(exc)
 
@@ -637,12 +637,12 @@ class TestContextConfigExposedCorrectly:
 
         context = _runtime_context(prefix_cache=True)
         old_manager = _manager(BlockingLookupCache(max_entries=2))
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(
             cache_manager_mod,
-            "_DFLASH_RUNTIME_CACHE_CONFIG_KEY",
-            cache_manager_mod._prefix_cache_config_key(context),
+            "_DFLASH_RUNTIME_CACHE_REGISTRY",
+            {None: (cache_manager_mod._prefix_cache_config_key(context), old_manager)},
         )
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
 
         def lookup_worker() -> None:
             try:
@@ -653,7 +653,7 @@ class TestContextConfigExposedCorrectly:
         def clear_worker() -> None:
             try:
                 clear_started.set()
-                cache_manager_mod._clear_runtime_cache_manager()
+                cache_manager_mod._clear_all_runtime_cache_managers()
             except BaseException as exc:
                 errors.append(exc)
 
@@ -714,8 +714,8 @@ class TestContextConfigExposedCorrectly:
 
         context = _runtime_context(prefix_cache=True)
         old_manager = _manager(BlockingInsertCache(max_entries=2))
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {None: (("old",), old_manager)})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         monkeypatch.setattr(cache_manager_mod, "_make_prefix_store", make_cache)
 
         def insert_worker() -> None:
@@ -733,7 +733,7 @@ class TestContextConfigExposedCorrectly:
 
         def clear_worker() -> None:
             try:
-                cache_manager_mod._clear_runtime_cache_manager()
+                cache_manager_mod._clear_all_runtime_cache_managers()
             except BaseException as exc:
                 errors.append(exc)
 
@@ -785,12 +785,12 @@ class TestContextConfigExposedCorrectly:
                 return super().shutdown()
 
         old_manager = _manager(BlockingShutdownCache(max_entries=2))
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {None: (("old",), old_manager)})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
 
         def clear_worker() -> None:
             try:
-                cache_manager_mod._clear_runtime_cache_manager()
+                cache_manager_mod._clear_all_runtime_cache_managers()
             except BaseException as exc:
                 errors.append(exc)
 
@@ -832,8 +832,8 @@ class TestContextConfigExposedCorrectly:
 
         old_cache = TrackedShutdownCache(max_entries=2)
         old_manager = _manager(old_cache)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {None: (("old",), old_manager)})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         monkeypatch.setattr(
             cache_manager_mod,
             "_make_prefix_store",
@@ -846,11 +846,46 @@ class TestContextConfigExposedCorrectly:
         assert cache_manager_mod.current_runtime_cache_manager() is None
         assert shutdown_calls == [old_cache]
 
-    def test_l2_rebuild_releases_old_lock_before_new_manager(self, monkeypatch, tmp_path):
+    def test_l2_same_identity_rebuild_releases_old_lock(self, monkeypatch, tmp_path):
+        # A same-identity reconfiguration rebuilds the manager: the old one is
+        # retired and releases its L2 disk lock before the new one opens, so the
+        # replacement reclaims a writable L2 on the same directory.
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
+        l2_dir = str(tmp_path / "l2")
+
+        def _ctx(max_entries):
+            return _runtime_context(
+                prefix_cache=True,
+                prefix_cache_l2=True,
+                prefix_cache_l2_dir=l2_dir,
+                prefix_cache_max_entries=max_entries,
+            )
+
+        try:
+            first = cache_manager_mod.get_runtime_cache_manager(_ctx(2), cache_identity="model-a")
+            assert first is not None
+            assert first.stats()["l2"]["writable"] is True
+
+            second = cache_manager_mod.get_runtime_cache_manager(_ctx(7), cache_identity="model-a")
+            assert second is not None
+            assert second is not first
+            assert not first.active  # rebuild retired the old manager...
+            assert second.stats()["l2"]["writable"] is True  # ...and freed the L2 lock
+        finally:
+            cache_manager_mod.shutdown_runtime_cache_manager()
+
+    def test_l2_concurrent_models_sharing_dir_make_second_read_only(self, monkeypatch, tmp_path):
+        # Two distinct models coexist in the registry. If they happen to share an
+        # L2 directory, only the first holds the writable lock; the second serves
+        # read-only L2 (graceful L1-only degradation, never corruption). Hosts
+        # that want writable L2 per model should give each a distinct L2 dir.
+        import dflash_mlx.cache.manager as cache_manager_mod
+
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         context = _runtime_context(
             prefix_cache=True,
             prefix_cache_l2=True,
@@ -859,13 +894,11 @@ class TestContextConfigExposedCorrectly:
 
         try:
             first = cache_manager_mod.get_runtime_cache_manager(context, cache_identity="model-a")
-            assert first is not None
-            assert first.stats()["l2"]["writable"] is True
-
             second = cache_manager_mod.get_runtime_cache_manager(context, cache_identity="model-b")
-            assert second is not None
             assert second is not first
-            assert second.stats()["l2"]["writable"] is True
+            assert first.active and second.active  # both stay loaded
+            assert first.stats()["l2"]["writable"] is True
+            assert second.stats()["l2"]["writable"] is False
         finally:
             cache_manager_mod.shutdown_runtime_cache_manager()
 
@@ -879,8 +912,8 @@ class TestContextConfigExposedCorrectly:
             shutdown_calls.append(self)
             return original_shutdown(self)
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         monkeypatch.setattr(DFlashPrefixCache, "shutdown", tracked_shutdown)
 
         manager = cache_manager_mod.get_runtime_cache_manager(_runtime_context(prefix_cache=True))
@@ -901,20 +934,16 @@ class TestContextConfigExposedCorrectly:
         manager = _manager(BrokenShutdownCache(max_entries=2))
         monkeypatch.setattr(
             cache_manager_mod,
-            "_DFLASH_RUNTIME_CACHE_MANAGER",
-            manager,
+            "_DFLASH_RUNTIME_CACHE_REGISTRY",
+            {None: (("old",), manager)},
         )
-        monkeypatch.setattr(
-            cache_manager_mod,
-            "_DFLASH_RUNTIME_CACHE_CONFIG_KEY",
-            ("old",),
-        )
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
 
         cache_manager_mod.shutdown_runtime_cache_manager()
 
         assert "runtime cache manager shutdown failed: broken close" in capsys.readouterr().err
         assert cache_manager_mod.current_runtime_cache_manager() is None
-        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_MANAGER is manager
+        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_REGISTRY[None][1] is manager
         with pytest.raises(RuntimeError, match="shut down"):
             manager.stats()
 
@@ -926,14 +955,14 @@ class TestContextConfigExposedCorrectly:
                 raise RuntimeError("cannot close")
 
         old_manager = _manager(BrokenShutdownCache(max_entries=2))
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {None: (("old",), old_manager)})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
 
         with pytest.raises(RuntimeError, match="cannot close"):
             cache_manager_mod.get_runtime_cache_manager(_runtime_context(prefix_cache=False))
 
         assert cache_manager_mod.current_runtime_cache_manager() is None
-        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_MANAGER is old_manager
+        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_REGISTRY[None][1] is old_manager
         with pytest.raises(RuntimeError, match="shut down"):
             old_manager.stats()
 
@@ -954,19 +983,19 @@ class TestContextConfigExposedCorrectly:
         old_manager = _manager(BrokenShutdownCache(max_entries=2))
         with pytest.raises(RuntimeError, match="cannot close"):
             old_manager.shutdown()
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(
             cache_manager_mod,
-            "_DFLASH_RUNTIME_CACHE_CONFIG_KEY",
-            cache_manager_mod._prefix_cache_config_key(context),
+            "_DFLASH_RUNTIME_CACHE_REGISTRY",
+            {None: (cache_manager_mod._prefix_cache_config_key(context), old_manager)},
         )
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         monkeypatch.setattr(cache_manager_mod, "_make_prefix_store", make_cache)
 
         with pytest.raises(RuntimeError, match="cannot close"):
             cache_manager_mod.sync_runtime_cache_manager(context)
 
         assert cache_manager_mod.current_runtime_cache_manager() is None
-        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_MANAGER is old_manager
+        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_REGISTRY[None][1] is old_manager
         assert make_calls == []
 
     def test_sync_clears_poisoned_manager_after_successful_retry(self, monkeypatch):
@@ -985,18 +1014,18 @@ class TestContextConfigExposedCorrectly:
         old_manager = _manager(FlakyShutdownCache(max_entries=2))
         with pytest.raises(RuntimeError, match="first close failed"):
             old_manager.shutdown()
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(
             cache_manager_mod,
-            "_DFLASH_RUNTIME_CACHE_CONFIG_KEY",
-            cache_manager_mod._prefix_cache_config_key(context),
+            "_DFLASH_RUNTIME_CACHE_REGISTRY",
+            {None: (cache_manager_mod._prefix_cache_config_key(context), old_manager)},
         )
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
 
         assert cache_manager_mod.sync_runtime_cache_manager(context) is None
 
         assert len(shutdown_calls) == 2
         assert cache_manager_mod.current_runtime_cache_manager() is None
-        assert cache_manager_mod._DFLASH_RUNTIME_CACHE_MANAGER is None
+        assert None not in cache_manager_mod._DFLASH_RUNTIME_CACHE_REGISTRY
 
     def test_chat_template_stable_marker_returns_none_without_converter(self):
         from dflash_mlx.server.prefix_cache_manager import chat_template_stable_marker
@@ -1051,8 +1080,8 @@ class TestContextConfigExposedCorrectly:
     def test_budgets_propagate_to_cache(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         manager = cache_manager_mod.get_runtime_cache_manager(
             _runtime_context(
                 prefix_cache=True,
@@ -1068,8 +1097,8 @@ class TestContextConfigExposedCorrectly:
     def test_l2_frontier_stride_has_disk_pressure_floor(self, monkeypatch, tmp_path):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         manager = cache_manager_mod.get_runtime_cache_manager(
             _runtime_context(
                 prefix_cache=True,
@@ -1085,8 +1114,8 @@ class TestContextConfigExposedCorrectly:
     def test_l2_frontier_stride_never_splits_prefill_chunks(self, monkeypatch, tmp_path):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         manager = cache_manager_mod.get_runtime_cache_manager(
             _runtime_context(
                 prefix_cache=True,
@@ -1102,8 +1131,8 @@ class TestContextConfigExposedCorrectly:
     def test_l2_frontier_stride_rounds_floor_to_chunk_multiple(self, monkeypatch, tmp_path):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         manager = cache_manager_mod.get_runtime_cache_manager(
             _runtime_context(
                 prefix_cache=True,
@@ -1121,8 +1150,8 @@ class TestContextConfigExposedCorrectly:
     ):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         context = _runtime_context(
             prefix_cache=True,
             prefix_cache_l2=True,
@@ -1141,8 +1170,8 @@ class TestContextConfigExposedCorrectly:
     def test_frontier_stride_disabled_without_l2(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         manager = cache_manager_mod.get_runtime_cache_manager(
             _runtime_context(
                 prefix_cache=True,
@@ -1160,8 +1189,8 @@ class TestContextConfigExposedCorrectly:
         def raise_os_error(**_kwargs):
             raise OSError("l2 unavailable")
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         monkeypatch.setattr(cache_manager_mod, "DFlashPrefixL2Cache", raise_os_error)
 
         manager = cache_manager_mod.get_runtime_cache_manager(
@@ -1178,8 +1207,8 @@ class TestContextConfigExposedCorrectly:
         def raise_type_error(**_kwargs):
             raise TypeError("bad l2 constructor")
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         monkeypatch.setattr(cache_manager_mod, "DFlashPrefixL2Cache", raise_type_error)
 
         with pytest.raises(TypeError, match="bad l2 constructor"):
@@ -1239,8 +1268,8 @@ class TestContextConfigExposedCorrectly:
     def test_singleton_rebuilds_when_identity_changes(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
         context = _runtime_context(prefix_cache=True)
 
         first = cache_manager_mod.get_runtime_cache_manager(context, cache_identity="model-a")
