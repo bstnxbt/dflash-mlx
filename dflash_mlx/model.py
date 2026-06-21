@@ -283,6 +283,16 @@ class DFlashDraftModelArgs:
                 data["sliding_window"] = _GEMMA4_DEFAULT_SLIDING_WINDOW
         data["layer_types"] = layer_types
         data["dflash_config"] = dict(data.get("dflash_config") or {})
+        if "block_size" not in data:
+            nested_block_size = data["dflash_config"].get("block_size")
+            if nested_block_size is not None:
+                data["block_size"] = nested_block_size
+        if "rope_theta" not in data:
+            rope_parameters = data.get("rope_parameters") or {}
+            if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+                data["rope_theta"] = rope_parameters["rope_theta"]
+            elif isinstance(data.get("rope_scaling"), dict) and "rope_theta" in data["rope_scaling"]:
+                data["rope_theta"] = data["rope_scaling"]["rope_theta"]
         return cls(
             **{key: value for key, value in data.items() if key in cls.__annotations__}
         )
