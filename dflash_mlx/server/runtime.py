@@ -132,8 +132,13 @@ class ServerRuntime:
         if args.seed is not None:
             mx.random.seed(args.seed)
 
-        stop_token_ids = get_stop_token_ids(tokenizer)
-        eos_token_ids = set(int(token_id) for token_id in tokenizer.eos_token_ids)
+        base_stop_token_ids = get_stop_token_ids(tokenizer)
+        no_eos = bool(getattr(self.model_provider.cli_args, "no_eos", False))
+        stop_token_ids = [] if no_eos else base_stop_token_ids
+        suppress_token_ids = base_stop_token_ids if no_eos else None
+        eos_token_ids = (
+            set() if no_eos else set(int(token_id) for token_id in tokenizer.eos_token_ids)
+        )
         request_start_ns = time.perf_counter_ns()
         prefix_flow = PrefixCacheFlow.for_request(
             model_provider=self.model_provider,
@@ -167,6 +172,7 @@ class ServerRuntime:
             use_chat_template=False,
             quantize_kv_cache=bool(runtime_context.runtime.quantize_kv_cache),
             stop_token_ids=stop_token_ids,
+            suppress_token_ids=suppress_token_ids,
             prompt_tokens_override=prepared.prompt,
             prefix_snapshot=prefix_flow.snapshot,
             snapshot_service=prefix_flow.snapshot_service,

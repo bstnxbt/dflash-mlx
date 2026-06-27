@@ -159,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set chat-template arg enable_thinking=true.",
     )
     parser.add_argument(
+        "--no-eos",
+        action="store_true",
+        default=False,
+        help="Suppress EOS so generation reaches the requested max tokens.",
+    )
+    parser.add_argument(
         "--prompt-cache-size",
         type=int,
         default=10,

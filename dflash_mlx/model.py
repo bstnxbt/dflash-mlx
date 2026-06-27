@@ -264,6 +264,12 @@ class DFlashDraftModelArgs:
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> "DFlashDraftModelArgs":
         data = dict(params)
+        rope_parameters = data.get("rope_parameters") or {}
+        if "rope_theta" not in data and isinstance(rope_parameters, dict):
+            data["rope_theta"] = rope_parameters.get("rope_theta")
+        dflash_config = dict(data.get("dflash_config") or {})
+        if "block_size" not in data:
+            data["block_size"] = dflash_config.get("block_size")
         layer_types = tuple(data.get("layer_types") or ())
         model_type = str(data.get("model_type", ""))
         if (
@@ -282,7 +288,7 @@ class DFlashDraftModelArgs:
             ):
                 data["sliding_window"] = _GEMMA4_DEFAULT_SLIDING_WINDOW
         data["layer_types"] = layer_types
-        data["dflash_config"] = dict(data.get("dflash_config") or {})
+        data["dflash_config"] = dflash_config
         return cls(
             **{key: value for key, value in data.items() if key in cls.__annotations__}
         )
