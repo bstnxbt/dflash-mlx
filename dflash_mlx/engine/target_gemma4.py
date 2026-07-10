@@ -306,7 +306,17 @@ class Gemma4TargetOps:
 
     def supports_model(self, target_model: Any) -> bool:
         model_type = self.model_type(target_model)
-        if model_type not in ("gemma4", "gemma4_text"):
+        # gemma4_unified checkpoints load through mlx-lm's MODEL_REMAPPING
+        # (gemma4_unified -> gemma4), so the resulting module IS the gemma4
+        # text stack this backend already drives; only args.model_type keeps
+        # the unified name. gemma4_unified_text covers a directly loaded
+        # unified text tower resolving via the language_model/config paths.
+        if model_type not in (
+            "gemma4",
+            "gemma4_text",
+            "gemma4_unified",
+            "gemma4_unified_text",
+        ):
             return False
         try:
             inner = self.text_model(target_model)

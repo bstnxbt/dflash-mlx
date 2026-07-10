@@ -731,3 +731,60 @@ def test_draft_args_reject_sliding_attention_without_positive_window():
         assert "sliding_attention draft layers require a positive sliding_window" in str(exc)
     else:
         raise AssertionError("sliding attention without positive window must be rejected")
+
+
+def test_gemma4_unified_target_supports_model():
+    # Current mlx-community Gemma 4 exports declare gemma4_unified; mlx-lm's
+    # MODEL_REMAPPING loads them through the gemma4 module, so the wrapper
+    # this backend receives is structurally identical and only the
+    # args.model_type string differs.
+    target_model = SimpleNamespace(
+        args=SimpleNamespace(
+            model_type="gemma4_unified",
+            layer_types=("sliding_attention", "full_attention"),
+            num_kv_shared_layers=0,
+        ),
+        model=SimpleNamespace(layers=[object()], embed_tokens=object()),
+    )
+    assert Gemma4TargetOps().supports_model(target_model)
+
+
+def test_draft_args_hoist_rope_theta_from_rope_parameters():
+    # transformers >= 5.x drafter exports (z-lab gemma4 drafters) nest rope
+    # fields under rope_parameters with no top-level rope_theta.
+    base = {
+        "model_type": "qwen3",
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "num_attention_heads": 4,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 128,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 4096,
+        "head_dim": 8,
+        "tie_word_embeddings": True,
+        "num_target_layers": 8,
+        "block_size": 16,
+        "layer_types": ["full_attention", "full_attention"],
+    }
+    args = DFlashDraftModelArgs.from_dict(
+        {**base, "rope_parameters": {"rope_theta": 1_000_000, "rope_type": "default"}}
+    )
+    assert args.rope_theta == 1_000_000
+    assert args.rope_scaling is None
+
+    yarn = {"rope_theta": 1_000_000, "rope_type": "yarn", "factor": 4.0}
+    args = DFlashDraftModelArgs.from_dict({**base, "rope_parameters": yarn})
+    assert args.rope_theta == 1_000_000
+    assert args.rope_scaling == yarn
+
+    # explicit top-level values always win over the nested form
+    args = DFlashDraftModelArgs.from_dict(
+        {
+            **base,
+            "rope_theta": 10_000.0,
+            "rope_parameters": {"rope_theta": 1_000_000, "rope_type": "default"},
+        }
+    )
+    assert args.rope_theta == 10_000.0

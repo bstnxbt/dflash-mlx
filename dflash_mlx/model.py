@@ -264,6 +264,18 @@ class DFlashDraftModelArgs:
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> "DFlashDraftModelArgs":
         data = dict(params)
+        # transformers >= 5.x nests rope fields under rope_parameters
+        # (e.g. the z-lab gemma4 drafters); hoist them so the required
+        # top-level rope_theta is satisfied for both conventions.
+        rope_params = data.get("rope_parameters")
+        if isinstance(rope_params, dict):
+            if "rope_theta" not in data and "rope_theta" in rope_params:
+                data["rope_theta"] = rope_params["rope_theta"]
+            if (
+                "rope_scaling" not in data
+                and rope_params.get("rope_type", "default") != "default"
+            ):
+                data["rope_scaling"] = rope_params
         layer_types = tuple(data.get("layer_types") or ())
         model_type = str(data.get("model_type", ""))
         if (
