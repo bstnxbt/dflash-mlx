@@ -35,7 +35,9 @@ from dflash_mlx.diagnostics import TraceConfig
 from dflash_mlx.engine.prefill import snapshot_covers_prefix
 from tests.test_prefix_cache import (
     _make_full_hidden_snapshot,
+    _make_gdn_cache_populated,
     _make_key,
+    _make_kv_cache_populated,
     _make_rotating_cache_populated,
     _make_synthetic_snapshot,
     _make_trimmed_snapshot,
@@ -1564,3 +1566,44 @@ class TestEvictionLruOnHit:
             assert path.stat().st_mtime_ns == 10**9
         finally:
             l2.shutdown()
+
+
+def test_serialize_skips_empty_target_hidden_chunk_when_sink_is_zero():
+    """Regression: draft_sink_size=0 produces an empty sink chunk that
+    mx.save_safetensors refuses to serialize, crashing the L2 writer thread
+    and preventing any snapshot from persisting (issue #54)."""
+    from dflash_mlx.cache.codecs import build_snapshot
+
+    key = _make_key()
+    n = 128  # > sink(0) + window, forcing the sink/tail split
+    snap = build_snapshot(
+        token_ids=list(range(n)),
+        target_cache=[
+            _make_kv_cache_populated(n_tokens=n),
+            _make_gdn_cache_populated(),
+        ],
+        target_hidden=mx.zeros((1, n, 8), dtype=mx.float32),
+        last_logits=mx.zeros((1, 32), dtype=mx.float32),
+        key=key,
+        kind="prefill",
+        draft_sink_size=0,   # reproduces the empty-sink crash
+        draft_window_size=16,
+    )
+
+    arrays, meta_dict = _serialize(snap)
+    meta = json.loads(meta_dict["dflash_meta"])
+    spans = meta["target_hidden_chunk_spans"]
+
+    # No empty arrays in the serialized payload; spans stay in lockstep.
+    assert spans, "expected at least one chunk span"
+    for c in range(len(spans)):
+        arr = arrays[f"target_hidden_{c}"]
+        assert 0 not in arr.shape, f"empty chunk serialized: target_hidden_{c}"
+
+    # Round-trip: deserialize must reconstruct the same (non-empty) chunks.
+    restored = _deserialize(arrays, meta)
+    assert len(restored.target_hidden_chunks) == len(spans)
+    for chunk, span in zip(restored.target_hidden_chunks, spans):
+        assert 0 not in chunk.shape
+        assert span[1] > span[0]
+
