@@ -236,10 +236,24 @@ def _serialize(snapshot: DFlashPrefixSnapshot) -> tuple[dict[str, mx.array], dic
             gdn_array_present.append(mask)
 
     chunk_spans: list[list[int]] = []
-    for c, chunk in enumerate(snapshot.target_hidden_chunks):
-        arrays[f"target_hidden_{c}"] = chunk
-    for span in snapshot.target_hidden_chunk_spans:
+    array_idx = 0
+    for chunk, span in zip(
+        snapshot.target_hidden_chunks, snapshot.target_hidden_chunk_spans
+    ):
+        # Skip zero-length chunks (e.g. an empty sink slice when
+        # draft_sink_size == 0). mx.save_safetensors refuses to serialize
+        # empty arrays, which crashed the L2 writer thread and prevented
+        # any snapshot from persisting. Spans are kept in lockstep with the
+        # arrays so _deserialize (which keys off len(chunk_spans_raw))
+        # rebuilds the same set.
+        if chunk is None or 0 in chunk.shape:
+            continue
+        # Name arrays positionally (0..k) — _deserialize reads
+        # target_hidden_{c} for c in range(len(chunk_spans)), so a skipped
+        # chunk must not leave a hole in the sequence.
+        arrays[f"target_hidden_{array_idx}"] = chunk
         chunk_spans.append([int(span[0]), int(span[1])])
+        array_idx += 1
 
     has_last_logits = snapshot.last_logits is not None
     if has_last_logits:
