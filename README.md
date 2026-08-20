@@ -141,9 +141,7 @@ target-only short-response fast path.
 adapter for text input and function-call tools. Streaming Responses,
 multimodal input, reasoning/text/truncation controls, `tool_choice`,
 `parallel_tool_calls`, and persistent `previous_response_id` / `store`
-behavior are not implemented. Greedy requests use DFlash; requests that need
-sampling, logits processing, or log probabilities use exact target-only AR so
-their OpenAI-compatible generation parameters are honored.
+behavior are not implemented. Sampling and logprobs use exact target-only AR.
 
 Inspect live server metrics:
 
