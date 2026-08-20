@@ -2,11 +2,10 @@
 # Licensed under the Apache License, Version 2.0 - see LICENSE file
 """Tests for hit_kind classification in PrefixCacheLookupResult.
 
-Design: hit_kind is exposed only through the public RuntimeCacheManager.lookup()
-API (which returns PrefixCacheLookupResult).  Internal _l1.lookup() and
-_store.lookup() keep their existing 2-tuple signatures — they do not return
-hit_kind.  The classification is side-effected into _last_hit_kind state that
-the manager reads after the lookup under _state_lock.
+Design: hit_kind is exposed through RuntimeCacheManager.lookup(), which returns
+PrefixCacheLookupResult.  Internal _l1.lookup() and _store.lookup() keep their
+existing 2-tuple signatures; the manager reads the store's last_hit_kind
+property after each lookup under _state_lock.
 """
 
 from __future__ import annotations
@@ -128,7 +127,7 @@ class TestHitKindL1:
         assert mgr.lookup([1, 2, 3, 4, 5], key).hit_kind == "l1_prefix"
 
     def test_probe_does_not_overwrite_last_hit_kind(self):
-        """Internal record=False probes must not change _last_hit_kind."""
+        """Internal record=False probes must not change the recorded hit kind."""
         mgr = _make_manager()
         key = _make_key()
         snap = _make_snapshot([1, 2, 3], key, kind="prefill", with_logits=True)
@@ -136,11 +135,11 @@ class TestHitKindL1:
 
         # Establish a recorded hit.
         mgr.lookup([1, 2, 3], key)
-        assert mgr._store._l1._last_hit_kind == "l1_exact"
+        assert mgr._store._l1.last_hit_kind == "l1_exact"
 
         # Probe (record=False) must not overwrite state.
         mgr._store._l1.lookup([1, 2, 3], key, record=False)
-        assert mgr._store._l1._last_hit_kind == "l1_exact"
+        assert mgr._store._l1.last_hit_kind == "l1_exact"
 
     def test_generation_snapshot_without_logits_reports_prefix_not_exact(self):
         """Generation snapshot without last_logits can only serve as a prefix hit."""

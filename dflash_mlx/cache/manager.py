@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, cast
 
 HitKind = Literal["miss", "l1_exact", "l1_prefix", "l2_exact", "l2_prefix"]
 
@@ -119,7 +119,7 @@ class RuntimeCacheManager:
                 request_id=request_id,
                 require_full_coverage=require_full_coverage,
             )
-            hit_kind: HitKind = self._store._last_hit_kind  # type: ignore[assignment]
+            hit_kind = cast(HitKind, self._store.last_hit_kind)
         return PrefixCacheLookupResult(
             matched_tokens=int(matched_len),
             snapshot=snapshot,
