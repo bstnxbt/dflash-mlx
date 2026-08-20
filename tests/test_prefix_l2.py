@@ -1568,10 +1568,7 @@ class TestEvictionLruOnHit:
             l2.shutdown()
 
 
-def test_serialize_skips_empty_target_hidden_chunk_when_sink_is_zero():
-    """Regression: draft_sink_size=0 produces an empty sink chunk that
-    mx.save_safetensors refuses to serialize, crashing the L2 writer thread
-    and preventing any snapshot from persisting (issue #54)."""
+def test_sink_zero_snapshot_has_only_nonempty_target_hidden_chunks():
     from dflash_mlx.cache.codecs import build_snapshot
 
     key = _make_key()
@@ -1590,20 +1587,20 @@ def test_serialize_skips_empty_target_hidden_chunk_when_sink_is_zero():
         draft_window_size=16,
     )
 
+    assert snap.target_hidden_chunk_spans == ((n - 16, n),)
+    assert len(snap.target_hidden_chunks) == 1
+
     arrays, meta_dict = _serialize(snap)
     meta = json.loads(meta_dict["dflash_meta"])
     spans = meta["target_hidden_chunk_spans"]
 
-    # No empty arrays in the serialized payload; spans stay in lockstep.
-    assert spans, "expected at least one chunk span"
+    assert spans
     for c in range(len(spans)):
         arr = arrays[f"target_hidden_{c}"]
         assert 0 not in arr.shape, f"empty chunk serialized: target_hidden_{c}"
 
-    # Round-trip: deserialize must reconstruct the same (non-empty) chunks.
     restored = _deserialize(arrays, meta)
     assert len(restored.target_hidden_chunks) == len(spans)
     for chunk, span in zip(restored.target_hidden_chunks, spans):
         assert 0 not in chunk.shape
         assert span[1] > span[0]
-

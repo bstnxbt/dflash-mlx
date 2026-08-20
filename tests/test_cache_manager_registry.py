@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 import dflash_mlx.cache.manager as cm
+from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.runtime.config import runtime_config_from_defaults
 from dflash_mlx.runtime.context import build_runtime_context
 
@@ -31,6 +32,18 @@ def _ctx(**overrides):
     )
     values.update(overrides)
     return build_runtime_context(runtime_config_from_defaults(**values))
+
+
+def _key(*, target: str = "target-A", window: int = 1024) -> DFlashPrefixKey:
+    return DFlashPrefixKey(
+        target_model_id=target,
+        draft_model_id="draft-A",
+        capture_layer_ids=(1, 2),
+        draft_sink_size=64,
+        draft_window_size=window,
+        template_hash="a" * 64,
+        prompt_policy_hash="b" * 64,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -71,6 +84,29 @@ def test_same_identity_reconfig_replaces_and_retires_old():
     assert not first.active  # reconfigured -> old retired
     assert second.active
     assert second.stats()["max_entries"] == 7
+
+
+def test_same_model_fingerprint_change_replaces_old_manager():
+    ctx = _ctx()
+    first = cm.get_runtime_cache_manager(ctx, cache_identity=_key(window=1024))
+    second = cm.get_runtime_cache_manager(ctx, cache_identity=_key(window=2048))
+
+    assert first is not None and second is not None
+    assert first is not second
+    assert not first.active
+    assert second.active
+
+
+def test_disabled_same_model_runtime_retires_existing_manager():
+    first = cm.get_runtime_cache_manager(_ctx(), cache_identity=_key())
+
+    disabled = cm.get_runtime_cache_manager(
+        _ctx(prefix_cache=False),
+        cache_identity=_key(),
+    )
+
+    assert disabled is None
+    assert first is not None and not first.active
 
 
 def test_reconfig_of_one_identity_leaves_other_untouched():

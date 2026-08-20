@@ -237,7 +237,7 @@ def get_runtime_cache_manager(
         _clear_runtime_cache_identity(cache_identity)
         return None
     config_key = _prefix_cache_config_key(runtime_context, cache_identity=cache_identity)
-    identity = config_key[0]
+    identity = _runtime_cache_registry_identity(cache_identity)
     trace_config = runtime_context.diagnostics.trace
     with _DFLASH_RUNTIME_CACHE_LOCK:
         entry = _DFLASH_RUNTIME_CACHE_REGISTRY.get(identity)
@@ -270,7 +270,7 @@ def sync_runtime_cache_manager(
         _clear_runtime_cache_identity(cache_identity)
         return None
     config_key = _prefix_cache_config_key(runtime_context, cache_identity=cache_identity)
-    identity = config_key[0]
+    identity = _runtime_cache_registry_identity(cache_identity)
     with _DFLASH_RUNTIME_CACHE_LOCK:
         entry = _DFLASH_RUNTIME_CACHE_REGISTRY.get(identity)
         if entry is None:
@@ -312,17 +312,20 @@ def shutdown_runtime_cache_manager(
     """Retire cache managers.
 
     No args retires *all* registered managers (process/server teardown). Passing
-    a ``runtime_context`` and/or ``cache_identity`` retires just that model's
-    manager, leaving any others serving (oMLX per-engine unload).
+    ``cache_identity`` retires just that model's manager, leaving any others
+    serving (oMLX per-engine unload).
     """
     if runtime_context is None and cache_identity is None:
         _clear_all_runtime_cache_managers(raise_on_error=False)
         return
+    if cache_identity is None:
+        raise ValueError("scoped cache-manager shutdown requires cache_identity")
     _clear_runtime_cache_identity(cache_identity, raise_on_error=False)
 
 
 def _clear_runtime_cache_identity(identity: Any, *, raise_on_error: bool = True) -> None:
     global _DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY
+    identity = _runtime_cache_registry_identity(identity)
     with _DFLASH_RUNTIME_CACHE_LOCK:
         entry = _DFLASH_RUNTIME_CACHE_REGISTRY.get(identity)
         if entry is None:
@@ -342,6 +345,15 @@ def _clear_all_runtime_cache_managers(*, raise_on_error: bool = True) -> None:
             if _shutdown_manager(manager, raise_on_error=raise_on_error):
                 del _DFLASH_RUNTIME_CACHE_REGISTRY[identity]
         _DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY = None
+
+
+def _runtime_cache_registry_identity(cache_identity: Any) -> Any:
+    if isinstance(cache_identity, DFlashPrefixKey):
+        return (
+            cache_identity.target_model_id,
+            cache_identity.draft_model_id,
+        )
+    return cache_identity
 
 
 def _prefix_cache_config_key(

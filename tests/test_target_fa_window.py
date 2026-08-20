@@ -193,7 +193,7 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
         return original_shutdown(self)
 
     class FakeProvider:
-        pass
+        model_key = ("target", None, "draft")
 
     class FakeDraft:
         pass
@@ -208,7 +208,12 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
     monkeypatch.setattr(
         cache_manager_mod,
         "_DFLASH_RUNTIME_CACHE_REGISTRY",
-        {None: (("old",), RuntimeCacheManager(PrefixSnapshotStore(l1=preexisting_cache)))},
+        {
+            ("target", "draft"): (
+                ("old",),
+                RuntimeCacheManager(PrefixSnapshotStore(l1=preexisting_cache)),
+            )
+        },
     )
     monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
     monkeypatch.setattr(DFlashPrefixCache, "shutdown", tracked_shutdown)

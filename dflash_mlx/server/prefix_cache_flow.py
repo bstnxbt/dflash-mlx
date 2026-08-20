@@ -21,6 +21,7 @@ from dflash_mlx.cache.snapshot_service import SnapshotService
 from dflash_mlx.engine.spec_epoch import resolve_full_context_draft_layers
 from dflash_mlx.server.prefix_cache_manager import (
     build_prefix_key,
+    build_runtime_cache_identity,
     chat_template_stable_marker,
 )
 
@@ -124,7 +125,10 @@ class PrefixCacheFlow:
 
         runtime_config = runtime_context.runtime
         if runtime_config.target_fa_window > 0 or not runtime_config.prefix_cache:
-            get_runtime_cache_manager(runtime_context)
+            get_runtime_cache_manager(
+                runtime_context,
+                cache_identity=build_runtime_cache_identity(model_provider),
+            )
             return cls(cache_manager=None)
 
         key = build_prefix_key(model_provider, draft_model, runtime_context)

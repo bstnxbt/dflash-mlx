@@ -10,11 +10,8 @@ from typing import Any
 
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 
-def build_prefix_key(
-    model_provider: Any,
-    draft_model: Any,
-    runtime_context: Any,
-) -> DFlashPrefixKey:
+
+def build_runtime_cache_identity(model_provider: Any) -> tuple[str, str]:
     model_key = getattr(model_provider, "model_key", None)
     if not isinstance(model_key, (list, tuple)) or len(model_key) < 3:
         raise ValueError("model provider is missing a loaded model_key")
@@ -22,6 +19,15 @@ def build_prefix_key(
     draft_id = str(model_key[2]) if model_key[2] is not None else ""
     if not target_id or not draft_id:
         raise ValueError("prefix cache requires loaded target and draft model ids")
+    return target_id, draft_id
+
+
+def build_prefix_key(
+    model_provider: Any,
+    draft_model: Any,
+    runtime_context: Any,
+) -> DFlashPrefixKey:
+    target_id, draft_id = build_runtime_cache_identity(model_provider)
 
     raw_capture_ids = getattr(draft_model, "target_layer_ids", None)
     if raw_capture_ids is None:

@@ -567,7 +567,7 @@ def test_metrics_startup_clears_stale_cache_when_runtime_disables_prefix_cache(m
         return original_shutdown(self)
 
     stale_cache = DFlashPrefixCache()
-    stale_identity = ("target-model", None, "draft-model")
+    stale_identity = ("target-model", "draft-model")
     monkeypatch.setattr(
         cache_manager_mod,
         "_DFLASH_RUNTIME_CACHE_REGISTRY",
