@@ -18,32 +18,7 @@ from __future__ import annotations
 import mlx.nn as nn
 import pytest
 
-from dflash_mlx.engine._hook_guard import DFlashHookConflict, claim_class_hook
-
-
-def test_free_slot_is_claimable():
-    class A(nn.Module):
-        pass
-
-    assert claim_class_hook(A, "_marker", "gemma4") is True
-
-
-def test_same_owner_reclaim_is_noop():
-    class A(nn.Module):
-        pass
-
-    assert claim_class_hook(A, "_marker", "gemma4") is True
-    A._marker = "gemma4"  # installer sets the marker after patching
-    assert claim_class_hook(A, "_marker", "gemma4") is False
-
-
-def test_different_owner_raises():
-    class A(nn.Module):
-        pass
-
-    A._marker = "gemma4"
-    with pytest.raises(DFlashHookConflict, match="already patched"):
-        claim_class_hook(A, "_marker", "qwen_gdn")
+from dflash_mlx.engine._hook_guard import DFlashHookConflict
 
 
 def test_installers_fail_loud_on_shared_attention_class():

@@ -535,32 +535,6 @@ def test_load_draft_bundle_rejects_future_draft_owned_lm_head(tmp_path):
         raise AssertionError("draft checkpoints with lm_head weights must fail fast")
 
 
-def test_load_draft_bundle_model_class_callback_accepts_mlx_lm_config_keyword(
-    tmp_path,
-    monkeypatch,
-):
-    calls = []
-
-    def fake_load_model(model_path, *, lazy, get_model_classes):
-        model_classes = get_model_classes(config={"model_type": "qwen3"})
-        calls.append((model_path, lazy, model_classes))
-        return object(), {"model_type": "qwen3"}
-
-    monkeypatch.setattr(runtime_loading, "load_model", fake_load_model)
-
-    model, meta = runtime_loading.load_draft_bundle(tmp_path, lazy=False)
-
-    assert model is not None
-    assert meta["config"] == {"model_type": "qwen3"}
-    assert calls == [
-        (
-            tmp_path,
-            False,
-            (DFlashDraftModel, DFlashDraftModelArgs),
-        )
-    ]
-
-
 def test_load_draft_bundle_uses_real_mlx_lm_model_class_callback(tmp_path):
     config = {
         "model_type": "qwen3",

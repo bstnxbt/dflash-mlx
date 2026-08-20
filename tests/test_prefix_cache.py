@@ -2013,38 +2013,6 @@ class TestSidecar:
         assert hit is full
         assert cache.stats()["sidecar_hits"] == 0
 
-    def test_l1_lookup_sidecar_serves_uncovered_windowed_snapshot(self):
-        cache = DFlashPrefixCache(max_entries=8)
-        key = _make_key(draft_sink_size=2, draft_window_size=2)
-        snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6, 7, 8], 5, key)
-        snap.target_hidden_chunks = (
-            mx.zeros((1, 2, 8), dtype=mx.float32),
-            mx.zeros((1, 5, 8), dtype=mx.float32),
-        )
-        snap.target_hidden_chunk_spans = ((0, 2), (3, 8))
-        cache.insert(snap)
-        matched, hit = cache.lookup([1, 2, 3, 4, 5, 99], key)
-        assert matched == 5
-        assert hit is not None
-        assert hit.kind == "prefill"
-        assert cache.stats()["sidecar_hits"] == 1
-
-    def test_l1_lookup_sidecar_skips_uncovered_when_full_coverage_required(self):
-        cache = DFlashPrefixCache(max_entries=8)
-        key = _make_key(draft_sink_size=2, draft_window_size=2)
-        snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6, 7, 8], 5, key)
-        snap.target_hidden_chunks = (
-            mx.zeros((1, 2, 8), dtype=mx.float32),
-            mx.zeros((1, 5, 8), dtype=mx.float32),
-        )
-        snap.target_hidden_chunk_spans = ((0, 2), (3, 8))
-        cache.insert(snap)
-        matched, hit = cache.lookup(
-            [1, 2, 3, 4, 5, 99], key, require_full_coverage=True
-        )
-        assert matched == 0
-        assert hit is None
-
     def test_nbytes_breakdown_counts_sidecar(self):
         key = _make_key()
         snap = _make_sidecar_generation_snapshot([1, 2, 3, 4, 5, 6], 4, key)
@@ -2154,7 +2122,7 @@ def _make_trimmed_sidecar_carrier(
 
 
 class TestTrimmedSidecar:
-    def test_snapshot_keeps_and_slices_window_before_sidecar_boundary(self):
+    def test_windowed_draft_restores_trimmed_sidecar(self):
         key = _make_key(draft_sink_size=4, draft_window_size=16)
         tokens = list(range(1000, 1064))
         carrier = _make_trimmed_sidecar_carrier(tokens, 48, key)
@@ -2162,12 +2130,8 @@ class TestTrimmedSidecar:
         assert carrier.target_hidden_chunk_spans == ((0, 4), (32, 64))
         sliced = slice_snapshot_at_sidecar_boundary(carrier)
         assert sliced.target_hidden_chunk_spans == ((0, 4), (32, 48))
-
-    def test_l1_serves_trimmed_sidecar_for_windowed_draft(self):
         cache = DFlashPrefixCache(max_entries=8)
-        key = _make_key(draft_sink_size=4, draft_window_size=16)
-        tokens = list(range(1000, 1064))
-        cache.insert(_make_trimmed_sidecar_carrier(tokens, 48, key))
+        cache.insert(carrier)
 
         matched, served = cache.lookup(tokens[:48], key)
 

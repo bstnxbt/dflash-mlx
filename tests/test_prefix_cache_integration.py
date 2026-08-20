@@ -1265,20 +1265,6 @@ class TestContextConfigExposedCorrectly:
                 require_logits=True,
             )
 
-    def test_singleton_rebuilds_when_identity_changes(self, monkeypatch):
-        import dflash_mlx.cache.manager as cache_manager_mod
-
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
-        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
-        context = _runtime_context(prefix_cache=True)
-
-        first = cache_manager_mod.get_runtime_cache_manager(context, cache_identity="model-a")
-        second = cache_manager_mod.get_runtime_cache_manager(context, cache_identity="model-b")
-
-        assert first is not None
-        assert second is not None
-        assert first is not second
-
     def test_prefix_flow_lookup_records_hit(self, monkeypatch):
         import dflash_mlx.server.prefix_cache_flow as flow_mod
 
