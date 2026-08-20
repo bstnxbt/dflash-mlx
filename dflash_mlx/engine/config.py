@@ -28,16 +28,34 @@ def verify_token_count_for_block(block_len: int, verify_len_cap: int) -> int:
     return max(1, min(int(block_len), int(verify_len_cap)))
 
 
+def draft_capability(draft_model: Any, name: str, default: Any) -> Any:
+    capabilities = getattr(draft_model, "capabilities", None)
+    if capabilities is None:
+        return default
+    return getattr(capabilities, name, default)
+
+
 def resolve_speculative_cycle_config(
     runtime_config: Any,
     draft_model: Any,
     block_tokens: Optional[int],
 ) -> SpeculativeCycleConfig:
     draft_block_size = int(draft_model.block_size)
-    requested_block_tokens = (
-        draft_block_size if block_tokens is None else int(block_tokens)
+    default_block_tokens = int(
+        draft_capability(draft_model, "default_block_tokens", draft_block_size)
+        or draft_block_size
     )
-    effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+    max_block_tokens = int(
+        draft_capability(draft_model, "max_block_tokens", draft_block_size)
+        or draft_block_size
+    )
+    requested_block_tokens = (
+        default_block_tokens if block_tokens is None else int(block_tokens)
+    )
+    effective_block_tokens = max(
+        1,
+        min(requested_block_tokens, draft_block_size, max_block_tokens),
+    )
     return SpeculativeCycleConfig(
         draft_block_size=draft_block_size,
         requested_block_tokens=requested_block_tokens,

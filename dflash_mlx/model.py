@@ -291,7 +291,10 @@ class DFlashDraftModelArgs:
             rope_parameters = data.get("rope_parameters") or {}
             if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
                 data["rope_theta"] = rope_parameters["rope_theta"]
-            elif isinstance(data.get("rope_scaling"), dict) and "rope_theta" in data["rope_scaling"]:
+            elif (
+                isinstance(data.get("rope_scaling"), dict)
+                and "rope_theta" in data["rope_scaling"]
+            ):
                 data["rope_theta"] = data["rope_scaling"]["rope_theta"]
         return cls(
             **{key: value for key, value in data.items() if key in cls.__annotations__}
@@ -321,6 +324,16 @@ class DFlashDraftModelArgs:
         if "sliding_attention" in layer_types and int(self.sliding_window or 0) <= 0:
             raise ValueError("sliding_attention draft layers require a positive sliding_window")
         self.layer_types = layer_types
+
+
+@dataclass(frozen=True)
+class DraftRuntimeCapabilities:
+    default_block_tokens: int
+    max_block_tokens: int
+    supports_copyspec: bool = True
+    supports_ddtree: bool = True
+    supports_early_rollback_launch: bool = True
+
 
 class DFlashAttention(nn.Module):
     def __init__(self, args: DFlashDraftModelArgs, layer_idx: int):
@@ -706,15 +719,13 @@ class DFlashDecoderLayer(nn.Module):
             cache=cache,
         )
 
+
 class DFlashDraftModel(nn.Module):
     def __init__(self, args: DFlashDraftModelArgs):
         super().__init__()
         self.args = args
         self.model_type = "dflash_qwen3"
-        self.layers = [
-            DFlashDecoderLayer(args, layer_idx)
-            for layer_idx in range(args.num_hidden_layers)
-        ]
+        self.layers = self._build_layers(args)
         target_layer_ids = list((args.dflash_config or {}).get("target_layer_ids") or ())
         self.target_layer_ids = target_layer_ids or build_target_layer_ids(
             args.num_target_layers,
@@ -726,6 +737,16 @@ class DFlashDraftModel(nn.Module):
         self.block_size = int(args.block_size)
         self.mask_token_id = int((args.dflash_config or {}).get("mask_token_id", 0) or 0)
         self.embed_scale = 1.0
+        self.capabilities = DraftRuntimeCapabilities(
+            default_block_tokens=self.block_size,
+            max_block_tokens=self.block_size,
+        )
+
+    def _build_layers(self, args: DFlashDraftModelArgs) -> list[nn.Module]:
+        return [
+            DFlashDecoderLayer(args, layer_idx)
+            for layer_idx in range(args.num_hidden_layers)
+        ]
 
     def bind_target_model(self, target_model: Any, *, target_ops: Any) -> None:
         text_model = target_ops.text_model(target_model)

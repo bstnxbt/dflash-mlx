@@ -116,12 +116,16 @@ def _gqa_reshape_sdpa(
             mask=mask,
         )
 
-    use_native_gqa = (q_len_i == 1 and kv_len_i >= 4096) or (
-        q_len_i == 4
-        and (
-            kv_len_i <= 8192
-            or (int(gqa) <= 4 and kv_len_i <= 32768)
-            or (kv_heads_i >= 4 and kv_len_i <= 16384)
+    use_native_gqa = (
+        (q_len_i == 1 and kv_len_i >= 4096)
+        or (q_len_i == 5 and kv_len_i >= 8192)
+        or (
+            q_len_i == 4
+            and (
+                kv_len_i <= 8192
+                or (int(gqa) <= 4 and kv_len_i <= 32768)
+                or (kv_heads_i >= 4 and kv_len_i <= 16384)
+            )
         )
     )
     if use_native_gqa:
