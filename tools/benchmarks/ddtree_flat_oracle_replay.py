@@ -21,7 +21,6 @@ from dflash_mlx.engine.ddtree import (
     draft_block_with_topk,
     flat_tree_path_token_ids,
     follow_verified_tree,
-    pad_flat_tree_paths,
 )
 from dflash_mlx.engine.events import PrefillCompleteEvent
 from dflash_mlx.engine.sampling import (
@@ -305,11 +304,11 @@ def run_request(
 
             paths = flat_tree_path_token_ids(tree, root_token_id=root_token_id)
             pad_token_id = int(getattr(bundle.draft_model, "mask_token_id", root_token_id))
-            rows, path_lengths = pad_flat_tree_paths(
-                paths,
-                pad_token_id=pad_token_id,
-                max_len=block_len,
-            )
+            path_lengths = [len(path) for path in paths]
+            rows = [
+                [*path, *([pad_token_id] * (block_len - len(path)))]
+                for path in paths
+            ]
             verify_start_ns = time.perf_counter_ns()
             posterior_token_ids: list[int] = []
             chunk_size = max(1, int(oracle_batch_size))

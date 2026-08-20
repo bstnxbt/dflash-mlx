@@ -23,7 +23,6 @@ from dflash_mlx.engine.ddtree import (
     flat_tree_path_token_ids,
     flat_tree_positions,
     flat_tree_token_ids,
-    pad_flat_tree_paths,
     restore_cache,
     select_captured,
     select_tree_slots,
@@ -339,26 +338,6 @@ def test_flat_tree_inputs_match_lucebox_tree_contract():
         tree,
         prefix_len=100,
     ).tolist()
-
-
-def test_pad_flat_tree_paths_preserves_lengths():
-    padded, lengths = pad_flat_tree_paths(
-        [[7], [7, 10], [7, 10, 20]],
-        pad_token_id=0,
-        max_len=4,
-    )
-
-    assert padded == [
-        [7, 0, 0, 0],
-        [7, 10, 0, 0],
-        [7, 10, 20, 0],
-    ]
-    assert lengths == [1, 2, 3]
-
-
-def test_pad_flat_tree_paths_rejects_truncation():
-    with pytest.raises(ValueError, match="truncate"):
-        pad_flat_tree_paths([[7, 10]], pad_token_id=0, max_len=1)
 
 
 def test_build_flat_ddtree_handles_empty_budget():

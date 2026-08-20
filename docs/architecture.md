@@ -42,9 +42,9 @@ for small `max_tokens` requests, controlled by `--fastpath-max-tokens` (default
 `0`, disabled), but that is a serving policy after a valid runtime has already
 loaded.
 
-The current DFlash draft class is `DFlashDraftModel`. Target-family behavior is
-owned by `engine.target_ops`; the registered concrete implementations are
-`engine.target_qwen_gdn` and `engine.target_gemma4`.
+Draft checkpoint dispatch selects `DFlashDraftModel` or `DFlash2DraftModel`.
+Target-family behavior is owned by `engine.target_ops`; the registered concrete
+implementations are `engine.target_qwen_gdn` and `engine.target_gemma4`.
 
 Adding another architecture is a real adapter project, not just a new registry
 row. The required seam for more architectures is:
@@ -108,8 +108,9 @@ The server wraps `mlx_lm.server` rather than replacing it.
 9. `cache.snapshot_service.SnapshotService` builds and admits snapshots through
    the runtime cache manager.
 
-The prefix cache is process-local. The runtime cache manager owns the singleton
-lifecycle keyed by relevant runtime config so repeated requests can share state.
+The prefix cache is process-local. Runtime cache managers are registered by
+target/draft model identity; each manager owns the config-keyed lifecycle shared
+by repeated requests for that model pair.
 
 ## Offline Generate Flow
 

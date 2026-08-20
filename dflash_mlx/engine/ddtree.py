@@ -256,27 +256,6 @@ def flat_tree_path_token_ids(
     return paths
 
 
-def pad_flat_tree_paths(
-    paths: list[list[int]],
-    *,
-    pad_token_id: int,
-    max_len: int | None = None,
-) -> tuple[list[list[int]], list[int]]:
-    if not paths:
-        raise ValueError("paths must not be empty")
-    lengths = [len(path) for path in paths]
-    resolved_len = max(lengths) if max_len is None else int(max_len)
-    if resolved_len <= 0:
-        raise ValueError("max_len must be positive")
-    if max(lengths) > resolved_len:
-        raise ValueError("max_len cannot truncate flat tree paths")
-    padded = [
-        list(path) + [int(pad_token_id)] * (resolved_len - len(path))
-        for path in paths
-    ]
-    return padded, lengths
-
-
 def follow_verified_tree(
     tree: FlatDDTree,
     posterior_token_ids: list[int],

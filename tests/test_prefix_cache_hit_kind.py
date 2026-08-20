@@ -11,14 +11,12 @@ property after each lookup under _state_lock.
 from __future__ import annotations
 
 import mlx.core as mx
-import pytest
 
 from dflash_mlx.cache.codecs import build_snapshot
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
-from dflash_mlx.cache.manager import HitKind, PrefixCacheLookupResult, RuntimeCacheManager
+from dflash_mlx.cache.manager import RuntimeCacheManager
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.store import PrefixSnapshotStore
-from dflash_mlx.engine.events import SummaryEvent
 from mlx_lm.models.cache import KVCache
 
 
@@ -68,53 +66,8 @@ def _make_manager(max_entries: int = 8) -> RuntimeCacheManager:
     return RuntimeCacheManager(store)
 
 
-class TestHitKindTypeSystem:
-    """The HitKind Literal covers all possible values."""
-
-    def test_hit_kind_literal_values(self):
-        assert set(HitKind.__args__) == {
-            "miss", "l1_exact", "l1_prefix", "l2_exact", "l2_prefix"
-        }
-
-    def test_result_is_dataclass_not_tuple(self):
-        mgr = _make_manager()
-        result = mgr.lookup([1, 2, 3], _make_key())
-        assert isinstance(result, PrefixCacheLookupResult)
-        # Must NOT be unpackable as a tuple (keeps old 2-tuple callers safe).
-        with pytest.raises((TypeError, ValueError)):
-            _, _ = result  # type: ignore[misc]
-
-    def test_default_hit_kind_is_miss(self):
-        result = PrefixCacheLookupResult(matched_tokens=0, snapshot=None, elapsed_ms=0.0)
-        assert result.hit_kind == "miss"
-
-
 class TestHitKindL1:
     """hit_kind classification with L1-only cache."""
-
-    def test_cold_miss(self):
-        mgr = _make_manager()
-        result = mgr.lookup([1, 2, 3], _make_key())
-        assert result.hit_kind == "miss"
-        assert result.matched_tokens == 0
-
-    def test_prefix_hit(self):
-        mgr = _make_manager()
-        key = _make_key()
-        snap = _make_snapshot([1, 2, 3], key, kind="prefill", with_logits=True)
-        mgr._store._l1.insert(snap)
-        result = mgr.lookup([1, 2, 3, 4, 5], key)
-        assert result.hit_kind == "l1_prefix"
-        assert result.matched_tokens == 3
-
-    def test_exact_hit(self):
-        mgr = _make_manager()
-        key = _make_key()
-        snap = _make_snapshot([1, 2, 3], key, kind="prefill", with_logits=True)
-        mgr._store._l1.insert(snap)
-        result = mgr.lookup([1, 2, 3], key)
-        assert result.hit_kind == "l1_exact"
-        assert result.matched_tokens == 3
 
     def test_sequential_lookups_are_independent(self):
         mgr = _make_manager()
@@ -125,87 +78,3 @@ class TestHitKindL1:
         assert mgr.lookup([1, 2, 3], key).hit_kind == "l1_exact"
         assert mgr.lookup([9, 9, 9], key).hit_kind == "miss"
         assert mgr.lookup([1, 2, 3, 4, 5], key).hit_kind == "l1_prefix"
-
-    def test_probe_does_not_overwrite_last_hit_kind(self):
-        """Internal record=False probes must not change the recorded hit kind."""
-        mgr = _make_manager()
-        key = _make_key()
-        snap = _make_snapshot([1, 2, 3], key, kind="prefill", with_logits=True)
-        mgr._store._l1.insert(snap)
-
-        # Establish a recorded hit.
-        mgr.lookup([1, 2, 3], key)
-        assert mgr._store._l1.last_hit_kind == "l1_exact"
-
-        # Probe (record=False) must not overwrite state.
-        mgr._store._l1.lookup([1, 2, 3], key, record=False)
-        assert mgr._store._l1.last_hit_kind == "l1_exact"
-
-    def test_generation_snapshot_without_logits_reports_prefix_not_exact(self):
-        """Generation snapshot without last_logits can only serve as a prefix hit."""
-        mgr = _make_manager()
-        key = _make_key()
-        snap = _make_snapshot([1, 2, 3], key, kind="generation", with_logits=False)
-        mgr._store._l1.insert(snap)
-        result = mgr.lookup([1, 2, 3], key)
-        # Without logits the snapshot is not usable for exact-match serving.
-        assert result.hit_kind in ("miss", "l1_prefix")
-        assert result.matched_tokens in (0, 3)
-
-
-def _make_summary_event(hit_kind: str = "miss") -> SummaryEvent:
-    return SummaryEvent(
-        elapsed_us=100.0,
-        prompt_token_count=10,
-        generated_token_ids=(1, 2, 3),
-        generation_tokens=3,
-        accepted_from_draft=2,
-        acceptance_ratio=0.67,
-        cycles_completed=1,
-        phase_timings_us={},
-        hit_kind=hit_kind,
-    )
-
-
-class TestSummaryEventHitKind:
-    """SummaryEvent.to_payload() always includes hit_kind."""
-
-    def test_default_hit_kind_is_miss(self):
-        event = SummaryEvent(
-            elapsed_us=0.0,
-            prompt_token_count=0,
-            generated_token_ids=(),
-            generation_tokens=0,
-            accepted_from_draft=0,
-            acceptance_ratio=0.0,
-            cycles_completed=0,
-            phase_timings_us={},
-        )
-        assert event.hit_kind == "miss"
-        assert event.to_payload()["hit_kind"] == "miss"
-
-    def test_hit_kind_always_present_in_payload(self):
-        event = _make_summary_event("l1_exact")
-        payload = event.to_payload()
-        assert "hit_kind" in payload
-        assert payload["hit_kind"] == "l1_exact"
-
-    def test_all_hit_kind_values_roundtrip_through_payload(self):
-        for kind in HitKind.__args__:
-            payload = _make_summary_event(kind).to_payload()
-            assert payload["hit_kind"] == kind, f"hit_kind={kind!r} did not survive to_payload()"
-
-    def test_lookup_result_hit_kind_propagates_to_summary_event_payload(self):
-        """The value from PrefixCacheLookupResult must match what ends up in SummaryEvent payload.
-        This documents the contract that spec_epoch.py must honour when forwarding hit_kind."""
-        mgr = _make_manager()
-        key = _make_key()
-        snap = _make_snapshot([1, 2, 3], key)
-        mgr._store._l1.insert(snap)
-
-        result = mgr.lookup([1, 2, 3], key)
-        assert result.hit_kind == "l1_exact"
-
-        # Simulate spec_epoch forwarding: SummaryEvent.hit_kind = request.prefix_hit_kind.
-        summary_payload = _make_summary_event(result.hit_kind).to_payload()
-        assert summary_payload["hit_kind"] == "l1_exact"

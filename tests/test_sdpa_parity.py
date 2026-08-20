@@ -215,78 +215,31 @@ def test_qwen_gqa_large_kv_routes_match_native(
     )
 
 
-def _fake_route_array(queries: mx.array) -> mx.array:
-    return mx.zeros(queries.shape, dtype=queries.dtype)
-
-
-def test_qwen_hk2_q16_mid_kv_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "kv_len,expected_route,route_name",
+    [
+        (8192, "grouped", "grouped_gqa_sdpa"),
+        (16384, "async", "async_per_head_gqa_sdpa"),
+        (65536, "per_head", "per_head_gqa_sdpa"),
+    ],
+)
+def test_qwen_hk2_q16_long_context_route_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_len: int,
+    expected_route: str,
+    route_name: str,
+) -> None:
     calls: list[str] = []
 
-    def _async(queries, keys, values, *, scale, mask, gqa):
-        del keys, values, scale, mask, gqa
-        calls.append("async")
-        return _fake_route_array(queries)
+    def _route(queries, *_args, **_kwargs):
+        calls.append(expected_route)
+        return mx.zeros(queries.shape, dtype=queries.dtype)
 
-    def _unexpected(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("mid-KV hk=2 q=16 must use async route")
-
-    monkeypatch.setattr(qwen_gdn, "async_per_head_gqa_sdpa", _async)
-    monkeypatch.setattr(qwen_gdn, "per_head_gqa_sdpa", _unexpected)
-
+    monkeypatch.setattr(qwen_gdn, route_name, _route)
     q = mx.zeros((1, 16, 16, 256), dtype=mx.bfloat16)
-    k = mx.zeros((1, 2, 16384, 256), dtype=mx.bfloat16)
-    v = mx.zeros((1, 2, 16384, 256), dtype=mx.bfloat16)
-    out = _gqa_reshape_sdpa(q, k, v, cache=None, scale=1.0, mask="causal")
-    mx.eval(out)
+    k = mx.zeros((1, 2, kv_len, 256), dtype=mx.bfloat16)
+    v = mx.zeros((1, 2, kv_len, 256), dtype=mx.bfloat16)
 
-    assert calls == ["async"]
+    mx.eval(_gqa_reshape_sdpa(q, k, v, cache=None, scale=1.0, mask="causal"))
 
-
-def test_qwen_hk2_q16_short_kv_uses_grouped(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[str] = []
-
-    def _grouped(queries, keys, values, *, cache, scale, mask):
-        del keys, values, cache, scale, mask
-        calls.append("grouped")
-        return _fake_route_array(queries)
-
-    def _unexpected(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("short-KV hk=2 q=16 must stay on grouped route")
-
-    monkeypatch.setattr(qwen_gdn, "grouped_gqa_sdpa", _grouped)
-    monkeypatch.setattr(qwen_gdn, "async_per_head_gqa_sdpa", _unexpected)
-    monkeypatch.setattr(qwen_gdn, "per_head_gqa_sdpa", _unexpected)
-
-    q = mx.zeros((1, 16, 16, 256), dtype=mx.bfloat16)
-    k = mx.zeros((1, 2, 8192, 256), dtype=mx.bfloat16)
-    v = mx.zeros((1, 2, 8192, 256), dtype=mx.bfloat16)
-    out = _gqa_reshape_sdpa(q, k, v, cache=None, scale=1.0, mask="causal")
-    mx.eval(out)
-
-    assert calls == ["grouped"]
-
-
-def test_qwen_hk2_q16_long_kv_uses_per_head(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[str] = []
-
-    def _per_head(queries, keys, values, *, scale, mask, gqa):
-        del keys, values, scale, mask, gqa
-        calls.append("per_head")
-        return _fake_route_array(queries)
-
-    def _unexpected(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("long-KV hk=2 q=16 must use per-head route")
-
-    monkeypatch.setattr(qwen_gdn, "per_head_gqa_sdpa", _per_head)
-    monkeypatch.setattr(qwen_gdn, "async_per_head_gqa_sdpa", _unexpected)
-
-    q = mx.zeros((1, 16, 16, 256), dtype=mx.bfloat16)
-    k = mx.zeros((1, 2, 65536, 256), dtype=mx.bfloat16)
-    v = mx.zeros((1, 2, 65536, 256), dtype=mx.bfloat16)
-    out = _gqa_reshape_sdpa(q, k, v, cache=None, scale=1.0, mask="causal")
-    mx.eval(out)
-
-    assert calls == ["per_head"]
+    assert calls == [expected_route]

@@ -2,34 +2,20 @@
 # Licensed under the Apache License, Version 2.0 - see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
 
-"""Registry semantics for the runtime cache manager.
-
-Two DFlash models loaded in one process (e.g. an embedding host's engine
-pool) must each keep their own prefix-cache manager alive concurrently.
-Previously a single process-global slot meant loading the second model
-retired the first's cache. These tests pin the registry contract:
-
-  * distinct cache identities coexist (neither retired),
-  * the same identity + same config returns the same manager,
-  * the same identity reconfigured replaces (and retires) the old one,
-  * shutdown can target one identity or clear all.
-"""
-from __future__ import annotations
-
 import pytest
 
-import dflash_mlx.cache.manager as cm
+import dflash_mlx.cache.manager as cache_managers
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.runtime.config import runtime_config_from_defaults
 from dflash_mlx.runtime.context import build_runtime_context
 
 
-def _ctx(**overrides):
-    values = dict(
-        prefix_cache=True,
-        prefix_cache_l2=False,
-        prefix_cache_l2_dir="/tmp/dflash-prefix-l2-registry-test",
-    )
+def _context(**overrides):
+    values = {
+        "prefix_cache": True,
+        "prefix_cache_l2": False,
+        "prefix_cache_l2_dir": "/tmp/dflash-prefix-l2-registry-test",
+    }
     values.update(overrides)
     return build_runtime_context(runtime_config_from_defaults(**values))
 
@@ -48,104 +34,92 @@ def _key(*, target: str = "target-A", window: int = 1024) -> DFlashPrefixKey:
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    # Start and end each test with an empty registry so order can't leak state.
-    cm.shutdown_runtime_cache_manager()
+    cache_managers.shutdown_runtime_cache_manager()
     yield
-    cm.shutdown_runtime_cache_manager()
+    cache_managers.shutdown_runtime_cache_manager()
 
 
-def test_distinct_identities_coexist():
-    ctx = _ctx()
-    mgr_a = cm.get_runtime_cache_manager(ctx, cache_identity="model-A")
-    mgr_b = cm.get_runtime_cache_manager(ctx, cache_identity="model-B")
-
-    assert mgr_a is not None and mgr_b is not None
-    assert mgr_a is not mgr_b
-    # The crux of #1892: loading B must NOT retire A.
-    assert mgr_a.active
-    assert mgr_b.active
-
-
-def test_same_identity_same_config_returns_same_manager():
-    ctx = _ctx()
-    first = cm.get_runtime_cache_manager(ctx, cache_identity="model-A")
-    second = cm.get_runtime_cache_manager(ctx, cache_identity="model-A")
-    assert first is second
-
-
-def test_same_identity_reconfig_replaces_and_retires_old():
-    first = cm.get_runtime_cache_manager(
-        _ctx(prefix_cache_max_entries=2), cache_identity="model-A"
+def test_distinct_model_managers_coexist_and_resolve_independently():
+    context = _context()
+    first = cache_managers.get_runtime_cache_manager(
+        context, cache_identity="model-A"
     )
-    second = cm.get_runtime_cache_manager(
-        _ctx(prefix_cache_max_entries=7), cache_identity="model-A"
+    second = cache_managers.get_runtime_cache_manager(
+        context, cache_identity="model-B"
     )
-    assert first is not second
-    assert not first.active  # reconfigured -> old retired
-    assert second.active
-    assert second.stats()["max_entries"] == 7
+
+    assert first is not None and second is not None and first is not second
+    assert first.active and second.active
+    assert (
+        cache_managers.sync_runtime_cache_manager(
+            context, cache_identity="model-A"
+        )
+        is first
+    )
+    assert (
+        cache_managers.sync_runtime_cache_manager(
+            context, cache_identity="model-B"
+        )
+        is second
+    )
 
 
-def test_same_model_fingerprint_change_replaces_old_manager():
-    ctx = _ctx()
-    first = cm.get_runtime_cache_manager(ctx, cache_identity=_key(window=1024))
-    second = cm.get_runtime_cache_manager(ctx, cache_identity=_key(window=2048))
+def test_same_model_reuses_or_replaces_its_manager_when_config_changes():
+    context = _context(prefix_cache_max_entries=2)
+    first = cache_managers.get_runtime_cache_manager(
+        context, cache_identity=_key(window=1024)
+    )
+    assert (
+        cache_managers.get_runtime_cache_manager(
+            context, cache_identity=_key(window=1024)
+        )
+        is first
+    )
 
-    assert first is not None and second is not None
-    assert first is not second
-    assert not first.active
-    assert second.active
+    replacement = cache_managers.get_runtime_cache_manager(
+        _context(prefix_cache_max_entries=7),
+        cache_identity=_key(window=2048),
+    )
+
+    assert first is not None and replacement is not None
+    assert replacement is not first
+    assert not first.active and replacement.active
+    assert replacement.stats()["max_entries"] == 7
 
 
-def test_disabled_same_model_runtime_retires_existing_manager():
-    first = cm.get_runtime_cache_manager(_ctx(), cache_identity=_key())
+def test_disabling_one_model_retires_only_its_manager():
+    context = _context()
+    first = cache_managers.get_runtime_cache_manager(
+        context, cache_identity=_key(target="target-A")
+    )
+    second = cache_managers.get_runtime_cache_manager(
+        context, cache_identity=_key(target="target-B")
+    )
 
-    disabled = cm.get_runtime_cache_manager(
-        _ctx(prefix_cache=False),
-        cache_identity=_key(),
+    disabled = cache_managers.get_runtime_cache_manager(
+        _context(prefix_cache=False),
+        cache_identity=_key(target="target-A"),
     )
 
     assert disabled is None
     assert first is not None and not first.active
+    assert second is not None and second.active
 
 
-def test_reconfig_of_one_identity_leaves_other_untouched():
-    ctx = _ctx()
-    mgr_a = cm.get_runtime_cache_manager(ctx, cache_identity="model-A")
-    mgr_b = cm.get_runtime_cache_manager(ctx, cache_identity="model-B")
-    # Reconfigure only A.
-    mgr_a2 = cm.get_runtime_cache_manager(
-        _ctx(prefix_cache_max_entries=9), cache_identity="model-A"
+def test_scoped_and_global_shutdown_retire_the_expected_managers():
+    context = _context()
+    first = cache_managers.get_runtime_cache_manager(
+        context, cache_identity="model-A"
     )
-    assert mgr_a2 is not mgr_a
-    assert not mgr_a.active
-    assert mgr_a2.active
-    assert mgr_b.active  # B is unaffected
+    second = cache_managers.get_runtime_cache_manager(
+        context, cache_identity="model-B"
+    )
 
+    cache_managers.shutdown_runtime_cache_manager(
+        context, cache_identity="model-A"
+    )
+    assert first is not None and not first.active
+    assert second is not None and second.active
 
-def test_sync_resolves_per_identity():
-    ctx = _ctx()
-    mgr_a = cm.get_runtime_cache_manager(ctx, cache_identity="model-A")
-    mgr_b = cm.get_runtime_cache_manager(ctx, cache_identity="model-B")
-    assert cm.sync_runtime_cache_manager(ctx, cache_identity="model-A") is mgr_a
-    assert cm.sync_runtime_cache_manager(ctx, cache_identity="model-B") is mgr_b
-
-
-def test_keyed_shutdown_only_retires_that_identity():
-    ctx = _ctx()
-    mgr_a = cm.get_runtime_cache_manager(ctx, cache_identity="model-A")
-    mgr_b = cm.get_runtime_cache_manager(ctx, cache_identity="model-B")
-    cm.shutdown_runtime_cache_manager(ctx, cache_identity="model-A")
-    assert not mgr_a.active
-    assert mgr_b.active  # B survives A's unload
-    # A's slot is gone; B is still resolvable.
-    assert cm.sync_runtime_cache_manager(ctx, cache_identity="model-B") is mgr_b
-
-
-def test_shutdown_all_retires_everything():
-    ctx = _ctx()
-    mgr_a = cm.get_runtime_cache_manager(ctx, cache_identity="model-A")
-    mgr_b = cm.get_runtime_cache_manager(ctx, cache_identity="model-B")
-    cm.shutdown_runtime_cache_manager()  # no args == teardown all
-    assert not mgr_a.active
-    assert not mgr_b.active
+    cache_managers.shutdown_runtime_cache_manager()
+    assert not second.active

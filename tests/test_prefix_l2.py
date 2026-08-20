@@ -1572,7 +1572,7 @@ def test_sink_zero_snapshot_has_only_nonempty_target_hidden_chunks():
     from dflash_mlx.cache.codecs import build_snapshot
 
     key = _make_key()
-    n = 128  # > sink(0) + window, forcing the sink/tail split
+    n = 128
     snap = build_snapshot(
         token_ids=list(range(n)),
         target_cache=[
@@ -1583,24 +1583,16 @@ def test_sink_zero_snapshot_has_only_nonempty_target_hidden_chunks():
         last_logits=mx.zeros((1, 32), dtype=mx.float32),
         key=key,
         kind="prefill",
-        draft_sink_size=0,   # reproduces the empty-sink crash
+        draft_sink_size=0,
         draft_window_size=16,
     )
 
     assert snap.target_hidden_chunk_spans == ((n - 16, n),)
-    assert len(snap.target_hidden_chunks) == 1
-
     arrays, meta_dict = _serialize(snap)
     meta = json.loads(meta_dict["dflash_meta"])
-    spans = meta["target_hidden_chunk_spans"]
-
-    assert spans
-    for c in range(len(spans)):
-        arr = arrays[f"target_hidden_{c}"]
-        assert 0 not in arr.shape, f"empty chunk serialized: target_hidden_{c}"
-
     restored = _deserialize(arrays, meta)
-    assert len(restored.target_hidden_chunks) == len(spans)
-    for chunk, span in zip(restored.target_hidden_chunks, spans):
-        assert 0 not in chunk.shape
-        assert span[1] > span[0]
+
+    assert meta["target_hidden_chunk_spans"] == [[n - 16, n]]
+    assert arrays["target_hidden_0"].size > 0
+    assert restored.target_hidden_chunk_spans == snap.target_hidden_chunk_spans
+    assert restored.target_hidden_chunks[0].size > 0
