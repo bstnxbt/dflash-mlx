@@ -94,19 +94,33 @@ def test_responses_metadata_is_ignored():
 
 
 def test_responses_sampling_fields_passthrough():
+    fields = {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "top_k": 12,
+        "min_p": 0.05,
+        "xtc_probability": 0.1,
+        "xtc_threshold": 0.2,
+        "logit_bias": {"42": 1.5},
+        "repetition_penalty": 1.1,
+        "repetition_context_size": 32,
+        "presence_penalty": 0.3,
+        "presence_context_size": 48,
+        "frequency_penalty": 0.4,
+        "frequency_context_size": 64,
+        "logprobs": True,
+        "top_logprobs": 4,
+        "stop": ["END"],
+    }
     chat = responses_to_chat_body(
         {
             "model": "target",
             "input": "hello",
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "stop": ["END"],
+            **fields,
         }
     )
 
-    assert chat["temperature"] == 0.2
-    assert chat["top_p"] == 0.9
-    assert chat["stop"] == ["END"]
+    assert {key: chat[key] for key in fields} == fields
 
 
 def test_responses_function_tools_map_to_chat_tools():

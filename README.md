@@ -133,7 +133,7 @@ inside model tool spans; malformed or undeclared tool calls fail at the server
 boundary instead of leaking raw XML/JSON as assistant content. Chat Completions
 accepts `tool_choice: "auto"` and `tool_choice: "none"`; function-specific
 `tool_choice` and `parallel_tool_calls: false` are rejected because the server
-does not implement serial tool enforcement. DFlash handles every request by
+does not implement serial tool enforcement. Greedy requests use DFlash by
 default; pass a positive `--fastpath-max-tokens` value to opt into the
 target-only short-response fast path.
 
@@ -141,7 +141,9 @@ target-only short-response fast path.
 adapter for text input and function-call tools. Streaming Responses,
 multimodal input, reasoning/text/truncation controls, `tool_choice`,
 `parallel_tool_calls`, and persistent `previous_response_id` / `store`
-behavior are not implemented.
+behavior are not implemented. Greedy requests use DFlash; requests that need
+sampling, logits processing, or log probabilities use exact target-only AR so
+their OpenAI-compatible generation parameters are honored.
 
 Inspect live server metrics:
 

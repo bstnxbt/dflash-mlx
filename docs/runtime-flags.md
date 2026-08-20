@@ -55,6 +55,11 @@ Generation defaults:
 | `--enable-thinking` | set chat-template arg `enable_thinking=true`; default follows tokenizer/model template |
 | `--chat-template-args JSON` | JSON args for template rendering |
 
+Greedy requests (`temperature=0`) use DFlash speculative decoding. Requests
+that need stochastic sampling or logits processing use exact target-only AR,
+so `temperature`, `top_p`, `top_k`, `min_p`, penalties, XTC, and logprobs keep
+the same semantics as `mlx_lm` instead of being silently ignored.
+
 DFlash runtime:
 
 | Flag | Meaning |

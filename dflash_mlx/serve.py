@@ -63,6 +63,30 @@ from dflash_mlx.server.tool_calls import (
 def _read_project_version() -> str:
     return _DFLASH_VERSION
 
+
+def _target_only_api_reason(args: object) -> str | None:
+    sampling = getattr(args, "sampling", None)
+    temperature = float(getattr(sampling, "temperature", 0.0) or 0.0)
+    if temperature > 0.0:
+        return f"temperature={temperature:g}"
+    if float(getattr(sampling, "xtc_probability", 0.0) or 0.0) > 0.0:
+        return "xtc_probability"
+
+    logits = getattr(args, "logits", None)
+    if getattr(logits, "logit_bias", None):
+        return "logit_bias"
+    for field in ("repetition_penalty", "presence_penalty", "frequency_penalty"):
+        if float(getattr(logits, field, 0.0) or 0.0) != 0.0:
+            return field
+
+    if bool(getattr(args, "logprobs", False)):
+        return "logprobs"
+    top_logprobs = getattr(args, "top_logprobs", -1)
+    if top_logprobs is not None and int(top_logprobs) >= 0:
+        return "top_logprobs"
+    return None
+
+
 class DFlashResponseGenerator(mlx_server.ResponseGenerator):
     def __init__(self, model_provider, prompt_cache, server_runtime: ServerRuntime):
         super().__init__(model_provider, prompt_cache)
@@ -187,11 +211,24 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
             fastpath_max_tokens = int(
                 getattr(self.model_provider.cli_args, "fastpath_max_tokens", 0) or 0
             )
+            target_only_reason = _target_only_api_reason(args)
+            use_fastpath = (
+                fastpath_max_tokens > 0 and args.max_tokens <= fastpath_max_tokens
+            )
 
-            if fastpath_max_tokens > 0 and args.max_tokens <= fastpath_max_tokens:
+            if target_only_reason is not None or use_fastpath:
+                mode_used = (
+                    "ar_sampling" if target_only_reason is not None else "ar_fastpath"
+                )
+                if target_only_reason is not None:
+                    message = f"exact target AR | {target_only_reason}"
+                else:
+                    message = (
+                        f"fast-path AR | max_tokens={args.max_tokens} "
+                        f"threshold={fastpath_max_tokens}"
+                    )
                 sys.stderr.write(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] fast-path AR | "
-                    f"max_tokens={args.max_tokens} threshold={fastpath_max_tokens}\n"
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] {message}\n"
                 )
                 sys.stderr.flush()
                 saved_draft_model = self.model_provider.draft_model
@@ -199,7 +236,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 completed = False
                 self.server_runtime.start_target_only_request(
                     request_id=request_id,
-                    mode_used="ar_fastpath",
+                    mode_used=mode_used,
                     max_tokens=int(args.max_tokens),
                 )
                 try:
@@ -213,7 +250,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                         wall_ms = (time.perf_counter_ns() - wall_t0) / 1e6
                         self.server_runtime.record_target_only_request(
                             request_id=request_id,
-                            mode_used="ar_fastpath",
+                            mode_used=mode_used,
                             wall_ms=wall_ms,
                             max_tokens=int(args.max_tokens),
                         )
