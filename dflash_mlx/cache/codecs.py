@@ -81,6 +81,7 @@ def _build_target_hidden_chunks(
     draft_window_size: int = 1024,
     allow_full_attention_context: bool = False,
     clone: bool = True,
+    cover_boundary: int = 0,
 ) -> tuple[tuple[mx.array, ...], tuple[tuple[int, int], ...], int]:
     grab = _clone_array if clone else (lambda a: a)
     total_len = int(target_hidden.shape[1])
@@ -99,14 +100,22 @@ def _build_target_hidden_chunks(
         full = grab(_target_hidden_slice(target_hidden, 0, total_len))
         assert full is not None
         return (full,), ((0, total_len),), total_len
+    tail_start = total_len - window
+    if cover_boundary > 0:
+        tail_start = min(tail_start, max(0, int(cover_boundary) - window))
+    if tail_start <= sink:
+        full = grab(_target_hidden_slice(target_hidden, 0, total_len))
+        assert full is not None
+        return (full,), ((0, total_len),), total_len
+    tail_chunk = grab(_target_hidden_slice(target_hidden, tail_start, total_len))
+    assert tail_chunk is not None
+    if sink == 0:
+        return (tail_chunk,), ((tail_start, total_len),), total_len
     sink_chunk = grab(_target_hidden_slice(target_hidden, 0, sink))
-    tail_chunk = grab(
-        _target_hidden_slice(target_hidden, total_len - window, total_len)
-    )
-    assert sink_chunk is not None and tail_chunk is not None
+    assert sink_chunk is not None
     return (
         (sink_chunk, tail_chunk),
-        ((0, sink), (total_len - window, total_len)),
+        ((0, sink), (tail_start, total_len)),
         total_len,
     )
 
@@ -125,8 +134,49 @@ def capture_gdn_sidecar(
         for entry in target_cache
     )
 
+
+def snapshot_covers_sidecar_context(
+    snapshot: DFlashPrefixSnapshot,
+    boundary: int,
+    *,
+    require_full_coverage: bool,
+) -> bool:
+    boundary = int(boundary)
+    if require_full_coverage:
+        return snapshot_covers_prefix(snapshot, boundary)
+
+    spans = tuple(snapshot.target_hidden_chunk_spans)
+    sink_end = min(boundary, max(0, int(snapshot.key.draft_sink_size)))
+    if sink_end > 0 and not _spans_cover_interval(spans, 0, sink_end):
+        return False
+    window = max(1, int(snapshot.key.draft_window_size))
+    tail_start = max(sink_end, boundary - window)
+    return _spans_cover_interval(spans, tail_start, boundary)
+
+
+def _spans_cover_interval(
+    spans: tuple[tuple[int, int], ...],
+    start: int,
+    end: int,
+) -> bool:
+    covered = int(start)
+    for span_start, span_end in spans:
+        span_start = int(span_start)
+        span_end = int(span_end)
+        if span_end <= covered:
+            continue
+        if span_start > covered:
+            return False
+        covered = max(covered, span_end)
+        if covered >= int(end):
+            return True
+    return covered >= int(end)
+
+
 def slice_snapshot_at_sidecar_boundary(
     snapshot: DFlashPrefixSnapshot,
+    *,
+    require_full_coverage: bool = False,
 ) -> DFlashPrefixSnapshot:
     boundary = int(snapshot.sidecar_boundary)
     if not 0 < boundary < snapshot.prefix_len:
@@ -135,9 +185,13 @@ def slice_snapshot_at_sidecar_boundary(
         )
     if snapshot.sidecar_gdn_states is None or snapshot.sidecar_last_logits is None:
         raise ValueError("Snapshot has a sidecar boundary but no sidecar states")
-    if not snapshot_covers_prefix(snapshot, boundary):
+    if not snapshot_covers_sidecar_context(
+        snapshot,
+        boundary,
+        require_full_coverage=require_full_coverage,
+    ):
         raise ValueError(
-            f"Snapshot feature spans do not cover sidecar boundary {boundary}"
+            f"Snapshot feature spans do not cover sidecar context at {boundary}"
         )
     fa: list[Optional[FAState]] = []
     for layer_idx, state in enumerate(snapshot.fa_states):
@@ -379,6 +433,7 @@ def build_snapshot(
         draft_window_size=draft_window_size,
         allow_full_attention_context=allow_full_attention_context,
         clone=not adopt_cache_arrays,
+        cover_boundary=sidecar_boundary,
     )
     cloned_logits = (
         last_logits

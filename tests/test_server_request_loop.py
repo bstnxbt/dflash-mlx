@@ -284,7 +284,9 @@ def test_consume_dflash_events_updates_live_cycle_metrics_before_summary(monkeyp
 
 
 def test_consume_dflash_events_ignores_snapshot_publication_metadata():
-    prefix_flow = SimpleNamespace(lookup_ms=0.1, hit_tokens=2, insert_ms=0.5)
+    prefix_flow = SimpleNamespace(
+        lookup_ms=0.1, hit_tokens=2, insert_ms=0.5, cache_manager=None
+    )
     rqueue = SimpleQueue()
     events = ClosableEvents(
         [
@@ -383,6 +385,7 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
         snapshot_service=object(),
         stable_prefix_len=3,
         cache_active=True,
+        cache_manager=None,
         publish_generation_snapshot=True,
         insert_ms=0.0,
         prefix_cache_memory_bytes=lambda: None,
@@ -487,6 +490,7 @@ def test_memory_waterfall_events_are_enriched_with_prefix_cache_memory():
         lookup_ms = 0.0
         hit_tokens = 0
         insert_ms = 0.0
+        cache_manager = None
 
         def prefix_cache_memory_bytes(self):
             return {

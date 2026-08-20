@@ -567,12 +567,15 @@ def test_metrics_startup_clears_stale_cache_when_runtime_disables_prefix_cache(m
         return original_shutdown(self)
 
     stale_cache = DFlashPrefixCache()
+    stale_identity = ("target-model", "draft-model")
     monkeypatch.setattr(
         cache_manager_mod,
-        "_DFLASH_RUNTIME_CACHE_MANAGER",
-        RuntimeCacheManager(PrefixSnapshotStore(l1=stale_cache)),
+        "_DFLASH_RUNTIME_CACHE_REGISTRY",
+        {stale_identity: (("old",), RuntimeCacheManager(PrefixSnapshotStore(l1=stale_cache)))},
     )
-    monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
+    monkeypatch.setattr(
+        cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", stale_identity
+    )
     monkeypatch.setattr(DFlashPrefixCache, "shutdown", tracked_shutdown)
     monkeypatch.setattr(
         metrics_mod,
@@ -617,8 +620,8 @@ def test_metrics_startup_preserves_request_cache_identity(monkeypatch):
         ),
     )
     cache_identity = build_prefix_key(model_provider, draft_model, runtime_context)
-    monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
-    monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+    monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_REGISTRY", {})
+    monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CURRENT_IDENTITY", None)
     existing = cache_manager_mod.get_runtime_cache_manager(
         runtime_context,
         cache_identity=cache_identity,

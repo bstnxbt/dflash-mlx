@@ -24,7 +24,6 @@ from dflash_mlx.engine.events import (
     SummaryEvent,
     TokenEvent,
 )
-from dflash_mlx.cache.manager import current_runtime_cache_manager
 from dflash_mlx.observability.memory import process_memory_snapshot
 from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 from dflash_mlx.server.metrics import record_cycle_diagnostic, update_live_request
@@ -118,7 +117,11 @@ def consume_dflash_events(
                 fields=memory_start,
             )
 
-    cache_manager = current_runtime_cache_manager()
+    # Use the manager resolved for THIS request rather than the process-wide
+    # "current" one: with several models registered, the global current can
+    # point at a different model when requests interleave. prefix_flow carries
+    # the right model's manager (or None when the cache is off for it).
+    cache_manager = prefix_flow.cache_manager if prefix_flow is not None else None
     if cache_manager is not None:
         cache_manager.begin_request()
     try:

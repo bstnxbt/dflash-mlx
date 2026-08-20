@@ -50,8 +50,9 @@ def resolve_model_ref(model_ref: str | Path | None, *, kind: str) -> str:
 
 
 def _get_dflash_model_classes(config: dict[str, Any]):
-    del config
-    return DFlashDraftModel, DFlashDraftModelArgs
+    from dflash_mlx.draft.checkpoint import get_draft_model_classes
+
+    return get_draft_model_classes(config)
 
 
 def _resolve_local_model_path(model_ref: str | Path) -> Path:

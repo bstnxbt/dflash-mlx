@@ -16,6 +16,7 @@ from dflash_mlx.engine.gqa_sdpa import (
     per_head_gqa_sdpa,
     repeat_gqa_mask,
 )
+from dflash_mlx.engine._hook_guard import claim_class_hook
 from dflash_mlx.engine.sparse_rope import SPARSE_POSITIONS_ATTR
 from dflash_mlx.engine.target_ops import TargetCapabilities
 
@@ -216,7 +217,7 @@ def _gemma4_full_gqa_sdpa(
 
 def _install_full_attention_gqa_hook(attn: Any) -> None:
     cls = type(attn)
-    if getattr(cls, "_dflash_full_attention_gqa_installed", False):
+    if not claim_class_hook(cls, "_dflash_full_attention_gqa_installed", "gemma4"):
         return
 
     original_call = cls.__call__
@@ -279,7 +280,7 @@ def _install_full_attention_gqa_hook(attn: Any) -> None:
         return self.o_proj(output), (keys, values), offset
 
     cls.__call__ = attention_call
-    cls._dflash_full_attention_gqa_installed = True
+    cls._dflash_full_attention_gqa_installed = "gemma4"
 
 
 class Gemma4TargetOps:

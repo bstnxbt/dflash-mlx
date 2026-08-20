@@ -1658,6 +1658,34 @@ def test_copyspec_full_block_copy_skips_draft_backend():
     assert summary.copyspec_tokens == 3
 
 
+def test_draft_without_copyspec_capability_uses_dflash_draft():
+    target_ops = _FakeTargetOps()
+    draft_model = _draft_model()
+    draft_model.capabilities = SimpleNamespace(supports_copyspec=False)
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=4,
+            prompt_tokens_override=[1, 2, 3, 4, 5, 0, 0, 0, 0, 1, 2, 3, 4, 5],
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.calls == [(4, True)]
+    assert draft_backend.advance_context_lengths == []
+    assert summary.copyspec_hits == 0
+    assert summary.copyspec_tokens == 0
+
+
 def test_ddtree_copyspec_full_block_copy_skips_ddtree_draft_backend():
     target_ops = _FakeTargetOps()
     draft_model = _draft_model()
@@ -1688,6 +1716,27 @@ def test_ddtree_copyspec_full_block_copy_skips_ddtree_draft_backend():
     assert summary.acceptance_history == (3,)
     assert summary.copyspec_hits == 1
     assert summary.copyspec_tokens == 3
+
+
+def test_ddtree_verify_mode_fails_fast_for_unsupported_draft():
+    target_ops = _FakeTargetOps()
+    draft_model = _draft_model()
+    draft_model.capabilities = SimpleNamespace(supports_ddtree=False)
+
+    with pytest.raises(ValueError, match="does not support --verify-mode ddtree"):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=draft_model,
+                draft_backend=_RecordingDraftBackend(),
+                prompt="unused",
+                max_new_tokens=4,
+                prompt_tokens_override=[1, 2],
+                runtime_context=_runtime_context(verify_mode="ddtree"),
+            )
+        )
 
 
 def test_ddtree_copyspec_partial_acceptance_preserves_rollback_snapshot():

@@ -11,8 +11,8 @@ license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 authors = [{name = "bstnxbt"}]
 dependencies = [
-    "mlx>=0.31.0",
-    "mlx-lm>=0.31.0",
+    "mlx>=0.32.1",
+    "mlx-lm>=0.31.3",
 ]
 
 [project.optional-dependencies]

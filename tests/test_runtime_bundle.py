@@ -23,6 +23,7 @@ EXPECTED_DRAFT_REGISTRY = {
     "Qwen3.5-35B-A3B": "z-lab/Qwen3.5-35B-A3B-DFlash",
     "Qwen3.6-27B": "z-lab/Qwen3.6-27B-DFlash",
     "Qwen3.6-35B-A3B": "z-lab/Qwen3.6-35B-A3B-DFlash",
+    "Qwen3.8-27B": "z-lab/Qwen3.8-27B-DFlash2",
     "Qwen3-4B": "z-lab/Qwen3-4B-DFlash-b16",
     "Qwen3-8B": "z-lab/Qwen3-8B-DFlash-b16",
     "gemma-4-31b-it": "z-lab/gemma-4-31B-it-DFlash",
@@ -58,6 +59,10 @@ def test_runtime_registry_preserves_draft_resolution():
         == "z-lab/Qwen3.6-27B-DFlash"
     )
     assert (
+        resolve_optional_draft_ref("mlx-community/Qwen3.8-27B-4bit", None)
+        == "z-lab/Qwen3.8-27B-DFlash2"
+    )
+    assert (
         resolve_optional_draft_ref("mlx-community/gemma-4-26b-a4b-it-4bit", None)
         == "z-lab/gemma-4-26B-A4B-it-DFlash"
     )
@@ -67,6 +72,7 @@ def test_runtime_registry_preserves_draft_resolution():
         == "gemma4_swa"
     )
     assert resolve_model_support_spec("Qwen/Qwen3.5-9B").defaults.draft_quant == "w4"
+    assert resolve_model_support_spec("Qwen/Qwen3.8-27B").defaults.draft_quant == "w4"
     assert (
         resolve_model_support_spec("mlx-community/gemma-4-31b-it-4bit").defaults.draft_quant
         == "w4"

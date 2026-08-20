@@ -40,6 +40,10 @@ class PrefixSnapshotStore:
         # Readable by RuntimeCacheManager while holding _state_lock.
         self._last_hit_kind: str = "miss"
 
+    @property
+    def last_hit_kind(self) -> str:
+        return self._last_hit_kind
+
     def set_trace_config(self, trace_config: TraceConfig | None) -> None:
         self._trace_config = trace_config
         self._l1.set_trace_config(trace_config)

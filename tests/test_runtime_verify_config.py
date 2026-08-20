@@ -391,6 +391,29 @@ def test_speculative_cycle_config_defaults_to_draft_block_size():
     assert cycle.verify_len_cap == 16
 
 
+def test_speculative_cycle_config_honors_draft_default_block_capability():
+    cfg = runtime_config_from_defaults(verify_len_cap=0)
+    draft = SimpleNamespace(
+        block_size=8,
+        capabilities=SimpleNamespace(default_block_tokens=5, max_block_tokens=5),
+    )
+
+    default_cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=None)
+    low_cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=4)
+    explicit_cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=8)
+    high_cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=16)
+
+    assert default_cycle.requested_block_tokens == 5
+    assert default_cycle.effective_block_tokens == 5
+    assert default_cycle.verify_len_cap == 5
+    assert low_cycle.requested_block_tokens == 4
+    assert low_cycle.effective_block_tokens == 4
+    assert explicit_cycle.requested_block_tokens == 8
+    assert explicit_cycle.effective_block_tokens == 5
+    assert high_cycle.requested_block_tokens == 16
+    assert high_cycle.effective_block_tokens == 5
+
+
 def test_speculative_cycle_config_clamps_requested_block_size():
     cfg = runtime_config_from_defaults(verify_len_cap=0)
     draft = SimpleNamespace(block_size=16)

@@ -304,6 +304,8 @@ Engine:
 Draft/model/kernels:
 
 - `dflash_mlx/model.py` - DFlash draft model;
+- `dflash_mlx/draft/` - draft architecture dispatch and DFlash2-specific
+  draft modules;
 - `dflash_mlx/draft_backend.py` - masked-block draft call;
 - `dflash_mlx/kernels.py` - local kernel helpers;
 - `dflash_mlx/verify_linear.py` and `dflash_mlx/verify_qmm.py` - verify

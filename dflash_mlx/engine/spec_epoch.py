@@ -63,6 +63,7 @@ from dflash_mlx.engine.sampling import (
 from dflash_mlx.engine.target_features import TargetFeatureStore
 from dflash_mlx.engine.config import (
     _profile_dflash_cycles_enabled,
+    draft_capability,
     resolve_draft_window,
     resolve_speculative_cycle_config,
     verify_token_count_for_block,
@@ -607,6 +608,25 @@ def _capture_rows_float(arr: mx.array) -> tuple[tuple[float, ...], ...]:
     return tuple(tuple(float(v) for v in row) for row in arr.tolist())
 
 
+def _draft_capability(
+    draft_model: Any,
+    capability: str,
+    *,
+    default: bool,
+) -> bool:
+    return bool(draft_capability(draft_model, capability, default))
+
+
+def _validate_draft_runtime_compatibility(
+    draft_model: Any,
+    runtime_config: Any,
+) -> None:
+    if str(getattr(runtime_config, "verify_mode", "dflash")) == "ddtree" and not (
+        _draft_capability(draft_model, "supports_ddtree", default=True)
+    ):
+        raise ValueError("draft model does not support --verify-mode ddtree")
+
+
 @dataclass
 class SpeculativeSession:
     target_model: Any
@@ -704,6 +724,9 @@ class SpeculativeSession:
         profile_cycles = _profile_dflash_cycles_enabled(diagnostics)
         memory_waterfall = _memory_waterfall_enabled(diagnostics)
         capture_logits = os.environ.get("DFLASH_CAPTURE_LOGITS", "") == "1"
+        copyspec_mode = str(getattr(runtime_config, "copyspec_mode", "conservative"))
+        if not _draft_capability(draft_model, "supports_copyspec", default=True):
+            copyspec_mode = "off"
         return cls(
             target_model=target_model,
             draft_model=draft_model,
@@ -728,7 +751,7 @@ class SpeculativeSession:
             clear_cache_boundaries=bool(runtime_config.clear_cache_boundaries),
             target_fa_window=target_fa_window,
             copyspec_index=CopySpecIndex(prompt_tokens),
-            copyspec_mode=str(getattr(runtime_config, "copyspec_mode", "conservative")),
+            copyspec_mode=copyspec_mode,
         )
 
     def clear_cache_boundary(self) -> None:
@@ -2835,6 +2858,7 @@ def stream_dflash_generate_impl(
     if runtime_context is None:
         raise ValueError("runtime_context is required")
     runtime_config = runtime_context.runtime
+    _validate_draft_runtime_compatibility(draft_model, runtime_config)
     prompt_len = len(prompt_tokens)
     configured_max_ctx = int(runtime_config.dflash_max_ctx)
     dflash_max_ctx = configured_max_ctx if configured_max_ctx > 0 else sys.maxsize

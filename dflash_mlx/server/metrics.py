@@ -30,7 +30,10 @@ from dflash_mlx.cache.manager import (
 from dflash_mlx.diagnostics import DiagnosticsConfig
 from dflash_mlx.engine.events import PrefillCompleteEvent, SummaryEvent
 from dflash_mlx.observability.memory import live_memory_payload
-from dflash_mlx.server.prefix_cache_manager import build_prefix_key
+from dflash_mlx.server.prefix_cache_manager import (
+    build_prefix_key,
+    build_runtime_cache_identity,
+)
 
 _LIVE_LOCK = threading.Lock()
 _LIVE_STARTED_AT = time.time()
@@ -412,7 +415,11 @@ def configure_live_metrics(
         and int(target_fa_window or 0) <= 0
     )
     runtime_context = getattr(cli_args, "runtime_context", None)
-    cache_identity: Any = tuple(model_key)
+    cache_identity: Any = (
+        build_runtime_cache_identity(model_provider)
+        if runtime_context is not None
+        else tuple(model_key)
+    )
     draft_model = getattr(model_provider, "draft_model", None)
     if prefix_cache_enabled and runtime_context is not None and draft_model is not None:
         cache_identity = build_prefix_key(model_provider, draft_model, runtime_context)
