@@ -154,6 +154,54 @@ def test_response_generator_ar_fastpath_accounting(monkeypatch, ar_raises):
         assert runtime_calls[1][1]["wall_ms"] >= 0.0
 
 
+def test_response_generator_sampling_uses_exact_target_ar(monkeypatch):
+    runtime_calls = []
+
+    def fake_ar_serve(self, request_tuple):
+        assert self.model_provider.draft_model is None
+        sampling = request_tuple[2].sampling
+        assert (sampling.temperature, sampling.top_p, sampling.top_k, sampling.min_p) == (
+            0.7,
+            0.9,
+            12,
+            0.05,
+        )
+        return request_tuple
+
+    monkeypatch.setattr(serve.mlx_server.ResponseGenerator, "_serve_single", fake_ar_serve)
+    generator = object.__new__(DFlashResponseGenerator)
+    generator.server_runtime = SimpleNamespace(
+        next_request_id=lambda: 12,
+        start_target_only_request=lambda **kwargs: runtime_calls.append(("start", kwargs)),
+        record_target_only_request=lambda **kwargs: runtime_calls.append(("record", kwargs)),
+    )
+    generator.model_provider = SimpleNamespace(
+        draft_model="draft",
+        cli_args=SimpleNamespace(fastpath_max_tokens=0),
+    )
+    args = SimpleNamespace(
+        max_tokens=64,
+        sampling=SimpleNamespace(
+            temperature=0.7,
+            top_p=0.9,
+            top_k=12,
+            min_p=0.05,
+            xtc_probability=0.0,
+        ),
+        logits=SimpleNamespace(),
+        logprobs=False,
+        top_logprobs=-1,
+    )
+    request_tuple = (_Queue(), object(), args)
+
+    assert generator._serve_single(request_tuple) == request_tuple
+    assert generator.model_provider.draft_model == "draft"
+    assert [call[1]["mode_used"] for call in runtime_calls] == [
+        "ar_sampling",
+        "ar_sampling",
+    ]
+
+
 def test_response_generator_clears_failed_dflash_request_after_live_start(monkeypatch):
     _reset_live_metrics_state()
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
