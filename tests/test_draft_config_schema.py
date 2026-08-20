@@ -22,7 +22,7 @@ from dflash_mlx.model import DFlashDraftModelArgs
 
 def _base_legacy_schema() -> dict:
     return {
-        "model_type": "dflash_qwen3",
+        "model_type": "qwen3",
         "hidden_size": 2048,
         "num_hidden_layers": 8,
         "intermediate_size": 6144,
@@ -52,7 +52,7 @@ def _base_nested_schema() -> dict:
     num_key_value_heads 4 -> 8; target_layer_ids 5 -> 8 anchors.
     """
     return {
-        "model_type": "dflash_qwen3",
+        "model_type": "qwen3",
         "hidden_size": 2048,
         "num_hidden_layers": 6,
         "intermediate_size": 6144,
@@ -119,6 +119,15 @@ def test_from_dict_unwraps_block_size_from_dflash_config_when_top_level_absent()
 
     assert args.block_size == 16
     assert args.rope_theta == 10_000_000.0
+
+
+def test_from_dict_does_not_invent_missing_block_size():
+    data = _base_nested_schema()
+    data.pop("block_size", None)
+    data["dflash_config"].pop("block_size", None)
+
+    with pytest.raises(TypeError, match="block_size"):
+        DFlashDraftModelArgs.from_dict(data)
 
 
 def test_from_dict_unwraps_rope_theta_from_rope_scaling_as_fallback():
