@@ -162,3 +162,21 @@ def _mk_linear(in_dims, out_dims):
     lin = nn.Linear(in_dims, out_dims, bias=False)
     lin.weight = mx.random.normal((out_dims, in_dims)).astype(mx.bfloat16) * 0.1
     return lin
+
+
+def test_prewarm_visits_modules_and_deduplicates_shapes(monkeypatch):
+    from dflash_mlx.verify_linear import prewarm_verify_kernels
+
+    layers = [VerifyQuantizedLinear.from_quantized(
+        nn.QuantizedLinear(64, 32, bias=False), enable_qmm=False) for _ in range(2)]
+    model = nn.Sequential(*layers)
+    calls = []
+
+    def call(self, x):
+        calls.append(x.shape)
+        return mx.zeros((*x.shape[:-1], 32), dtype=x.dtype)
+
+    monkeypatch.setattr(VerifyQuantizedLinear, "__call__", call)
+    count = prewarm_verify_kernels(model)
+    assert count == 2
+    assert calls == [(1, 16, 64), (1, 4, 64)]

@@ -323,7 +323,7 @@ def prewarm_verify_kernels(
 
     seen: set[tuple] = set()
     warmed = 0
-    for _, m in tree_flatten(model.leaf_modules()):
+    for _, m in tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module):
         if not isinstance(m, VerifyQuantizedLinear):
             continue
         K = int(m.weight.shape[1]) * (32 // m.bits)
